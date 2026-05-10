@@ -15,7 +15,7 @@ def generate_launch_description():
             'channel': 0,
             'image_width': 1280,
             'image_height': 720,
-            'out_format': 'bgr8',
+            'out_format': 'mono8',
             'camera_calibration_file_path': '/home/ddddd/AutoPark_ws/src/bringup/config/lastest_ost.yaml'
         }],
         remappings=[('/image_raw', '/front_cam/image_raw'),
@@ -42,7 +42,7 @@ def generate_launch_description():
             'channel': 2,
             'image_width': 1280,
             'image_height': 720,
-            'out_format': 'bgr8',
+            'out_format': 'mono8',
             'camera_calibration_file_path': '/home/ddddd/AutoPark_ws/src/bringup/config/lastest_ost.yaml'
         }],
         remappings=[('/image_raw', '/rear_cam/image_raw')]
