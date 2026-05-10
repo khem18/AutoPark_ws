@@ -1,0 +1,267 @@
+import json
+import math
+import time
+from typing import Optional
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Bool, String, Float32MultiArray
+from geometry_msgs.msg import Pose2D
+
+from .planner_adapter import plan_from_start, result_to_dict
+
+
+class AutoparkMaster(Node):
+    def __init__(self):
+        super().__init__("autopark_master")
+
+        for name, default in [
+            ("start_switch_topic", "/autopark/start_switch"),
+            ("pose_topic", "/autopark/start_pose"),
+            ("parking_metrics_topic", "/parking_metrics"),
+            ("ultrasonic_topic", "/autopark/ultrasonic"),
+            ("command_topic", "/autopark/cmd_json"),
+            ("plan_topic", "/autopark/plan_result"),
+
+            ("min_clearance_m", 0.12),
+            ("disable_ultrasonic_block", True),
+
+            ("planner_mode", "both_sides"),
+            ("use_default_pose_when_missing", True),
+            ("default_start_x", 0.0),
+            ("default_start_y", 2.17),
+            ("default_start_yaw_deg", 180.0),
+
+            ("speed_scale", 0.05),
+            ("default_motion_seconds", 1.0),
+            ("pause_between_commands", 0.30),
+            ("steer_wait_seconds", 3.0),
+        ]:
+            self.declare_parameter(name, default)
+
+        self.min_clearance_m = float(self.get_parameter("min_clearance_m").value)
+        self.disable_ultrasonic_block = bool(self.get_parameter("disable_ultrasonic_block").value)
+
+        self.planner_mode = str(self.get_parameter("planner_mode").value)
+        self.use_default_pose_when_missing = bool(self.get_parameter("use_default_pose_when_missing").value)
+
+        self.default_start_x = float(self.get_parameter("default_start_x").value)
+        self.default_start_y = float(self.get_parameter("default_start_y").value)
+        self.default_start_yaw_deg = float(self.get_parameter("default_start_yaw_deg").value)
+
+        self.speed_scale = float(self.get_parameter("speed_scale").value)
+        self.default_motion_seconds = float(self.get_parameter("default_motion_seconds").value)
+        self.pause_between_commands = float(self.get_parameter("pause_between_commands").value)
+        self.steer_wait_seconds = float(self.get_parameter("steer_wait_seconds").value)
+
+        self.latest_pose: Optional[Pose2D] = None
+        self.latest_us = [9.9] * 8
+        self.latest_metrics = []
+        self.busy = False
+
+        self.create_subscription(Bool, self.get_parameter("start_switch_topic").value, self.on_start_switch, 10)
+        self.create_subscription(Pose2D, self.get_parameter("pose_topic").value, self.on_pose, 10)
+        self.create_subscription(Float32MultiArray, self.get_parameter("parking_metrics_topic").value, self.on_metrics, 10)
+        self.create_subscription(Float32MultiArray, self.get_parameter("ultrasonic_topic").value, self.on_ultrasonic, 10)
+
+        self.cmd_pub = self.create_publisher(String, self.get_parameter("command_topic").value, 10)
+        self.plan_pub = self.create_publisher(String, self.get_parameter("plan_topic").value, 10)
+
+        self.get_logger().info("autopark_master ready")
+
+    def on_pose(self, msg):
+        self.latest_pose = msg
+
+    def on_metrics(self, msg):
+        self.latest_metrics = list(msg.data)
+
+    def on_ultrasonic(self, msg):
+        vals = list(msg.data)
+        if len(vals) >= 8:
+            self.latest_us = vals[:8]
+
+    def on_start_switch(self, msg):
+        self.get_logger().info("START SWITCH CALLBACK: " + str(msg.data))
+
+        if not msg.data:
+            return
+
+        if self.busy:
+            self.get_logger().warning("ignored start switch because busy")
+            return
+
+        self.busy = True
+        try:
+            self.start_autopark()
+        finally:
+            self.busy = False
+
+    def start_autopark(self):
+        self.get_logger().info("START_AUTOPARK ENTERED")
+
+        if not self.disable_ultrasonic_block:
+            if self.latest_us and min(self.latest_us) < self.min_clearance_m:
+                self.publish_stop("blocked_by_ultrasonic_before_start")
+                return
+
+        pose = self.latest_pose
+
+        if pose is None:
+            if not self.use_default_pose_when_missing:
+                self.publish_stop("no_start_pose")
+                return
+
+            pose = Pose2D()
+            pose.x = self.default_start_x
+            pose.y = self.default_start_y
+            pose.theta = math.radians(self.default_start_yaw_deg)
+
+            self.get_logger().warning(
+                "using default pose: " + str((pose.x, pose.y, pose.theta))
+            )
+
+        # Pose2D.theta is radians, planner expects degrees
+        yaw_deg = math.degrees(pose.theta)
+
+        self.get_logger().info(
+            "planning from pose x="
+            + str(pose.x)
+            + " y="
+            + str(pose.y)
+            + " theta_rad="
+            + str(pose.theta)
+            + " theta_deg="
+            + str(yaw_deg)
+        )
+
+        planned = plan_from_start(pose.x, pose.y, yaw_deg, self.planner_mode)
+        result = result_to_dict(planned)
+        motions = result.get("motions", [])
+
+        self.get_logger().info("PLANNER FINISHED")
+        self.get_logger().info("MOTIONS LEN: " + str(len(motions)))
+
+        if not motions:
+            self.plan_pub.publish(String(data=json.dumps(result)))
+            self.publish_stop("planner_returned_empty_motion_sequence")
+            return
+
+        if self.latest_metrics:
+            result["parking_metrics"] = self.latest_metrics
+
+        self.plan_pub.publish(String(data=json.dumps(result)))
+
+        self.get_logger().info(
+            "plan published: case="
+            + str(self.planner_mode)
+            + " motions="
+            + str(len(motions))
+        )
+
+        self.execute_motions(motions)
+
+    def execute_motions(self, motions):
+        self.get_logger().info("EXECUTING MOTIONS")
+
+        for i, motion in enumerate(motions):
+            cmd = self.motion_to_cmd(motion)
+
+            self.get_logger().info(
+                "CMD "
+                + str(i + 1)
+                + "/"
+                + str(len(motions))
+                + ": "
+                + json.dumps(cmd)
+            )
+
+            # 1) Stop car and steer first
+            steer_cmd = dict(cmd)
+            steer_cmd["speed_mps"] = 0.0
+            steer_cmd["gear"] = 0
+            steer_cmd["type"] = "drive"
+
+            self.cmd_pub.publish(String(data=json.dumps(steer_cmd)))
+
+            self.get_logger().info(
+                "WAIT STEER COMPLETE: steer_deg="
+                + str(steer_cmd["steer_deg"])
+                + " wait="
+                + str(self.steer_wait_seconds)
+                + " sec"
+            )
+
+            time.sleep(self.steer_wait_seconds)
+
+            # 2) Drive after steering wait
+            self.cmd_pub.publish(String(data=json.dumps(cmd)))
+
+            duration = float(cmd.get("duration", self.default_motion_seconds))
+            time.sleep(max(0.10, duration))
+
+            self.publish_stop("segment_pause")
+            time.sleep(self.pause_between_commands)
+
+        self.publish_stop("parking_sequence_done")
+        self.get_logger().info("PARKING SEQUENCE DONE")
+
+    def motion_to_cmd(self, motion):
+        gear = -1
+        steer_deg = 0.0
+        speed_mps = self.speed_scale
+        duration = self.default_motion_seconds
+
+        if isinstance(motion, dict):
+            if "gear" in motion:
+                gear = int(motion["gear"])
+
+            if "steer_deg" in motion:
+                steer_deg = float(motion["steer_deg"])
+
+            if "speed_mps" in motion:
+                speed_mps = abs(float(motion["speed_mps"]))
+
+            if "duration" in motion:
+                duration = float(motion["duration"])
+            elif "dist_m" in motion:
+                dist = abs(float(motion["dist_m"]))
+                duration = max(0.4, dist / max(speed_mps, 0.05))
+            elif "dist" in motion:
+                dist = abs(float(motion["dist"]))
+                duration = max(0.4, dist / max(speed_mps, 0.05))
+
+        speed_mps = min(abs(speed_mps), self.speed_scale)
+        duration = max(1.2, min(duration, 2.0))
+
+        return {
+            "type": "drive",
+            "gear": gear,
+            "speed_mps": speed_mps,
+            "steer_deg": steer_deg,
+            "duration": duration,
+        }
+
+    def publish_stop(self, reason):
+        cmd = {
+            "type": "stop",
+            "reason": reason,
+        }
+        self.cmd_pub.publish(String(data=json.dumps(cmd)))
+        self.get_logger().warning("STOP: " + reason)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = AutoparkMaster()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.publish_stop("shutdown")
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+# ROS2 specific
+build/
+install/
+log/
+
+# Python
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+
+# OS specific
+.DS_Store
+Thumbs.db
