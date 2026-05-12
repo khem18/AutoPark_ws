@@ -1,13 +1,14 @@
 import os
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.actions import TimerAction
+from launch.actions import TimerAction, ExecuteProcess
+
+CALIB    = '/home/ddddd/AutoPark_ws/src/bringup/config/lastest_ost.yaml'
+VINS_CFG = '/home/ddddd/AutoPark_ws/src/params/vins_config_rdkx5.yaml'
 
 def generate_launch_description():
-    
-    # ==========================================
-    # 📷 1. กล้องข้าง (Side Camera) - เริ่มทันทีที่ T=0
-    # ==========================================
+
+    # 1. SIDE CAMERA
     side_cam = Node(
         package='mipi_cam',
         executable='mipi_cam',
@@ -15,33 +16,29 @@ def generate_launch_description():
         parameters=[{
             'video_device': 'ov5647',
             'device_mode': 'single',
-            'channel': 0, # Port 0
+            'channel': 0,
             'image_width': 1280,
             'image_height': 720,
             'out_format': 'nv12',
-            'camera_calibration_file_path': '/home/ddddd/AutoPark_ws/src/bringup/config/lastest_ost.yaml'
+            'camera_calibration_file_path': CALIB,
         }],
-        remappings=[('/image_raw', '/side_cam/image_nv12'),
-                    ('/camera_info', '/side_cam/camera_info')]
+        remappings=[
+            ('/image_raw',   '/side_cam/image_nv12'),
+            ('/camera_info', '/side_cam/camera_info'),
+        ],
     )
 
     side_codec = Node(
-        package='hobot_codec',
-        executable='hobot_codec_republish',
-        name='side_codec_converter',
+        package='vision',
+        executable='nv12_to_bgr',
+        name='side_nv12_to_bgr',
         parameters=[{
-            'in_mode': 'ros',
-            'in_format': 'nv12',
-            'out_mode': 'ros',
-            'out_format': 'bgr8',
             'sub_topic': '/side_cam/image_nv12',
-            'pub_topic': '/side_cam/image_raw'
-        }]
+            'pub_topic': '/side_cam/image_raw',
+        }],
     )
 
-    # ==========================================
-    # 📷 2. กล้องหลัง (Rear Camera) - ตั้งค่าไว้ก่อน
-    # ==========================================
+    # 2. REAR CAMERA (delayed 5 s)
     rear_cam = Node(
         package='mipi_cam',
         executable='mipi_cam',
@@ -49,49 +46,65 @@ def generate_launch_description():
         parameters=[{
             'video_device': 'ov5647',
             'device_mode': 'single',
-            'channel': 2, # Port 2
+            'channel': 2,
             'image_width': 1280,
             'image_height': 720,
             'out_format': 'nv12',
-            'camera_calibration_file_path': '/home/ddddd/AutoPark_ws/src/bringup/config/lastest_ost.yaml'
+            'camera_calibration_file_path': CALIB,
         }],
-        remappings=[('/image_raw', '/rear_cam/image_nv12'),
-                    ('/camera_info', '/rear_cam/camera_info')]
+        remappings=[
+            ('/image_raw',   '/rear_cam/image_nv12'),
+            ('/camera_info', '/rear_cam/camera_info'),
+        ],
     )
 
     rear_codec = Node(
-        package='hobot_codec',
-        executable='hobot_codec_republish',
-        name='rear_codec_converter',
+        package='vision',
+        executable='nv12_to_bgr',
+        name='rear_nv12_to_bgr',
         parameters=[{
-            'in_mode': 'ros',
-            'in_format': 'nv12',
-            'out_mode': 'ros',
-            'out_format': 'bgr8',
             'sub_topic': '/rear_cam/image_nv12',
-            'pub_topic': '/rear_cam/image_raw'
-        }]
+            'pub_topic': '/rear_cam/image_raw',
+        }],
     )
 
-    # ⏳ สร้าง TimerAction หน่วงเวลา 5 วินาทีสำหรับระบบกล้องหลัง
-    delayed_rear_system = TimerAction(
+    delayed_rear = TimerAction(
         period=5.0,
-        actions=[rear_cam, rear_codec]
+        actions=[rear_cam, rear_codec],
     )
 
-    # ==========================================
-    # 🧠 3. โหนดส่วนกลาง (ทำงานทันที)
-    # ==========================================
+    # 3. GRAYSCALE CONVERTER
     grayscale_node = Node(
         package='vision',
         executable='grayscale_node',
         name='grayscale_converter',
+        output='screen',
+    )
+
+    # 4. MPU6050
+    imu_node = Node(
+        package='mpu6050_cpp',
+        executable='mpu6050_node',
+        name='mpu6050_cpp_node',
+        output='screen',
+    )
+
+    # 5. VINS ESTIMATOR (ExecuteProcess) - delayed 8 s
+    vins_estimator = ExecuteProcess(
+        cmd=['/home/ddddd/AutoPark_ws/install/vins/lib/vins/vins_node', VINS_CFG],
         output='screen'
+    )
+
+    delayed_vins = TimerAction(
+        period=5.0,  # 🚨 ผมลดเวลาลงเหลือ 5 วินาที จะได้ไม่ต้องรอนานครับ!
+        actions=[vins_estimator],
     )
 
     return LaunchDescription([
         side_cam,
         side_codec,
         grayscale_node,
-        delayed_rear_system # ระบบกล้องหลังจะเริ่มหลังจากนี้ 5 วินาที
+        imu_node,
+        delayed_rear,
+        delayed_vins,
     ])

@@ -29,6 +29,7 @@ setup(
 			'lot_detector_sim = autopark_logic.lot_detector_sim:main',
 			'local_mapper = autopark_logic.local_mapper:main',
 			'local_mapeer_sim = autopark_logic.local_mapper_sim',
+                        'vins_preflight_check = autopark_logic.vins_preflight_check:main',
         ],
     },
 )

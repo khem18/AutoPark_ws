@@ -1,0 +1,49 @@
+%YAML:1.0
+#==============================================================================
+# cam0_pinhole.yaml
+# VINS-Fusion camera intrinsic file for OV5647 rear camera
+#==============================================================================
+#
+# Source calibration:  src/bringup/config/lastest_ost.yaml  (1280×720)
+# Published image:     640×360  (VINS_W × VINS_H in grayscale_node.py)
+# Scale factor:        0.5  (exact half — no aspect ratio change)
+#
+# ── Intrinsic scaling rule ─────────────────────────────────────────────
+#   fx_new = fx_orig × (W_new / W_orig) = fx_orig × 0.5
+#   fy_new = fy_orig × (H_new / H_orig) = fy_orig × 0.5
+#   cx_new = cx_orig × 0.5
+#   cy_new = cy_orig × 0.5
+#   Distortion coefficients DO NOT change — they are normalised.
+#
+# ── Original values (lastest_ost.yaml camera_matrix) ─────────────────
+#   fx = 986.72775   →  493.364
+#   fy = 987.08102   →  493.541
+#   cx = 573.38566   →  286.693
+#   cy = 325.86338   →  162.932
+#
+# ── Distortion (plumb_bob = radtan in VINS) ──────────────────────────
+#   k1 = -0.329390
+#   k2 =  0.115908
+#   p1 = -0.000645
+#   p2 =  0.000030
+#==============================================================================
+
+model_type: PINHOLE
+camera_name: rear_cam
+
+image_width:  640
+image_height: 360
+
+# radtan = plumb_bob in ROS (k1 k2 p1 p2)
+distortion_model: radtan
+distortion_parameters:
+   k1: -0.329390
+   k2:  0.115908
+   p1: -0.000645
+   p2:  0.000030
+
+projection_parameters:
+   fx: 493.364
+   fy: 493.541
+   cx: 286.693
+   cy: 162.932

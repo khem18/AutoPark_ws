@@ -1,0 +1,75 @@
+%YAML:1.0
+#==============================================================================
+# vins_config_rdkx5.yaml
+# VINS-Fusion main config — RDK X5 + OV5647 (rear, upside-down) + MPU6050
+#==============================================================================
+
+imu: 1
+imu_topic:    "/imu/data_raw"
+image0_topic: "/rear_cam/image_gray"
+num_of_cam:   1
+
+cam0_calib: "cam0_pinhole.yaml"
+
+image_width:  640
+image_height: 360
+
+# ── body_T_cam0  (camera frame → IMU/body frame) ──────────────────────────
+#
+# Physical mounting:
+#   • Lens faces BACKWARD  (rear camera)
+#   • Camera board is UPSIDE DOWN (rotated 180° around optical axis)
+#
+# Camera axes (OpenCV convention, in the raw upside-down image):
+#   Z_cam = out of lens  →  backward on kart  →  -X_body
+#   Y_cam = down in raw image, but board is flipped, so physically UP  →  +Z_body
+#   X_cam = right in raw image, board flipped + facing back  →  +Y_body
+#
+# Rotation columns  [X_cam | Y_cam | Z_cam]  expressed in body coords:
+#        X_cam  Y_cam  Z_cam
+#   X_b [  0     0     -1  ]
+#   Y_b [  1     0      0  ]
+#   Z_b [  0     1      0  ]
+#
+# Translation (camera optical centre relative to IMU in body frame, metres):
+#   MEASURE THESE ON YOUR KART — replace the placeholders below.
+#   t_x ≈ -0.50  (camera is ~50 cm behind the IMU)
+#   t_y ≈  0.00  (centred left-right)
+#   t_z ≈  0.05  (camera ~5 cm above the IMU PCB)
+#==============================================================================
+
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [  0,  0, -1, -0.50,
+             1,  0,  0,  0.00,
+             0,  1,  0,  0.05,
+             0,  0,  0,  1.00 ]
+
+max_cnt:      200
+min_dist:     10
+freq:         10
+F_threshold:  1.0
+show_track:   1
+
+estimate_td:      1
+td:               0
+rolling_shutter:  0
+
+keyframe_parallax:  10.0
+max_solver_time:    0.04
+max_num_iterations: 8
+focal_length:       493
+
+acc_n:  0.012
+gyr_n:  0.00026
+acc_w:  0.0018
+gyr_w:  0.000044
+g_norm: 9.81
+
+loop_closure:              0
+load_previous_pose_graph:  0
+fast_relocalization:       0
+
+output_path: "/tmp/vins_output"
