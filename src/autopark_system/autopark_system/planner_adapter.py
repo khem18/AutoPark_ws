@@ -572,19 +572,47 @@ def plan_from_start(
     motions = [
         {
             "gear": 1 if gear == "f" else -1,
-            "steer_deg": steer_deg,
-            "dist_m": dist_m,
+            "steer_deg": float(steer_deg),
+            "dist_m": float(dist_m),
         }
         for gear, steer_deg, dist_m in result.primitive_seq
     ]
+
+    # IMPORTANT:
+    # Do not use tiny fallback like 0.06 / 0.05 m.
+    # If planner result has empty primitive_seq, use a real practical
+    # template distance for real-car testing.
     if len(motions) == 0:
+        result.reason = "empty_planner_result_using_realcar_fallback_template"
+        result.planner = "real_middle_slot_planner(realcar_fallback_template)"
+        result.primitive_seq = [
+            ("f", -15.0, 0.60),
+            ("r", 25.0, 0.90),
+            ("r", 8.0, 0.35),
+        ]
+
+        ok, path, end_pose = simulate_sequence(
+            start,
+            result.primitive_seq,
+            spec,
+            env,
+            step_len=0.01,
+        )
+
+        result.path = path
+        result.final_pose = end_pose
+        result.metrics = slot_metrics(env, end_pose, spec, planner.target_yaw)
+
         motions = [
-            {"gear": 1, "steer_deg": -15.0, "dist_m": 0.06},
-            {"gear": -1, "steer_deg": 25.0, "dist_m": 0.05},
+            {
+                "gear": 1 if gear == "f" else -1,
+                "steer_deg": float(steer_deg),
+                "dist_m": float(dist_m),
+            }
+            for gear, steer_deg, dist_m in result.primitive_seq
         ]
 
     return PlannedPath(result, motions)
-
 
 def result_to_dict(planned: PlannedPath) -> Dict[str, Any]:
     res = planned.result

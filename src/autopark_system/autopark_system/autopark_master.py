@@ -26,8 +26,10 @@ class AutoparkMaster(Node):
             ("slot_topic", "/autopark/slot_info"),
             ("flow_distance_topic", "/autopark/flow_distance"),
 
-            ("min_clearance_m", 0.12),
+            # Before-start ultrasonic block.
+            # Keep true for now because tight slot may make pre-start ultrasonic too sensitive.
             ("disable_ultrasonic_block", True),
+            ("min_clearance_m", 0.12),
 
             ("planner_mode", "both_sides"),
             ("use_default_pose_when_missing", True),
@@ -35,44 +37,84 @@ class AutoparkMaster(Node):
             ("default_start_y", 0.70),
             ("default_start_yaw_deg", 180.0),
 
+            # Your calibrated real-car speed command
             ("speed_scale", 0.07),
 
-            # fallback only
+            # Fallback only if flow is missing
             ("default_motion_seconds", 4.0),
 
-            # steering is still time-based for now
-            ("steer_wait_seconds", 30.0),
+            # Steering still uses wait time.
+            # ESP32 steerReady should also block drive if steering is not ready.
+            ("steer_wait_seconds", 45.0),
             ("pause_between_commands", 1.0),
 
-            # closed-loop drive distance
+            # Optical-flow closed-loop drive
             ("use_flow_distance_control", True),
-            ("default_drive_distance_m", 0.20),
-            ("drive_timeout_seconds", 12.0),
-            ("flow_valid_required", True),
+            ("default_drive_distance_m", 0.35),
+            ("flow_valid_required", False),
             ("flow_distance_tolerance_m", 0.01),
+
+            # This is NOT normal stop control.
+            # It only keeps ESP32 command active for long time.
+            ("esp32_drive_hold_seconds", 300.0),
+
+            # Ultrasonic safety during drive
+            ("drive_ultrasonic_safety", True),
+
+            # Safety stop distance.
+            # 0.04 m = 4 cm. Your slot is tight, so do not set this too high.
+            ("ultrasonic_stop_m", 0.04),
         ]:
             self.declare_parameter(name, default)
 
+        self.disable_ultrasonic_block = bool(
+            self.get_parameter("disable_ultrasonic_block").value
+        )
         self.min_clearance_m = float(self.get_parameter("min_clearance_m").value)
-        self.disable_ultrasonic_block = bool(self.get_parameter("disable_ultrasonic_block").value)
 
         self.planner_mode = str(self.get_parameter("planner_mode").value)
-        self.use_default_pose_when_missing = bool(self.get_parameter("use_default_pose_when_missing").value)
+        self.use_default_pose_when_missing = bool(
+            self.get_parameter("use_default_pose_when_missing").value
+        )
 
         self.default_start_x = float(self.get_parameter("default_start_x").value)
         self.default_start_y = float(self.get_parameter("default_start_y").value)
-        self.default_start_yaw_deg = float(self.get_parameter("default_start_yaw_deg").value)
+        self.default_start_yaw_deg = float(
+            self.get_parameter("default_start_yaw_deg").value
+        )
 
         self.speed_scale = float(self.get_parameter("speed_scale").value)
-        self.default_motion_seconds = float(self.get_parameter("default_motion_seconds").value)
+        self.default_motion_seconds = float(
+            self.get_parameter("default_motion_seconds").value
+        )
         self.steer_wait_seconds = float(self.get_parameter("steer_wait_seconds").value)
-        self.pause_between_commands = float(self.get_parameter("pause_between_commands").value)
+        self.pause_between_commands = float(
+            self.get_parameter("pause_between_commands").value
+        )
 
-        self.use_flow_distance_control = bool(self.get_parameter("use_flow_distance_control").value)
-        self.default_drive_distance_m = float(self.get_parameter("default_drive_distance_m").value)
-        self.drive_timeout_seconds = float(self.get_parameter("drive_timeout_seconds").value)
-        self.flow_valid_required = bool(self.get_parameter("flow_valid_required").value)
-        self.flow_distance_tolerance_m = float(self.get_parameter("flow_distance_tolerance_m").value)
+        self.use_flow_distance_control = bool(
+            self.get_parameter("use_flow_distance_control").value
+        )
+        self.default_drive_distance_m = float(
+            self.get_parameter("default_drive_distance_m").value
+        )
+        self.flow_valid_required = bool(
+            self.get_parameter("flow_valid_required").value
+        )
+        self.flow_distance_tolerance_m = float(
+            self.get_parameter("flow_distance_tolerance_m").value
+        )
+
+        self.esp32_drive_hold_seconds = float(
+            self.get_parameter("esp32_drive_hold_seconds").value
+        )
+
+        self.drive_ultrasonic_safety = bool(
+            self.get_parameter("drive_ultrasonic_safety").value
+        )
+        self.ultrasonic_stop_m = float(
+            self.get_parameter("ultrasonic_stop_m").value
+        )
 
         self.latest_pose: Optional[Pose2D] = None
         self.latest_us = [9.9] * 8
@@ -88,17 +130,55 @@ class AutoparkMaster(Node):
         self.busy = False
         self.lock = threading.Lock()
 
-        self.create_subscription(Bool, self.get_parameter("start_switch_topic").value, self.on_start_switch, 10)
-        self.create_subscription(Pose2D, self.get_parameter("pose_topic").value, self.on_pose, 10)
-        self.create_subscription(Float32MultiArray, self.get_parameter("parking_metrics_topic").value, self.on_metrics, 10)
-        self.create_subscription(Float32MultiArray, self.get_parameter("ultrasonic_topic").value, self.on_ultrasonic, 10)
-        self.create_subscription(String, self.get_parameter("slot_topic").value, self.on_slot_info, 10)
-        self.create_subscription(Float32MultiArray, self.get_parameter("flow_distance_topic").value, self.on_flow_distance, 20)
+        self.create_subscription(
+            Bool,
+            self.get_parameter("start_switch_topic").value,
+            self.on_start_switch,
+            10,
+        )
+        self.create_subscription(
+            Pose2D,
+            self.get_parameter("pose_topic").value,
+            self.on_pose,
+            10,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            self.get_parameter("parking_metrics_topic").value,
+            self.on_metrics,
+            10,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            self.get_parameter("ultrasonic_topic").value,
+            self.on_ultrasonic,
+            10,
+        )
+        self.create_subscription(
+            String,
+            self.get_parameter("slot_topic").value,
+            self.on_slot_info,
+            10,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            self.get_parameter("flow_distance_topic").value,
+            self.on_flow_distance,
+            20,
+        )
 
-        self.cmd_pub = self.create_publisher(String, self.get_parameter("command_topic").value, 10)
-        self.plan_pub = self.create_publisher(String, self.get_parameter("plan_topic").value, 10)
+        self.cmd_pub = self.create_publisher(
+            String,
+            self.get_parameter("command_topic").value,
+            10,
+        )
+        self.plan_pub = self.create_publisher(
+            String,
+            self.get_parameter("plan_topic").value,
+            10,
+        )
 
-        self.get_logger().info("autopark_master ready with flow-distance control")
+        self.get_logger().info("autopark_master ready: flow distance + ultrasonic safety")
 
     def on_pose(self, msg):
         self.latest_pose = msg
@@ -127,7 +207,9 @@ class AutoparkMaster(Node):
 
             if case_name in ("left_only", "right_only", "both_sides"):
                 if case_name != self.latest_case:
-                    self.get_logger().info("parking case updated from slot_info: " + case_name)
+                    self.get_logger().info(
+                        "parking case updated from slot_info: " + case_name
+                    )
                 self.latest_case = case_name
 
         except Exception as exc:
@@ -162,7 +244,7 @@ class AutoparkMaster(Node):
         self.get_logger().info("START_AUTOPARK ENTERED")
 
         if not self.disable_ultrasonic_block:
-            if self.latest_us and min(self.latest_us) < self.min_clearance_m:
+            if self.get_ultrasonic_min_m() < self.min_clearance_m:
                 self.publish_stop("blocked_by_ultrasonic_before_start")
                 return
 
@@ -216,8 +298,9 @@ class AutoparkMaster(Node):
         if self.latest_metrics:
             result["parking_metrics"] = self.latest_metrics
 
-        result["control_mode"] = "flow_distance_closed_loop"
+        result["control_mode"] = "flow_distance_closed_loop_ultrasonic_safety"
         result["default_drive_distance_m"] = self.default_drive_distance_m
+        result["ultrasonic_stop_m"] = self.ultrasonic_stop_m
 
         self.plan_pub.publish(String(data=json.dumps(result)))
 
@@ -231,7 +314,7 @@ class AutoparkMaster(Node):
         self.execute_motions(motions)
 
     def execute_motions(self, motions):
-        self.get_logger().info("EXECUTING MOTIONS WITH FLOW DISTANCE")
+        self.get_logger().info("EXECUTING MOTIONS WITH FLOW DISTANCE + ULTRASONIC SAFETY")
 
         for i, motion in enumerate(motions):
             cmd = self.motion_to_cmd(motion)
@@ -245,6 +328,7 @@ class AutoparkMaster(Node):
                 + json.dumps(cmd)
             )
 
+            # 1) Steering command first, no drive.
             steer_cmd = dict(cmd)
             steer_cmd["type"] = "drive"
             steer_cmd["gear"] = 0
@@ -263,11 +347,12 @@ class AutoparkMaster(Node):
 
             time.sleep(self.steer_wait_seconds)
 
+            # 2) Drive command.
+            # Duration is long hold only. Normal stop is flow target or ultrasonic safety.
             target_dist_m = float(cmd.get("target_dist_m", self.default_drive_distance_m))
-            timeout_s = float(cmd.get("timeout", self.drive_timeout_seconds))
 
             drive_cmd = dict(cmd)
-            drive_cmd["duration"] = timeout_s + 1.0
+            drive_cmd["duration"] = self.esp32_drive_hold_seconds
 
             baseline_dist = self.flow_distance_m
 
@@ -280,25 +365,29 @@ class AutoparkMaster(Node):
                 + str(drive_cmd["steer_deg"])
                 + " target_dist_m="
                 + str(target_dist_m)
-                + " timeout_s="
-                + str(timeout_s)
+                + " esp32_hold_s="
+                + str(self.esp32_drive_hold_seconds)
                 + " baseline_flow="
                 + str(baseline_dist)
+                + " ultrasonic_min_m="
+                + str(round(self.get_ultrasonic_min_m(), 3))
             )
 
             self.cmd_pub.publish(String(data=json.dumps(drive_cmd)))
 
+            # Wait a little after drive command.
+            # This lets ESP32 finish steerReady gating and avoids counting steering vibration.
+            time.sleep(1.0)
+
+            # Reset baseline AFTER drive command is active.
+            baseline_dist = self.flow_distance_m
+
             if self.use_flow_distance_control and baseline_dist is not None:
-                reached = self.wait_until_distance_reached(
+                stop_reason = self.wait_until_stop_condition(
                     baseline_dist=baseline_dist,
                     target_dist_m=target_dist_m,
-                    timeout_s=timeout_s,
                 )
-
-                if reached:
-                    self.publish_stop("target_distance_reached")
-                else:
-                    self.publish_stop("drive_timeout_or_flow_invalid")
+                self.publish_stop(stop_reason)
             else:
                 self.get_logger().warning(
                     "flow distance unavailable, fallback to default_motion_seconds"
@@ -311,22 +400,23 @@ class AutoparkMaster(Node):
         self.publish_stop("parking_sequence_done")
         self.get_logger().info("PARKING SEQUENCE DONE")
 
-    def wait_until_distance_reached(self, baseline_dist, target_dist_m, timeout_s):
-        start_t = time.monotonic()
+    def wait_until_stop_condition(self, baseline_dist, target_dist_m):
         last_log_t = 0.0
 
         while rclpy.ok():
             now = time.monotonic()
-            elapsed = now - start_t
 
-            if elapsed >= timeout_s:
+            # Ultrasonic safety stop.
+            # This replaces short duration timeout.
+            if self.drive_ultrasonic_safety and self.ultrasonic_blocked_now():
+                dmin = self.get_ultrasonic_min_m()
                 self.get_logger().warning(
-                    "drive timeout: elapsed="
-                    + str(round(elapsed, 2))
-                    + " target="
-                    + str(target_dist_m)
+                    "ultrasonic safety stop: min_clearance_m="
+                    + str(round(dmin, 3))
+                    + " limit="
+                    + str(round(self.ultrasonic_stop_m, 3))
                 )
-                return False
+                return "ultrasonic_safety_stop"
 
             if self.flow_distance_m is None:
                 time.sleep(0.05)
@@ -358,6 +448,8 @@ class AutoparkMaster(Node):
                     + str(round(self.flow_vx_mps, 3))
                     + " valid="
                     + str(self.flow_valid)
+                    + " ultrasonic_min_m="
+                    + str(round(self.get_ultrasonic_min_m(), 3))
                 )
                 last_log_t = now
 
@@ -368,11 +460,45 @@ class AutoparkMaster(Node):
                     + " target="
                     + str(round(target_dist_m, 3))
                 )
-                return True
+                return "target_distance_reached"
 
             time.sleep(0.05)
 
-        return False
+        return "ros_shutdown"
+
+    def get_ultrasonic_min_m(self):
+        vals_m = []
+
+        for v in self.latest_us:
+            try:
+                x = float(v)
+            except Exception:
+                continue
+
+            # Ignore invalid readings.
+            if x <= 0.0:
+                continue
+
+            # If value looks like cm, convert to m.
+            # Example: 35 means 35 cm = 0.35 m.
+            # If value is already m, keep it.
+            if x > 3.0:
+                x = x / 100.0
+
+            # Ignore impossible very large fallback values.
+            if x > 5.0:
+                continue
+
+            vals_m.append(x)
+
+        if not vals_m:
+            return 9.9
+
+        return min(vals_m)
+
+    def ultrasonic_blocked_now(self):
+        dmin = self.get_ultrasonic_min_m()
+        return dmin < self.ultrasonic_stop_m
 
     def motion_to_cmd(self, motion):
         gear = -1
@@ -398,11 +524,8 @@ class AutoparkMaster(Node):
                         pass
                     break
 
-            # Real-car minimum distance.
-            # Planner segment distances can be too small for the physical car,
-            # so force a safe minimum drive distance for testing.
-            if gear != 0:
-                target_dist_m = max(target_dist_m, self.default_drive_distance_m)
+        # Real-car minimum distance.
+        # Planner segment distances can be too small for the physical car.
 
         speed_mps = min(abs(speed_mps), self.speed_scale)
 
@@ -415,8 +538,10 @@ class AutoparkMaster(Node):
             "speed_mps": speed_mps,
             "steer_deg": steer_deg,
             "target_dist_m": target_dist_m,
-            "duration": self.drive_timeout_seconds + 1.0,
-            "timeout": self.drive_timeout_seconds,
+
+            # Long hold only. Not used as normal stop.
+            # Normal stop = flow target reached or ultrasonic safety stop.
+            "duration": self.esp32_drive_hold_seconds,
         }
 
     def publish_stop(self, reason):
