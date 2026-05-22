@@ -2,15 +2,36 @@ autopark_master:
   ros__parameters:
     planner_mode: "both_sides"
     slot_topic: "/autopark/slot_info"
+
     use_default_pose_when_missing: true
     default_start_x: 0.00
     default_start_y: 0.70
     default_start_yaw_deg: 180.0
-    disable_ultrasonic_block: true
-    steer_wait_seconds: 30.0
+
+    # ultrasonic used as drive safety
+    disable_ultrasonic_block: false
+    min_clearance_m: 0.10
+    drive_ultrasonic_safety: true
+    ultrasonic_stop_m: 0.10
+
     speed_scale: 0.07
+
+    # not used for normal stop anymore
     default_motion_seconds: 4.0
+
+    steer_wait_seconds: 45.0
     pause_between_commands: 1.0
+
+    flow_distance_topic: "/autopark/flow_distance"
+    use_flow_distance_control: true
+    default_drive_distance_m: 0.35
+
+    # long hold only, not real stop
+    esp32_drive_hold_seconds: 300.0
+
+    # do not stop because flow valid drops during real test
+    flow_valid_required: false
+    flow_distance_tolerance_m: 0.01
 
 perception_bridge:
   ros__parameters:
@@ -59,7 +80,8 @@ flow_distance_node:
     image_topic: "/rear_cam/image_raw"
     imu_topic: "/imu/data_raw"
     output_topic: "/autopark/flow_distance"
-    scale_m_per_px: 0.0005
-    deadband_px_per_s: 1.0
+    scale_m_per_px: 0.0105
+    deadband_px_per_frame: 0.0001
     crop_ratio: 0.60
+    min_texture_std: 5.0
     max_v_mps: 1.0

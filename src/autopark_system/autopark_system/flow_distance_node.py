@@ -1,5 +1,5 @@
-import math
 import time
+import math
 
 import cv2
 import numpy as np
@@ -14,7 +14,7 @@ from cv_bridge import CvBridge
 
 class FlowDistanceNode(Node):
     """
-    Simple optical-flow + IMU distance estimator.
+    Optical-flow distance estimator.
 
     Publishes:
       /autopark/flow_distance : Float32MultiArray
@@ -35,16 +35,18 @@ class FlowDistanceNode(Node):
         self.declare_parameter("imu_topic", "/imu/data_raw")
         self.declare_parameter("output_topic", "/autopark/flow_distance")
 
-        # Start rough. We will calibrate this with tape measure.
-        self.declare_parameter("scale_m_per_px", 0.0005)
+        # Start with this. We will calibrate after data[1] increases.
+        self.declare_parameter("scale_m_per_px", 0.05)
 
-        # Ignore tiny image motion noise
-        self.declare_parameter("deadband_px_per_s", 1.0)
+        # Very small because your previous flow value was tiny.
+        self.declare_parameter("deadband_px_per_frame", 0.0001)
 
-        # Use center crop to avoid edge fisheye distortion
+        # Center crop helps reduce fisheye edge distortion.
         self.declare_parameter("crop_ratio", 0.60)
 
-        # Limit too large spikes
+        # If distance increases too much while standing still, increase this.
+        self.declare_parameter("min_texture_std", 5.0)
+
         self.declare_parameter("max_v_mps", 1.0)
 
         self.image_topic = str(self.get_parameter("image_topic").value)
@@ -52,8 +54,9 @@ class FlowDistanceNode(Node):
         self.output_topic = str(self.get_parameter("output_topic").value)
 
         self.scale_m_per_px = float(self.get_parameter("scale_m_per_px").value)
-        self.deadband_px_per_s = float(self.get_parameter("deadband_px_per_s").value)
+        self.deadband_px_per_frame = float(self.get_parameter("deadband_px_per_frame").value)
         self.crop_ratio = float(self.get_parameter("crop_ratio").value)
+        self.min_texture_std = float(self.get_parameter("min_texture_std").value)
         self.max_v_mps = float(self.get_parameter("max_v_mps").value)
 
         self.bridge = CvBridge()
@@ -69,7 +72,7 @@ class FlowDistanceNode(Node):
 
         self.pub = self.create_publisher(Float32MultiArray, self.output_topic, 10)
 
-        self.get_logger().info("flow_distance_node ready")
+        self.get_logger().info("flow_distance_node ready: magnitude mode")
         self.get_logger().info("image_topic = " + self.image_topic)
         self.get_logger().info("imu_topic = " + self.imu_topic)
         self.get_logger().info("scale_m_per_px = " + str(self.scale_m_per_px))
@@ -109,17 +112,24 @@ class FlowDistanceNode(Node):
         gray = self.crop_center(gray)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
+        texture_std = float(np.std(gray))
+        if texture_std < self.min_texture_std:
+            self.publish(0.0, self.distance_m, 0.0, valid=False)
+            self.prev_gray = gray
+            self.prev_t = now
+            return
+
         if self.prev_gray is None:
             self.prev_gray = gray
             self.prev_t = now
-            self.publish(0.0, 0.0, 0.0, valid=False)
+            self.publish(0.0, self.distance_m, 0.0, valid=False)
             return
 
         dt = now - self.prev_t
         if dt <= 0.001 or dt > 1.0:
             self.prev_gray = gray
             self.prev_t = now
-            self.publish(0.0, 0.0, 0.0, valid=False)
+            self.publish(0.0, self.distance_m, 0.0, valid=False)
             return
 
         flow = cv2.calcOpticalFlowFarneback(
@@ -138,19 +148,27 @@ class FlowDistanceNode(Node):
         fx = flow[..., 0]
         fy = flow[..., 1]
 
-        # For forward/reverse distance, vertical image flow is often more useful.
-        # If your camera direction is different, we can swap to fx later.
-        flow_forward_px = float(np.median(fy))
-        flow_px_per_s = flow_forward_px / dt
+        mag = np.sqrt(fx * fx + fy * fy)
 
-        if abs(flow_px_per_s) < self.deadband_px_per_s:
+        # Remove extreme noise.
+        p90 = float(np.percentile(mag, 90))
+        mag_clip = np.clip(mag, 0.0, p90)
+
+        # Mean magnitude is more sensitive than median vertical flow.
+        flow_px_per_frame = float(np.mean(mag_clip))
+
+        if flow_px_per_frame < self.deadband_px_per_frame:
+            step_m = 0.0
             vx = 0.0
         else:
-            vx = flow_px_per_s * self.scale_m_per_px
+            step_m = flow_px_per_frame * self.scale_m_per_px
+            vx = step_m / dt
 
         vx = max(-self.max_v_mps, min(self.max_v_mps, vx))
 
-        self.distance_m += abs(vx) * dt
+        self.distance_m += abs(step_m)
+
+        flow_px_per_s = flow_px_per_frame / dt
 
         self.prev_gray = gray
         self.prev_t = now
