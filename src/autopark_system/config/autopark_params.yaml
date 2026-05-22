@@ -1,30 +1,65 @@
 autopark_master:
   ros__parameters:
     planner_mode: "both_sides"
+    slot_topic: "/autopark/slot_info"
     use_default_pose_when_missing: true
     default_start_x: 0.00
     default_start_y: 0.70
     default_start_yaw_deg: 180.0
     disable_ultrasonic_block: true
-    steer_wait_seconds: 4.0
-    speed_scale: 0.12
+    steer_wait_seconds: 30.0
+    speed_scale: 0.07
+    default_motion_seconds: 4.0
+    pause_between_commands: 1.0
+
+perception_bridge:
+  ros__parameters:
+    parking_metrics_topic: "/parking_metrics"
+    imu_topic: "/imu/data_raw"
+    start_pose_topic: "/autopark/start_pose"
+    slot_topic: "/autopark/slot_info"
+    publish_start_pose: true
+    # Keep false first. This makes the real-car test safer because the planner
+    # uses the known near-slot default pose until camera sign/scale is checked.
+    use_camera_pose: false
+    default_start_x: 0.00
+    default_start_y: 0.70
+    default_start_yaw_deg: 180.0
+    case_detection_mode: "fixed"
+    fixed_case: "both_sides"
+    camera_x_scale: -0.01
+    camera_y_scale: 0.01
+    camera_x_offset_m: 0.0
+    camera_y_offset_m: 0.0
+    yaw_from_camera_tilt: false
 
 serial_bridge:
   ros__parameters:
-    drive_port: "/dev/ttyUSB0"
+    drive_port: "/dev/ttyUSB1"
     us_front_port: ""
     us_rear_port: ""
-    us_all_port: "/dev/ttyUSB1"
+    us_all_port: "/dev/ttyUSB0"
     baud: 115200
+    debug_serial: false
 
 motion_executor:
   ros__parameters:
+    # Disabled because autopark_master already executes motions directly.
     plan_topic: "/autopark/plan_result_disabled"
-    drive_topic: "/autopark/cmd_json"
-    speed_scale: 0.035
-    steer_scale: 0.5
-    stop_between_segments: true
+    command_topic: "/autopark/cmd_json"
+    open_loop_speed_mps: 0.12
+    segment_pause_s: 0.20
 
-slot_detector:
+lot_detector:
   ros__parameters:
-    use_mock_detection: true
+    show_debug_windows: false
+
+flow_distance_node:
+  ros__parameters:
+    image_topic: "/rear_cam/image_raw"
+    imu_topic: "/imu/data_raw"
+    output_topic: "/autopark/flow_distance"
+    scale_m_per_px: 0.0005
+    deadband_px_per_s: 1.0
+    crop_ratio: 0.60
+    max_v_mps: 1.0

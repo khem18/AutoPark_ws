@@ -22,6 +22,7 @@ class AutoparkMaster(Node):
             ("ultrasonic_topic", "/autopark/ultrasonic"),
             ("command_topic", "/autopark/cmd_json"),
             ("plan_topic", "/autopark/plan_result"),
+            ("slot_topic", "/autopark/slot_info"),
 
             ("min_clearance_m", 0.12),
             ("disable_ultrasonic_block", True),
@@ -32,10 +33,13 @@ class AutoparkMaster(Node):
             ("default_start_y", 2.17),
             ("default_start_yaw_deg", 180.0),
 
+            # Low speed for real test
             ("speed_scale", 0.05),
-            ("default_motion_seconds", 1.0),
-            ("pause_between_commands", 0.30),
-            ("steer_wait_seconds", 3.0),
+
+            # Long timing because real steering is slow
+            ("default_motion_seconds", 30.0),
+            ("pause_between_commands", 1.0),
+            ("steer_wait_seconds", 30.0),
         ]:
             self.declare_parameter(name, default)
 
@@ -57,15 +61,50 @@ class AutoparkMaster(Node):
         self.latest_pose: Optional[Pose2D] = None
         self.latest_us = [9.9] * 8
         self.latest_metrics = []
+        self.latest_case = self.planner_mode
         self.busy = False
 
-        self.create_subscription(Bool, self.get_parameter("start_switch_topic").value, self.on_start_switch, 10)
-        self.create_subscription(Pose2D, self.get_parameter("pose_topic").value, self.on_pose, 10)
-        self.create_subscription(Float32MultiArray, self.get_parameter("parking_metrics_topic").value, self.on_metrics, 10)
-        self.create_subscription(Float32MultiArray, self.get_parameter("ultrasonic_topic").value, self.on_ultrasonic, 10)
+        self.create_subscription(
+            Bool,
+            self.get_parameter("start_switch_topic").value,
+            self.on_start_switch,
+            10,
+        )
+        self.create_subscription(
+            Pose2D,
+            self.get_parameter("pose_topic").value,
+            self.on_pose,
+            10,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            self.get_parameter("parking_metrics_topic").value,
+            self.on_metrics,
+            10,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            self.get_parameter("ultrasonic_topic").value,
+            self.on_ultrasonic,
+            10,
+        )
+        self.create_subscription(
+            String,
+            self.get_parameter("slot_topic").value,
+            self.on_slot_info,
+            10,
+        )
 
-        self.cmd_pub = self.create_publisher(String, self.get_parameter("command_topic").value, 10)
-        self.plan_pub = self.create_publisher(String, self.get_parameter("plan_topic").value, 10)
+        self.cmd_pub = self.create_publisher(
+            String,
+            self.get_parameter("command_topic").value,
+            10,
+        )
+        self.plan_pub = self.create_publisher(
+            String,
+            self.get_parameter("plan_topic").value,
+            10,
+        )
 
         self.get_logger().info("autopark_master ready")
 
@@ -79,6 +118,21 @@ class AutoparkMaster(Node):
         vals = list(msg.data)
         if len(vals) >= 8:
             self.latest_us = vals[:8]
+
+    def on_slot_info(self, msg):
+        try:
+            obj = json.loads(msg.data)
+            case_name = str(obj.get("case", self.planner_mode)).strip().lower()
+
+            if case_name in ("left_only", "right_only", "both_sides"):
+                if case_name != self.latest_case:
+                    self.get_logger().info(
+                        "parking case updated from slot_info: " + case_name
+                    )
+                self.latest_case = case_name
+
+        except Exception as exc:
+            self.get_logger().warning("bad slot_info JSON: " + str(exc))
 
     def on_start_switch(self, msg):
         self.get_logger().info("START SWITCH CALLBACK: " + str(msg.data))
@@ -134,7 +188,13 @@ class AutoparkMaster(Node):
             + str(yaw_deg)
         )
 
-        planned = plan_from_start(pose.x, pose.y, yaw_deg, self.planner_mode)
+        case_name = (
+            self.latest_case
+            if self.latest_case in ("left_only", "right_only", "both_sides")
+            else self.planner_mode
+        )
+
+        planned = plan_from_start(pose.x, pose.y, yaw_deg, case_name)
         result = result_to_dict(planned)
         motions = result.get("motions", [])
 
@@ -153,7 +213,7 @@ class AutoparkMaster(Node):
 
         self.get_logger().info(
             "plan published: case="
-            + str(self.planner_mode)
+            + str(case_name)
             + " motions="
             + str(len(motions))
         )
@@ -175,29 +235,44 @@ class AutoparkMaster(Node):
                 + json.dumps(cmd)
             )
 
-            # 1) Stop car and steer first
+            # Step 1: steer first, no drive
             steer_cmd = dict(cmd)
-            steer_cmd["speed_mps"] = 0.0
-            steer_cmd["gear"] = 0
             steer_cmd["type"] = "drive"
+            steer_cmd["gear"] = 0
+            steer_cmd["speed_mps"] = 0.0
+            steer_cmd["duration"] = self.steer_wait_seconds
 
             self.cmd_pub.publish(String(data=json.dumps(steer_cmd)))
 
             self.get_logger().info(
                 "WAIT STEER COMPLETE: steer_deg="
                 + str(steer_cmd["steer_deg"])
-                + " wait="
-                + str(self.steer_wait_seconds)
+                + " duration="
+                + str(steer_cmd["duration"])
                 + " sec"
             )
 
             time.sleep(self.steer_wait_seconds)
 
-            # 2) Drive after steering wait
-            self.cmd_pub.publish(String(data=json.dumps(cmd)))
+            # Step 2: drive after steering wait
+            drive_cmd = dict(cmd)
+            drive_cmd["duration"] = self.default_motion_seconds
 
-            duration = float(cmd.get("duration", self.default_motion_seconds))
-            time.sleep(max(0.10, duration))
+            self.cmd_pub.publish(String(data=json.dumps(drive_cmd)))
+
+            self.get_logger().info(
+                "DRIVE COMMAND: gear="
+                + str(drive_cmd["gear"])
+                + " speed="
+                + str(drive_cmd["speed_mps"])
+                + " steer="
+                + str(drive_cmd["steer_deg"])
+                + " duration="
+                + str(drive_cmd["duration"])
+                + " sec"
+            )
+
+            time.sleep(self.default_motion_seconds)
 
             self.publish_stop("segment_pause")
             time.sleep(self.pause_between_commands)
@@ -209,7 +284,6 @@ class AutoparkMaster(Node):
         gear = -1
         steer_deg = 0.0
         speed_mps = self.speed_scale
-        duration = self.default_motion_seconds
 
         if isinstance(motion, dict):
             if "gear" in motion:
@@ -221,17 +295,13 @@ class AutoparkMaster(Node):
             if "speed_mps" in motion:
                 speed_mps = abs(float(motion["speed_mps"]))
 
-            if "duration" in motion:
-                duration = float(motion["duration"])
-            elif "dist_m" in motion:
-                dist = abs(float(motion["dist_m"]))
-                duration = max(0.4, dist / max(speed_mps, 0.05))
-            elif "dist" in motion:
-                dist = abs(float(motion["dist"]))
-                duration = max(0.4, dist / max(speed_mps, 0.05))
-
+        # Limit speed for safety
         speed_mps = min(abs(speed_mps), self.speed_scale)
-        duration = max(1.2, min(duration, 2.0))
+
+        # IMPORTANT:
+        # Keep duration because ESP32 firmware needs it.
+        # Short duration is bad, so use long test duration.
+        duration = self.default_motion_seconds
 
         return {
             "type": "drive",
@@ -253,6 +323,7 @@ class AutoparkMaster(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = AutoparkMaster()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

@@ -26,6 +26,8 @@ class LotDetector(Node):
             anti_lag_qos
         )
         self.bridge = CvBridge()
+        self.declare_parameter('show_debug_windows', False)
+        self.show_debug_windows = bool(self.get_parameter('show_debug_windows').value)
         
         # --- CREATE THE PARKING METRICS PUBLISHER ---
         # NOTE: Topic matches the Open-Loop Parker dashboard!
@@ -357,12 +359,13 @@ class LotDetector(Node):
 
         cv2.addWeighted(overlay, 0.4, bev_frame, 0.6, 0, bev_frame)
 
-        # 6. SHOW THE FEEDS
-        cv2.imshow("1. Normal img", frame)
-        cv2.imshow("2. BEV img", bev_frame)
-        cv2.imshow("3. Line Mask", yellow_mask)
-        cv2.imshow("4. Anomaly Mask", object_mask) 
-        cv2.waitKey(1)
+        # 6. Optional debug windows. Keep off on headless RDK/SSH.
+        if self.show_debug_windows:
+            cv2.imshow("1. Normal img", frame)
+            cv2.imshow("2. BEV img", bev_frame)
+            cv2.imshow("3. Line Mask", yellow_mask)
+            cv2.imshow("4. Anomaly Mask", object_mask)
+            cv2.waitKey(1)
         
 def main(args=None):
     rclpy.init(args=args)
