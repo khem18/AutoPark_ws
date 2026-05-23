@@ -587,8 +587,8 @@ def plan_from_start(
         result.planner = "real_middle_slot_planner(realcar_fallback_template)"
         result.primitive_seq = [
             ("f", -15.0, 0.60),
-            ("r", 25.0, 0.90),
-            ("r", 8.0, 0.35),
+            ("r", 25.0, 0.65),
+            ("r", 8.0, 0.06),
         ]
 
         ok, path, end_pose = simulate_sequence(
