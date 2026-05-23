@@ -33,6 +33,9 @@ autopark_master:
     flow_valid_required: false
     flow_distance_tolerance_m: 0.01
 
+    expected_real_speed_mps: 0.025
+    min_drive_time_ratio: 0.90
+
 perception_bridge:
   ros__parameters:
     parking_metrics_topic: "/parking_metrics"

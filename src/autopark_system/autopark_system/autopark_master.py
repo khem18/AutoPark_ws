@@ -27,7 +27,8 @@ class AutoparkMaster(Node):
             ("flow_distance_topic", "/autopark/flow_distance"),
 
             # Before-start ultrasonic block.
-            # Keep true for now because tight slot may make pre-start ultrasonic too sensitive.
+            # For tight slot, keep this true in YAML:
+            # disable_ultrasonic_block: true
             ("disable_ultrasonic_block", True),
             ("min_clearance_m", 0.12),
 
@@ -37,15 +38,15 @@ class AutoparkMaster(Node):
             ("default_start_y", 0.70),
             ("default_start_yaw_deg", 180.0),
 
-            # Your calibrated real-car speed command
+            # Real-car speed command
             ("speed_scale", 0.07),
 
             # Fallback only if flow is missing
             ("default_motion_seconds", 4.0),
 
-            # Steering still uses wait time.
-            # ESP32 steerReady should also block drive if steering is not ready.
-            ("steer_wait_seconds", 45.0),
+            # ROS steering wait before drive command.
+            # ESP32 steerReady also protects drive.
+            ("steer_wait_seconds", 8.0),
             ("pause_between_commands", 1.0),
 
             # Optical-flow closed-loop drive
@@ -54,16 +55,17 @@ class AutoparkMaster(Node):
             ("flow_valid_required", False),
             ("flow_distance_tolerance_m", 0.01),
 
-            # This is NOT normal stop control.
-            # It only keeps ESP32 command active for long time.
+            # Long hold only. Not normal stop.
             ("esp32_drive_hold_seconds", 300.0),
 
             # Ultrasonic safety during drive
             ("drive_ultrasonic_safety", True),
+            ("ultrasonic_stop_m", 0.025),
 
-            # Safety stop distance.
-            # 0.04 m = 4 cm. Your slot is tight, so do not set this too high.
-            ("ultrasonic_stop_m", 0.04),
+            # Protect against false optical-flow early stop during turning.
+            # Flow can over-count when steering/camera vibration happens.
+            ("expected_real_speed_mps", 0.08),
+            ("min_drive_time_ratio", 0.85),
         ]:
             self.declare_parameter(name, default)
 
@@ -114,6 +116,13 @@ class AutoparkMaster(Node):
         )
         self.ultrasonic_stop_m = float(
             self.get_parameter("ultrasonic_stop_m").value
+        )
+
+        self.expected_real_speed_mps = float(
+            self.get_parameter("expected_real_speed_mps").value
+        )
+        self.min_drive_time_ratio = float(
+            self.get_parameter("min_drive_time_ratio").value
         )
 
         self.latest_pose: Optional[Pose2D] = None
@@ -178,7 +187,9 @@ class AutoparkMaster(Node):
             10,
         )
 
-        self.get_logger().info("autopark_master ready: flow distance + ultrasonic safety")
+        self.get_logger().info(
+            "autopark_master ready: planner distance + flow distance + ultrasonic safety"
+        )
 
     def on_pose(self, msg):
         self.latest_pose = msg
@@ -298,9 +309,11 @@ class AutoparkMaster(Node):
         if self.latest_metrics:
             result["parking_metrics"] = self.latest_metrics
 
-        result["control_mode"] = "flow_distance_closed_loop_ultrasonic_safety"
+        result["control_mode"] = "planner_distance_flow_closed_loop_ultrasonic_safety"
         result["default_drive_distance_m"] = self.default_drive_distance_m
         result["ultrasonic_stop_m"] = self.ultrasonic_stop_m
+        result["expected_real_speed_mps"] = self.expected_real_speed_mps
+        result["min_drive_time_ratio"] = self.min_drive_time_ratio
 
         self.plan_pub.publish(String(data=json.dumps(result)))
 
@@ -314,7 +327,9 @@ class AutoparkMaster(Node):
         self.execute_motions(motions)
 
     def execute_motions(self, motions):
-        self.get_logger().info("EXECUTING MOTIONS WITH FLOW DISTANCE + ULTRASONIC SAFETY")
+        self.get_logger().info(
+            "EXECUTING MOTIONS WITH PLANNER DISTANCE + FLOW + ULTRASONIC SAFETY"
+        )
 
         for i, motion in enumerate(motions):
             cmd = self.motion_to_cmd(motion)
@@ -328,7 +343,6 @@ class AutoparkMaster(Node):
                 + json.dumps(cmd)
             )
 
-            # 1) Steering command first, no drive.
             steer_cmd = dict(cmd)
             steer_cmd["type"] = "drive"
             steer_cmd["gear"] = 0
@@ -347,17 +361,13 @@ class AutoparkMaster(Node):
 
             time.sleep(self.steer_wait_seconds)
 
-            # 2) Drive command.
-            # Duration is long hold only. Normal stop is flow target or ultrasonic safety.
             target_dist_m = float(cmd.get("target_dist_m", self.default_drive_distance_m))
 
             drive_cmd = dict(cmd)
             drive_cmd["duration"] = self.esp32_drive_hold_seconds
 
-            baseline_dist = self.flow_distance_m
-
             self.get_logger().info(
-                "DRIVE START: gear="
+                "DRIVE COMMAND: gear="
                 + str(drive_cmd["gear"])
                 + " speed="
                 + str(drive_cmd["speed_mps"])
@@ -367,25 +377,30 @@ class AutoparkMaster(Node):
                 + str(target_dist_m)
                 + " esp32_hold_s="
                 + str(self.esp32_drive_hold_seconds)
-                + " baseline_flow="
-                + str(baseline_dist)
                 + " ultrasonic_min_m="
                 + str(round(self.get_ultrasonic_min_m(), 3))
             )
 
             self.cmd_pub.publish(String(data=json.dumps(drive_cmd)))
 
-            # Wait a little after drive command.
-            # This lets ESP32 finish steerReady gating and avoids counting steering vibration.
+            # Let ESP32 steerReady gate settle, then reset flow baseline.
             time.sleep(1.0)
-
-            # Reset baseline AFTER drive command is active.
             baseline_dist = self.flow_distance_m
+
+            min_drive_time_s = self.compute_min_drive_time(target_dist_m)
+
+            self.get_logger().info(
+                "FLOW BASELINE RESET: baseline="
+                + str(baseline_dist)
+                + " min_drive_time_s="
+                + str(round(min_drive_time_s, 2))
+            )
 
             if self.use_flow_distance_control and baseline_dist is not None:
                 stop_reason = self.wait_until_stop_condition(
                     baseline_dist=baseline_dist,
                     target_dist_m=target_dist_m,
+                    min_drive_time_s=min_drive_time_s,
                 )
                 self.publish_stop(stop_reason)
             else:
@@ -400,14 +415,25 @@ class AutoparkMaster(Node):
         self.publish_stop("parking_sequence_done")
         self.get_logger().info("PARKING SEQUENCE DONE")
 
-    def wait_until_stop_condition(self, baseline_dist, target_dist_m):
+    def compute_min_drive_time(self, target_dist_m):
+        # Minimum time before accepting flow target.
+        # This prevents false early stop from turning/vibration/camera flow.
+        # It is not the main stop condition. Main stop is still flow target or ultrasonic.
+        t = (
+            target_dist_m / max(self.expected_real_speed_mps, 0.03)
+        ) * self.min_drive_time_ratio
+
+        return max(2.0, t)
+
+    def wait_until_stop_condition(self, baseline_dist, target_dist_m, min_drive_time_s=0.0):
+        start_t = time.monotonic()
         last_log_t = 0.0
+        last_early_log_t = 0.0
 
         while rclpy.ok():
             now = time.monotonic()
+            elapsed_drive = now - start_t
 
-            # Ultrasonic safety stop.
-            # This replaces short duration timeout.
             if self.drive_ultrasonic_safety and self.ultrasonic_blocked_now():
                 dmin = self.get_ultrasonic_min_m()
                 self.get_logger().warning(
@@ -444,6 +470,10 @@ class AutoparkMaster(Node):
                     + str(round(moved, 3))
                     + " / target="
                     + str(round(target_dist_m, 3))
+                    + " elapsed="
+                    + str(round(elapsed_drive, 2))
+                    + " / min="
+                    + str(round(min_drive_time_s, 2))
                     + " vx="
                     + str(round(self.flow_vx_mps, 3))
                     + " valid="
@@ -453,12 +483,33 @@ class AutoparkMaster(Node):
                 )
                 last_log_t = now
 
-            if moved + self.flow_distance_tolerance_m >= target_dist_m:
+            flow_reached = moved + self.flow_distance_tolerance_m >= target_dist_m
+
+            if flow_reached and elapsed_drive < min_drive_time_s:
+                if now - last_early_log_t > 0.5:
+                    self.get_logger().info(
+                        "flow reached early but waiting min time: moved="
+                        + str(round(moved, 3))
+                        + " target="
+                        + str(round(target_dist_m, 3))
+                        + " elapsed="
+                        + str(round(elapsed_drive, 2))
+                        + " / "
+                        + str(round(min_drive_time_s, 2))
+                    )
+                    last_early_log_t = now
+
+                time.sleep(0.05)
+                continue
+
+            if flow_reached and elapsed_drive >= min_drive_time_s:
                 self.get_logger().info(
                     "target distance reached: moved="
                     + str(round(moved, 3))
                     + " target="
                     + str(round(target_dist_m, 3))
+                    + " elapsed="
+                    + str(round(elapsed_drive, 2))
                 )
                 return "target_distance_reached"
 
@@ -475,17 +526,13 @@ class AutoparkMaster(Node):
             except Exception:
                 continue
 
-            # Ignore invalid readings.
             if x <= 0.0:
                 continue
 
             # If value looks like cm, convert to m.
-            # Example: 35 means 35 cm = 0.35 m.
-            # If value is already m, keep it.
             if x > 3.0:
                 x = x / 100.0
 
-            # Ignore impossible very large fallback values.
             if x > 5.0:
                 continue
 
@@ -524,8 +571,8 @@ class AutoparkMaster(Node):
                         pass
                     break
 
-        # Real-car minimum distance.
-        # Planner segment distances can be too small for the physical car.
+        # Use path-planning distance directly.
+        # Do not force minimum distance here.
 
         speed_mps = min(abs(speed_mps), self.speed_scale)
 
@@ -538,9 +585,6 @@ class AutoparkMaster(Node):
             "speed_mps": speed_mps,
             "steer_deg": steer_deg,
             "target_dist_m": target_dist_m,
-
-            # Long hold only. Not used as normal stop.
-            # Normal stop = flow target reached or ultrasonic safety stop.
             "duration": self.esp32_drive_hold_seconds,
         }
 
