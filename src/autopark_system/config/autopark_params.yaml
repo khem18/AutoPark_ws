@@ -1,40 +1,56 @@
 autopark_master:
   ros__parameters:
-    planner_mode: "both_sides"
+    planner_mode: "left_only"
     slot_topic: "/autopark/slot_info"
+
+    start_switch_topic: "/autopark/start_switch"
+    pose_topic: "/autopark/start_pose"
+    parking_metrics_topic: "/parking_metrics"
+    ultrasonic_topic: "/autopark/ultrasonic"
+    command_topic: "/autopark/cmd_json"
+    plan_topic: "/autopark/plan_result"
+    flow_distance_topic: "/autopark/flow_distance"
+    imu_topic: "/imu/data_raw"
 
     use_default_pose_when_missing: true
     default_start_x: 0.00
     default_start_y: 0.70
     default_start_yaw_deg: 180.0
 
-    # ultrasonic used as drive safety
+    # Real mode: fallback path is for bench tests only.
+    # If planner fails, autopark_master stops with planner_failed_no_motion.
+    allow_fallback_path: false
+
+    # Tight slot: do not block before start using 12 cm logic.
     disable_ultrasonic_block: true
     min_clearance_m: 0.12
-    drive_ultrasonic_safety: false
-    ultrasonic_stop_m: 0.025
 
-    speed_scale: 0.07
+    # Main command speed cap sent to ESP32.
+    speed_scale: 0.10
 
-    # not used for normal stop anymore
-    default_motion_seconds: 4.0
-
-    steer_wait_seconds: 15.0
+    # Steer first, then drive. ESP32 steerReady also gates drive motor.
+    steer_wait_seconds: 10.0
     pause_between_commands: 1.0
 
-    flow_distance_topic: "/autopark/flow_distance"
-    use_flow_distance_control: true
-    default_drive_distance_m: 0.35
+    # Calibrated speeds used for: drive_time = planner_dist_m / speed.
+    forward_turn_speed_mps: 0.055
+    reverse_turn_speed_mps: 0.076
+    forward_straight_speed_mps: 0.0675
+    reverse_straight_speed_mps: 0.0775
+    straight_steer_threshold_deg: 3.0
 
-    # long hold only, not real stop
-    esp32_drive_hold_seconds: 300.0
+    drive_time_min_s: 2.0
+    drive_time_max_s: 60.0
 
-    # do not stop because flow valid drops during real test
+    # Ultrasonic is emergency stop only while driving.
+    drive_ultrasonic_safety: true
+    ultrasonic_stop_m: 0.025
+
+    # Optical flow is logging/monitoring only in this version.
     flow_valid_required: false
-    flow_distance_tolerance_m: 0.01
 
-    expected_real_speed_mps: 0.004
-    min_drive_time_ratio: 0.70
+    # Usually false because physical start switch already arms ESP32.
+    send_arm_command_on_start: false
 
 perception_bridge:
   ros__parameters:
@@ -43,14 +59,12 @@ perception_bridge:
     start_pose_topic: "/autopark/start_pose"
     slot_topic: "/autopark/slot_info"
     publish_start_pose: true
-    # Keep false first. This makes the real-car test safer because the planner
-    # uses the known near-slot default pose until camera sign/scale is checked.
     use_camera_pose: false
     default_start_x: 0.00
     default_start_y: 0.70
     default_start_yaw_deg: 180.0
     case_detection_mode: "fixed"
-    fixed_case: "both_sides"
+    fixed_case: "left_only"
     camera_x_scale: -0.01
     camera_y_scale: 0.01
     camera_x_offset_m: 0.0
@@ -59,7 +73,7 @@ perception_bridge:
 
 serial_bridge:
   ros__parameters:
-    drive_port: "/dev/ttyUSB0"
+    drive_port: "/dev/ttyUSB2"
     us_front_port: ""
     us_rear_port: ""
     us_all_port: "/dev/ttyUSB1"
@@ -68,7 +82,7 @@ serial_bridge:
 
 motion_executor:
   ros__parameters:
-    # Disabled because autopark_master already executes motions directly.
+    # Disabled because autopark_master executes timed motions directly.
     plan_topic: "/autopark/plan_result_disabled"
     command_topic: "/autopark/cmd_json"
     open_loop_speed_mps: 0.12
