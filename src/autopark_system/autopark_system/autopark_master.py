@@ -15,15 +15,19 @@ from .planner_adapter import plan_from_start, result_to_dict
 
 class AutoparkMaster(Node):
     """
-    Real-car autopark master, timed-distance version.
+    Real-car autopark master.
 
-    Control rule:
-      planner dist_m -> calibrated speed -> drive duration
+    Main control:
+      planner dist_m -> split into safe chunks -> calibrated speed -> drive duration
 
-    Optical flow and IMU are NOT used as stop conditions.
-    They are used only for logging.
-
-    Ultrasonic is used only as emergency stop while driving.
+    Important:
+      - Planner full distance is NOT cut anymore.
+      - Each planner motion is split into chunks <= max_segment_dist_m.
+      - Optical flow is NOT used as exact distance stop.
+      - IMU orientation is NOT used.
+      - IMU gyro-z is integrated only for logging.
+      - Ultrasonic is emergency stop while driving.
+      - Stuck retry is available, but should stay disabled for now.
     """
 
     def __init__(self):
@@ -41,7 +45,6 @@ class AutoparkMaster(Node):
             ("imu_topic", "/imu/data_raw"),
 
             # Before-start ultrasonic block.
-            # Keep disabled for tight parking test.
             ("disable_ultrasonic_block", True),
             ("min_clearance_m", 0.12),
 
@@ -52,48 +55,56 @@ class AutoparkMaster(Node):
             ("default_start_y", 0.70),
             ("default_start_yaw_deg", 180.0),
 
-            # For hardware test only.
             # Real mode should be false.
-            ("allow_fallback_path", True),
+            ("allow_fallback_path", False),
 
             # Command speed cap sent to ESP32.
-            ("speed_scale", 0.07),
+            ("speed_scale", 0.10),
 
-            # IMPORTANT:
-            # Your ESP32 current WHEEL_MAX_STEER_DEG is 12 deg.
-            # So keep command below that.
+            # Keep within current ESP32 steering limit.
             ("max_command_steer_deg", 10.0),
 
-            # Steering settle time before each drive segment.
-            # ESP32 steerReady also gates the drive motor.
+            # Steering settle time before each drive chunk.
             ("steer_wait_seconds", 10.0),
             ("pause_between_commands", 1.0),
 
-            # Calibrated real-car speeds.
-            # Updated from your test:
-            # forward 0.07 for 4 s = 0.27 m -> 0.0675 m/s
-            # reverse 0.07 for 4 s = 0.31 m -> 0.0775 m/s
-            ("forward_turn_speed_mps", 0.040),
-            ("reverse_turn_speed_mps", 0.050),
+            # Calibrated real-car speeds for timed distance.
+            ("forward_turn_speed_mps", 0.055),
+            ("reverse_turn_speed_mps", 0.076),
             ("forward_straight_speed_mps", 0.0675),
             ("reverse_straight_speed_mps", 0.0775),
             ("straight_steer_threshold_deg", 3.0),
 
+            # Safe chunk distance.
+            # Planner distance is preserved, but split into chunks <= this value.
+            ("max_segment_dist_m", 0.50),
+            ("min_chunk_dist_m", 0.05),
+
             # Time clamp.
-            ("drive_time_min_s", 1.0),
+            ("drive_time_min_s", 2.0),
             ("drive_time_max_s", 60.0),
 
             # Ultrasonic safety during drive only.
-            # For first fallback test, keep false.
-            # For real parking, change to true.
-            ("drive_ultrasonic_safety", False),
+            ("drive_ultrasonic_safety", True),
             ("ultrasonic_stop_m", 0.025),
 
-            # Kept for compatibility, but not used as stop logic.
+            # Kept for compatibility.
             ("flow_valid_required", False),
 
-            # Usually false because the physical start switch already arms ESP32.
+            # Usually false because physical start switch already arms ESP32.
             ("send_arm_command_on_start", False),
+
+            # Stuck / no-motion detection.
+            # Keep false for now because it false-triggered during slip.
+            ("enable_stuck_retry", False),
+            ("stuck_check_after_s", 2.0),
+            ("stuck_flow_delta_min", 0.02),
+            ("stuck_yaw_delta_min_deg", 0.1),
+            ("stuck_metrics_delta_min", 3.0),
+            ("stuck_kick_speed_mps", 0.10),
+            ("stuck_kick_duration_s", 0.4),
+            ("stuck_retry_pause_s", 0.2),
+            ("stuck_max_retries", 1),
         ]:
             self.declare_parameter(name, default)
 
@@ -119,6 +130,9 @@ class AutoparkMaster(Node):
         self.reverse_straight_speed_mps = float(self.get_parameter("reverse_straight_speed_mps").value)
         self.straight_steer_threshold_deg = float(self.get_parameter("straight_steer_threshold_deg").value)
 
+        self.max_segment_dist_m = float(self.get_parameter("max_segment_dist_m").value)
+        self.min_chunk_dist_m = float(self.get_parameter("min_chunk_dist_m").value)
+
         self.drive_time_min_s = float(self.get_parameter("drive_time_min_s").value)
         self.drive_time_max_s = float(self.get_parameter("drive_time_max_s").value)
 
@@ -128,22 +142,34 @@ class AutoparkMaster(Node):
         self.flow_valid_required = bool(self.get_parameter("flow_valid_required").value)
         self.send_arm_command_on_start = bool(self.get_parameter("send_arm_command_on_start").value)
 
+        self.enable_stuck_retry = bool(self.get_parameter("enable_stuck_retry").value)
+        self.stuck_check_after_s = float(self.get_parameter("stuck_check_after_s").value)
+        self.stuck_flow_delta_min = float(self.get_parameter("stuck_flow_delta_min").value)
+        self.stuck_yaw_delta_min_deg = float(self.get_parameter("stuck_yaw_delta_min_deg").value)
+        self.stuck_metrics_delta_min = float(self.get_parameter("stuck_metrics_delta_min").value)
+        self.stuck_kick_speed_mps = float(self.get_parameter("stuck_kick_speed_mps").value)
+        self.stuck_kick_duration_s = float(self.get_parameter("stuck_kick_duration_s").value)
+        self.stuck_retry_pause_s = float(self.get_parameter("stuck_retry_pause_s").value)
+        self.stuck_max_retries = int(self.get_parameter("stuck_max_retries").value)
+
         self.latest_pose: Optional[Pose2D] = None
         self.latest_us = [9.9] * 8
         self.latest_metrics: List[float] = []
         self.latest_case = self.planner_mode
 
-        # Optical-flow monitor values only.
+        # Optical-flow monitor values.
+        self.latest_flow_data: List[float] = []
         self.flow_vx_mps = 0.0
         self.flow_distance_m: Optional[float] = None
         self.flow_yaw_rate = 0.0
         self.flow_valid = False
         self.last_flow_time = 0.0
 
-        # IMU monitor values only.
-        self.imu_yaw_rad: Optional[float] = None
-        self.imu_yaw_deg: Optional[float] = None
+        # IMU yaw from gyro-z integration.
+        self.imu_yaw_rad = 0.0
+        self.imu_yaw_deg = 0.0
         self.last_imu_time = 0.0
+        self.imu_gyro_z = 0.0
 
         self.busy = False
         self.lock = threading.Lock()
@@ -188,7 +214,7 @@ class AutoparkMaster(Node):
             Imu,
             self.get_parameter("imu_topic").value,
             self.on_imu,
-            20,
+            50,
         )
 
         self.cmd_pub = self.create_publisher(
@@ -203,8 +229,7 @@ class AutoparkMaster(Node):
         )
 
         self.get_logger().info(
-            "autopark_master ready: timed-distance drive, "
-            "safe fallback steer, ultrasonic emergency stop, flow/IMU log only"
+            "autopark_master ready: planner full distance chunked into safe timed moves"
         )
 
     # ------------------------------------------------------------------
@@ -222,20 +247,36 @@ class AutoparkMaster(Node):
             self.latest_us = vals[:8]
 
     def on_flow_distance(self, msg: Float32MultiArray):
-        data = list(msg.data)
+        data = [float(x) for x in list(msg.data)]
+        self.latest_flow_data = data
+        self.last_flow_time = time.monotonic()
+
         if len(data) >= 6:
             self.flow_vx_mps = float(data[0])
             self.flow_distance_m = float(data[1])
             self.flow_yaw_rate = float(data[2])
             self.flow_valid = bool(data[5] > 0.5)
-            self.last_flow_time = time.monotonic()
+        elif len(data) >= 2:
+            self.flow_distance_m = float(data[1])
+            self.flow_valid = True
+        else:
+            self.flow_valid = False
 
     def on_imu(self, msg: Imu):
-        q = msg.orientation
-        yaw = self.quaternion_to_yaw(q.x, q.y, q.z, q.w)
-        self.imu_yaw_rad = yaw
-        self.imu_yaw_deg = math.degrees(yaw)
-        self.last_imu_time = time.monotonic()
+        now = time.monotonic()
+
+        if self.last_imu_time <= 0.0:
+            self.last_imu_time = now
+            return
+
+        dt = now - self.last_imu_time
+        self.last_imu_time = now
+
+        if 0.0 < dt < 0.2:
+            wz = float(msg.angular_velocity.z)
+            self.imu_gyro_z = wz
+            self.imu_yaw_rad += wz * dt
+            self.imu_yaw_deg = math.degrees(self.imu_yaw_rad)
 
     def on_slot_info(self, msg: String):
         try:
@@ -336,22 +377,18 @@ class AutoparkMaster(Node):
             + reason
         )
 
-        # If planner failed/no output and fallback is allowed, use safe fallback.
         if not motions and self.allow_fallback_path:
             motions = self.get_safe_fallback_motions()
             result["reason"] = "safe_internal_fallback_no_planner_motion"
             result["motions"] = motions
             used_safe_fallback = True
 
-        # If planner adapter returned fallback but steering is too aggressive,
-        # replace it with our safe fallback for current ±12 deg ESP32 limit.
         if ("fallback" in reason.lower()) and self.allow_fallback_path:
             motions = self.get_safe_fallback_motions()
             result["reason"] = "safe_internal_fallback_replace_adapter_fallback"
             result["motions"] = motions
             used_safe_fallback = True
 
-        # In real mode, reject fallback.
         if ("fallback" in reason.lower()) and not self.allow_fallback_path:
             result["control_mode"] = "planner_failed_no_motion"
             result["rejected_fallback_path"] = True
@@ -364,12 +401,24 @@ class AutoparkMaster(Node):
             self.publish_stop("planner_failed_no_motion")
             return
 
+        expanded_motions = self.expand_motion_chunks(motions)
+
+        if not expanded_motions:
+            result["control_mode"] = "planner_failed_empty_after_chunk_expand"
+            self.plan_pub.publish(String(data=json.dumps(result)))
+            self.publish_stop("planner_failed_empty_after_chunk_expand")
+            return
+
         if self.latest_metrics:
             result["parking_metrics"] = self.latest_metrics
 
-        result["control_mode"] = "planner_distance_timed_drive_ultrasonic_safety_flow_imu_log_only"
+        result["control_mode"] = "planner_full_distance_chunked_timed_drive_ultrasonic_safety"
         result["used_safe_fallback"] = used_safe_fallback
+        result["original_motion_count"] = len(motions)
+        result["expanded_chunk_count"] = len(expanded_motions)
         result["max_command_steer_deg"] = self.max_command_steer_deg
+        result["max_segment_dist_m"] = self.max_segment_dist_m
+        result["min_chunk_dist_m"] = self.min_chunk_dist_m
         result["speed_table_mps"] = {
             "forward_turn": self.forward_turn_speed_mps,
             "reverse_turn": self.reverse_turn_speed_mps,
@@ -379,30 +428,97 @@ class AutoparkMaster(Node):
         result["drive_time_min_s"] = self.drive_time_min_s
         result["drive_time_max_s"] = self.drive_time_max_s
         result["ultrasonic_stop_m"] = self.ultrasonic_stop_m
-        result["flow_used_for_stop"] = False
-        result["imu_used_for_stop"] = False
+        result["flow_used_for_exact_stop"] = False
+        result["imu_orientation_used"] = False
+        result["imu_gyro_z_integrated"] = True
+        result["enable_stuck_retry"] = self.enable_stuck_retry
+
+        # Replace motions in published plan result with chunked executable motions.
+        result["executable_motions"] = expanded_motions
 
         self.plan_pub.publish(String(data=json.dumps(result)))
 
         self.get_logger().info(
             "plan published: case="
             + str(case_name)
-            + " motions="
+            + " original_motions="
             + str(len(motions))
+            + " expanded_chunks="
+            + str(len(expanded_motions))
             + " safe_fallback="
             + str(used_safe_fallback)
         )
 
-        self.execute_motions(motions)
+        self.execute_motions(expanded_motions)
+
+    def expand_motion_chunks(self, motions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Preserve planner full distance, but split each motion into safe chunks.
+
+        Example:
+          planner motion: reverse 1.50 m
+          chunks: 0.50 + 0.50 + 0.50
+
+        This replaces the old clamp behavior:
+          target_dist_m = min(target_dist_m, 0.50)
+        which caused the car to stop shallow.
+        """
+        expanded: List[Dict[str, Any]] = []
+
+        max_chunk = max(float(self.min_chunk_dist_m), float(self.max_segment_dist_m))
+        min_chunk = max(0.01, float(self.min_chunk_dist_m))
+
+        for parent_index, motion in enumerate(motions):
+            if not isinstance(motion, dict):
+                continue
+
+            gear = int(motion.get("gear", -1))
+            steer_deg = float(motion.get("steer_deg", 0.0))
+
+            dist_m = 0.0
+            for key in ("dist_m", "target_dist_m", "distance_m", "dist"):
+                if key in motion:
+                    try:
+                        dist_m = abs(float(motion[key]))
+                    except Exception:
+                        dist_m = 0.0
+                    break
+
+            if dist_m <= 0.0:
+                continue
+
+            remaining = dist_m
+            chunk_index = 0
+
+            while remaining > 1e-6:
+                if remaining <= max_chunk:
+                    chunk_dist = remaining
+                else:
+                    chunk_dist = max_chunk
+
+                # Avoid a tiny final chunk, merge it into previous chunk if possible.
+                if remaining - chunk_dist > 0.0 and remaining - chunk_dist < min_chunk:
+                    chunk_dist = remaining
+
+                chunk_index += 1
+
+                chunk = dict(motion)
+                chunk["gear"] = gear
+                chunk["steer_deg"] = steer_deg
+                chunk["dist_m"] = chunk_dist
+                chunk["target_dist_m"] = chunk_dist
+                chunk["parent_motion_index"] = parent_index + 1
+                chunk["parent_dist_m"] = dist_m
+                chunk["chunk_index"] = chunk_index
+                chunk["is_chunked"] = dist_m > max_chunk
+
+                expanded.append(chunk)
+
+                remaining -= chunk_dist
+
+        return expanded
 
     def get_safe_fallback_motions(self) -> List[Dict[str, Any]]:
-        """
-        Reverse-only safe fallback for real-car test.
-
-        Reason:
-        Forward turning is currently inconsistent on your car.
-        Reverse turning already moves more reliably.
-        """
         return [
             {
                 "gear": -1,
@@ -436,7 +552,7 @@ class AutoparkMaster(Node):
 
     def execute_motions(self, motions: List[Dict[str, Any]]):
         self.get_logger().info(
-            "EXECUTING MOTIONS: planner dist_m + calibrated time, ultrasonic emergency stop"
+            "EXECUTING MOTION CHUNKS: full planner distance preserved, each chunk timed"
         )
 
         for i, motion in enumerate(motions):
@@ -446,12 +562,22 @@ class AutoparkMaster(Node):
             drive_speed_mps = float(cmd["speed_mps"])
             drive_time_s = float(cmd["duration"])
 
+            parent_index = motion.get("parent_motion_index", segment_index)
+            chunk_index = motion.get("chunk_index", 1)
+            parent_dist_m = motion.get("parent_dist_m", target_dist_m)
+
             self.get_logger().info(
-                "SEGMENT "
+                "CHUNK "
                 + str(segment_index)
                 + "/"
                 + str(len(motions))
-                + ": gear="
+                + " parent="
+                + str(parent_index)
+                + " chunk="
+                + str(chunk_index)
+                + " parent_dist="
+                + str(round(float(parent_dist_m), 3))
+                + " gear="
                 + str(cmd["gear"])
                 + " steer="
                 + str(round(cmd["steer_deg"], 2))
@@ -464,9 +590,6 @@ class AutoparkMaster(Node):
             )
 
             # 1) Send steer command first.
-            # IMPORTANT:
-            # Do NOT use gear 0 here, because some ESP32 AUTO logic ignores steering
-            # in neutral. Use the same gear as the coming drive command but speed 0.
             steer_gear = int(cmd["gear"])
             if steer_gear == 0:
                 steer_gear = 1
@@ -490,35 +613,39 @@ class AutoparkMaster(Node):
             )
             self.sleep_while_ok(self.steer_wait_seconds)
 
-            # 2) Monitoring baselines only.
-            flow_start = self.flow_distance_m
+            # 2) Monitoring baselines.
+            flow_start_abs = self.flow_distance_m
             imu_start = self.imu_yaw_deg
+            metrics_start = list(self.latest_metrics)
             us_start = self.get_ultrasonic_min_m()
 
-            # 3) Send timed drive command.
-            # ESP32 still blocks drive until steerReady() is true.
+            # 3) Send timed drive chunk.
             self.publish_cmd(cmd)
 
-            stop_reason, elapsed = self.wait_drive_timed(
+            stop_reason, elapsed, retry_count = self.wait_drive_timed(
                 drive_time_s=drive_time_s,
                 segment_index=segment_index,
+                cmd=cmd,
             )
 
-            flow_end = self.flow_distance_m
+            flow_end_abs = self.flow_distance_m
             imu_end = self.imu_yaw_deg
-            flow_delta = self.safe_delta(flow_start, flow_end)
-            imu_delta = self.angle_delta_deg(imu_start, imu_end)
+            metrics_end = list(self.latest_metrics)
             us_end = self.get_ultrasonic_min_m()
 
+            flow_abs_delta = self.safe_delta(flow_start_abs, flow_end_abs)
+            imu_delta = self.angle_delta_deg(imu_start, imu_end)
+            metrics_delta = self.metrics_change_score(metrics_start, metrics_end)
+
             self.get_logger().info(
-                "SEGMENT LOG "
+                "CHUNK LOG "
                 + str(segment_index)
                 + ": elapsed_s="
                 + str(round(elapsed, 2))
                 + " target_dist_m="
                 + str(round(target_dist_m, 3))
-                + " flow_delta_m="
-                + self.fmt_optional(flow_delta, 3)
+                + " flow_abs_delta="
+                + self.fmt_optional(flow_abs_delta, 3)
                 + " flow_valid="
                 + str(self.flow_valid)
                 + " imu_yaw_start_deg="
@@ -527,10 +654,14 @@ class AutoparkMaster(Node):
                 + self.fmt_optional(imu_end, 2)
                 + " imu_delta_deg="
                 + self.fmt_optional(imu_delta, 2)
+                + " metrics_change="
+                + str(round(metrics_delta, 3))
                 + " ultrasonic_start_m="
                 + str(round(us_start, 3))
                 + " ultrasonic_end_m="
                 + str(round(us_end, 3))
+                + " stuck_retries="
+                + str(retry_count)
                 + " stop_reason="
                 + stop_reason
             )
@@ -541,18 +672,36 @@ class AutoparkMaster(Node):
                 self.get_logger().warning("parking aborted by ultrasonic emergency stop")
                 return
 
+            if stop_reason.startswith("stuck_failed"):
+                self.get_logger().warning("parking aborted because car did not move")
+                return
+
             self.sleep_while_ok(self.pause_between_commands)
 
         self.publish_stop("parking_sequence_done")
         self.get_logger().info("PARKING SEQUENCE DONE")
 
-    def wait_drive_timed(self, drive_time_s: float, segment_index: int) -> Tuple[str, float]:
+    def wait_drive_timed(
+        self,
+        drive_time_s: float,
+        segment_index: int,
+        cmd: Dict[str, Any],
+    ) -> Tuple[str, float, int]:
         start_t = time.monotonic()
         last_log_t = 0.0
 
+        stuck_retries = 0
+        stuck_checked = False
+        stuck_window_start_t = start_t
+
+        flow_window_start = list(self.latest_flow_data)
+        yaw_window_start = float(self.imu_yaw_deg)
+        metrics_window_start = list(self.latest_metrics)
+
         while rclpy.ok():
             now = time.monotonic()
-            elapsed = now - start_t
+            elapsed_total = now - start_t
+            elapsed_window = now - stuck_window_start_t
 
             if self.drive_ultrasonic_safety and self.ultrasonic_blocked_now():
                 dmin = self.get_ultrasonic_min_m()
@@ -564,14 +713,110 @@ class AutoparkMaster(Node):
                     + " limit_m="
                     + str(round(self.ultrasonic_stop_m, 3))
                 )
-                return "ultrasonic_safety_stop_segment_" + str(segment_index), elapsed
+                return "ultrasonic_safety_stop_segment_" + str(segment_index), elapsed_total, stuck_retries
+
+            if (
+                self.enable_stuck_retry
+                and not stuck_checked
+                and elapsed_window >= self.stuck_check_after_s
+            ):
+                stuck_checked = True
+
+                flow_now = list(self.latest_flow_data)
+                yaw_now = float(self.imu_yaw_deg)
+                metrics_now = list(self.latest_metrics)
+
+                flow_delta = self.flow_change_score(flow_window_start, flow_now)
+                yaw_delta = abs(self.angle_delta_deg(yaw_window_start, yaw_now) or 0.0)
+                metrics_delta = self.metrics_change_score(metrics_window_start, metrics_now)
+
+                turning = abs(float(cmd.get("steer_deg", 0.0))) > self.straight_steer_threshold_deg
+                metrics_moved = metrics_delta > self.stuck_metrics_delta_min
+
+                if turning:
+                    stuck = (
+                        flow_delta < self.stuck_flow_delta_min
+                        and yaw_delta < self.stuck_yaw_delta_min_deg
+                        and not metrics_moved
+                    )
+                else:
+                    stuck = (
+                        flow_delta < self.stuck_flow_delta_min
+                        and not metrics_moved
+                    )
+
+                self.get_logger().info(
+                    "STUCK CHECK seg="
+                    + str(segment_index)
+                    + " flow_delta="
+                    + str(round(flow_delta, 4))
+                    + " yaw_delta_deg="
+                    + str(round(yaw_delta, 3))
+                    + " metrics_delta="
+                    + str(round(metrics_delta, 3))
+                    + " metrics_moved="
+                    + str(metrics_moved)
+                    + " turning="
+                    + str(turning)
+                    + " stuck="
+                    + str(stuck)
+                )
+
+                if stuck:
+                    if stuck_retries >= self.stuck_max_retries:
+                        return (
+                            "stuck_failed_segment_" + str(segment_index),
+                            elapsed_total,
+                            stuck_retries,
+                        )
+
+                    stuck_retries += 1
+
+                    self.get_logger().warning(
+                        "STUCK RETRY "
+                        + str(stuck_retries)
+                        + " seg="
+                        + str(segment_index)
+                    )
+
+                    self.publish_stop("stuck_retry_" + str(stuck_retries))
+                    self.sleep_while_ok(self.stuck_retry_pause_s)
+
+                    kick_cmd = dict(cmd)
+                    kick_cmd["speed_mps"] = min(
+                        abs(self.stuck_kick_speed_mps),
+                        abs(self.speed_scale),
+                    )
+                    kick_cmd["duration"] = self.stuck_kick_duration_s
+
+                    self.publish_cmd(kick_cmd)
+                    self.get_logger().warning(
+                        "KICK CMD seg="
+                        + str(segment_index)
+                        + " speed="
+                        + str(kick_cmd["speed_mps"])
+                        + " duration="
+                        + str(kick_cmd["duration"])
+                    )
+                    self.sleep_while_ok(self.stuck_kick_duration_s)
+
+                    remaining = max(0.2, drive_time_s - elapsed_total)
+                    resume_cmd = dict(cmd)
+                    resume_cmd["duration"] = remaining
+                    self.publish_cmd(resume_cmd)
+
+                    stuck_window_start_t = time.monotonic()
+                    flow_window_start = list(self.latest_flow_data)
+                    yaw_window_start = float(self.imu_yaw_deg)
+                    metrics_window_start = list(self.latest_metrics)
+                    stuck_checked = False
 
             if now - last_log_t > 0.5:
                 self.get_logger().info(
-                    "TIMED DRIVE seg="
+                    "TIMED DRIVE chunk="
                     + str(segment_index)
                     + " elapsed="
-                    + str(round(elapsed, 2))
+                    + str(round(elapsed_total, 2))
                     + "/"
                     + str(round(drive_time_s, 2))
                     + " ultrasonic_min_m="
@@ -582,15 +827,19 @@ class AutoparkMaster(Node):
                     + str(self.flow_valid)
                     + " imu_yaw_deg="
                     + self.fmt_optional(self.imu_yaw_deg, 2)
+                    + " gyro_z="
+                    + str(round(float(self.imu_gyro_z), 4))
+                    + " stuck_retries="
+                    + str(stuck_retries)
                 )
                 last_log_t = now
 
-            if elapsed >= drive_time_s:
-                return "segment_timed_distance_complete", elapsed
+            if elapsed_total >= drive_time_s:
+                return "segment_timed_distance_complete", elapsed_total, stuck_retries
 
             time.sleep(0.05)
 
-        return "ros_shutdown", time.monotonic() - start_t
+        return "ros_shutdown", time.monotonic() - start_t, stuck_retries
 
     # ------------------------------------------------------------------
     # Command conversion
@@ -611,9 +860,10 @@ class AutoparkMaster(Node):
                     except Exception:
                         target_dist_m = 0.0
                     break
-            # TEMPORARY REAL-CAR SAFETY LIMIT
-            # Do not allow one planner segment to move more than 30 cm during testing.
-            target_dist_m = min(target_dist_m, 0.50)
+
+            # Do NOT clamp here.
+            # Distance is already safely chunked in expand_motion_chunks().
+            # Clamping here would cut planner distance and stop shallow.
 
         if gear > 0:
             gear = 1
@@ -622,7 +872,6 @@ class AutoparkMaster(Node):
         else:
             gear = 0
 
-        # Clamp steering command for current ESP32 limit.
         steer_deg = self.clamp(
             steer_deg,
             -abs(self.max_command_steer_deg),
@@ -630,22 +879,14 @@ class AutoparkMaster(Node):
         )
 
         turning = abs(float(steer_deg)) > self.straight_steer_threshold_deg
-
-        # This speed is used ONLY for drive time calculation.
         calibrated_speed_mps = self.select_calibrated_speed(gear, steer_deg)
 
-        # This speed is sent to ESP32.
-        # It must be strong enough to overcome motor deadband.
+        # Command speed sent to ESP32.
+        # Must overcome motor deadband.
         if gear > 0:
-            if turning:
-                command_speed_mps = 0.09
-            else:
-                command_speed_mps = 0.08
+            command_speed_mps = 0.09 if turning else 0.08
         elif gear < 0:
-            if turning:
-                command_speed_mps = 0.09
-            else:
-                command_speed_mps = 0.08
+            command_speed_mps = 0.09 if turning else 0.08
         else:
             command_speed_mps = 0.0
 
@@ -711,6 +952,54 @@ class AutoparkMaster(Node):
         return self.get_ultrasonic_min_m() < self.ultrasonic_stop_m
 
     # ------------------------------------------------------------------
+    # Feedback scoring
+    # ------------------------------------------------------------------
+    def flow_change_score(self, before: List[float], after: List[float]) -> float:
+        if not before or not after:
+            return 0.0
+
+        n = min(len(before), len(after))
+
+        # In your flow array, the last value is often valid flag 0/1.
+        if n >= 2:
+            n -= 1
+
+        if n <= 0:
+            return 0.0
+
+        diffs = []
+        for i in range(n):
+            try:
+                diffs.append(abs(float(after[i]) - float(before[i])))
+            except Exception:
+                pass
+
+        if not diffs:
+            return 0.0
+
+        return max(diffs)
+
+    def metrics_change_score(self, before: List[float], after: List[float]) -> float:
+        if not before or not after:
+            return 0.0
+
+        n = min(len(before), len(after))
+        if n <= 0:
+            return 0.0
+
+        diffs = []
+        for i in range(n):
+            try:
+                diffs.append(abs(float(after[i]) - float(before[i])))
+            except Exception:
+                pass
+
+        if not diffs:
+            return 0.0
+
+        return max(diffs)
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def publish_cmd(self, obj: Dict[str, Any]):
@@ -725,12 +1014,6 @@ class AutoparkMaster(Node):
 
         while rclpy.ok() and time.monotonic() < end_t:
             time.sleep(0.05)
-
-    @staticmethod
-    def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
-        siny_cosp = 2.0 * (w * z + x * y)
-        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-        return math.atan2(siny_cosp, cosy_cosp)
 
     @staticmethod
     def safe_delta(a: Optional[float], b: Optional[float]) -> Optional[float]:

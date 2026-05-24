@@ -1,6 +1,6 @@
 autopark_master:
   ros__parameters:
-    planner_mode: "left_only"
+    planner_mode: "right_only"
     slot_topic: "/autopark/slot_info"
 
     start_switch_topic: "/autopark/start_switch"
@@ -27,6 +27,7 @@ autopark_master:
 
     # Main command speed cap sent to ESP32.
     speed_scale: 0.10
+    max_command_steer_deg: 18.0
 
     # Steer first, then drive. ESP32 steerReady also gates drive motor.
     steer_wait_seconds: 10.0
@@ -39,12 +40,24 @@ autopark_master:
     reverse_straight_speed_mps: 0.0775
     straight_steer_threshold_deg: 3.0
 
-    drive_time_min_s: 2.0
+    max_segment_dist_m: 0.50
+    min_chunk_dist_m: 0.05
+
+    drive_time_min_s: 1.0
     drive_time_max_s: 60.0
 
     # Ultrasonic is emergency stop only while driving.
     drive_ultrasonic_safety: true
     ultrasonic_stop_m: 0.025
+
+    enable_stuck_retry: false
+    stuck_check_after_s: 1.2
+    stuck_flow_delta_min: 0.08
+    stuck_yaw_delta_min_deg: 0.4
+    stuck_kick_speed_mps: 0.10
+    stuck_kick_duration_s: 0.6
+    stuck_retry_pause_s: 0.2
+    stuck_max_retries: 2
 
     # Optical flow is logging/monitoring only in this version.
     flow_valid_required: false
@@ -64,7 +77,7 @@ perception_bridge:
     default_start_y: 0.70
     default_start_yaw_deg: 180.0
     case_detection_mode: "fixed"
-    fixed_case: "left_only"
+    fixed_case: "right_only"
     camera_x_scale: -0.01
     camera_y_scale: 0.01
     camera_x_offset_m: 0.0
