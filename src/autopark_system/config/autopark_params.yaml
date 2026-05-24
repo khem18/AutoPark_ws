@@ -1,117 +1,171 @@
 autopark_master:
   ros__parameters:
-    planner_mode: "right_only"
-    slot_topic: "/autopark/slot_info"
 
-    start_switch_topic: "/autopark/start_switch"
-    pose_topic: "/autopark/start_pose"
-    parking_metrics_topic: "/parking_metrics"
-    ultrasonic_topic: "/autopark/ultrasonic"
-    command_topic: "/autopark/cmd_json"
-    plan_topic: "/autopark/plan_result"
-    flow_distance_topic: "/autopark/flow_distance"
-    imu_topic: "/imu/data_raw"
+    planner_mode:           "right_only"
+    start_switch_topic:     "/autopark/start_switch"
+    pose_topic:             "/autopark/start_pose"
+    parking_metrics_topic:  "/parking_metrics"
+    ultrasonic_topic:       "/autopark/ultrasonic"
+    command_topic:          "/autopark/cmd_json"
+    plan_topic:             "/autopark/plan_result"
+    slot_topic:             "/autopark/slot_info"
+    flow_distance_topic:    "/autopark/flow_distance"
+    imu_topic:              "/imu/data_raw"
+    esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
 
+    # ── Planner / pose ─────────────────────────────────────────────
     use_default_pose_when_missing: true
-    default_start_x: 0.00
-    default_start_y: 0.70
+    default_start_x:       0.00
+    default_start_y:       0.70
     default_start_yaw_deg: 180.0
+    allow_fallback_path:   false
 
-    # Real mode: fallback path is for bench tests only.
-    # If planner fails, autopark_master stops with planner_failed_no_motion.
-    allow_fallback_path: false
-
-    # Tight slot: do not block before start using 12 cm logic.
+    # ── Safety ─────────────────────────────────────────────────────
     disable_ultrasonic_block: true
-    min_clearance_m: 0.12
+    min_clearance_m:          0.12
 
-    # Main command speed cap sent to ESP32.
-    speed_scale: 0.10
+    # ── Speed / steer ──────────────────────────────────────────────
+    speed_scale:           0.10
     max_command_steer_deg: 22.0
 
-    # Steer first, then drive. ESP32 steerReady also gates drive motor.
-    steer_wait_seconds: 10.0
-    pause_between_commands: 1.0
+    # ── Steer settle ───────────────────────────────────────────────
+    steer_ready_timeout_s:  7.0
+    steer_settle_pause_s:   0.3
+    steer_wait_fallback_s:  6.0
+    pause_between_commands: 1.2
 
-    # Calibrated speeds used for: drive_time = planner_dist_m / speed.
-    forward_turn_speed_mps: 0.055
-    reverse_turn_speed_mps: 0.076
-    forward_straight_speed_mps: 0.0675
-    reverse_straight_speed_mps: 0.0775
+    # ── Calibrated speeds (time fallback only) ─────────────────────
+    # These are used ONLY when the sensor-based stop hasn't fired.
+    # Calibrate: drive 0.50 m straight, measure elapsed seconds.
+    # reverse_straight_speed_mps = 0.50 / elapsed_s
+    # Repeat with max steer for turn speeds.
+    forward_turn_speed_mps:       0.055
+    reverse_turn_speed_mps:       0.076
+    forward_straight_speed_mps:   0.0675
+    reverse_straight_speed_mps:   0.0775
     straight_steer_threshold_deg: 3.0
 
+    # ── Chunk splitting ─────────────────────────────────────────────
     max_segment_dist_m: 0.50
-    min_chunk_dist_m: 0.05
+    min_chunk_dist_m:   0.05
+    drive_time_min_s:   1.0
+    drive_time_max_s:   60.0
 
-    drive_time_min_s: 1.0
-    drive_time_max_s: 60.0
+    # ── IMU ARC STOP — turning moves ───────────────────────────────
+    # Physics: arc_dist = (wheelbase / tan(steer)) × |Δyaw_rad|
+    # wheelbase = 0.739 m (hardcoded in arc_dist_from_yaw_delta)
+    #
+    # imu_arc_min_steer_deg:
+    #   Minimum steer angle to use IMU arc stop.
+    #   Below this angle, Δyaw per 0.5 m is tiny (< 3°) → unreliable.
+    #   At steer=8°: 0.5 m arc → 4.8° Δyaw (usable minimum).
+    #   At steer=22°: 0.5 m arc → 15.7° Δyaw (very clear).
+    #
+    # imu_arc_stop_factor:
+    #   Stop at this fraction of target arc to account for motor coast.
+    #   0.92 = stop when 92% of arc reached → car coasts the last 8%.
+    #   If car overshoots → decrease (try 0.88).
+    #   If car stops short → increase (try 0.96).
+    #
+    # imu_arc_wait_before_check_s:
+    #   Skip sensor check for this long after drive cmd is sent.
+    #   Prevents false trigger from IMU noise at motor startup.
+    imu_arc_stop_enabled:         true
+    imu_arc_min_steer_deg:        8.0
+    imu_arc_stop_factor:          0.75
+    imu_arc_wait_before_check_s:  0.3
 
-    # Ultrasonic is emergency stop only while driving.
+    # ── FLOW STRAIGHT STOP — straight / low-steer moves ───────────
+    # Only fires when |steer| <= imu_arc_min_steer_deg AND flow_valid=True.
+    # Falls back to time if flow is invalid.
+    #
+    # flow_straight_stop_factor:
+    #   Stop at this fraction of target distance.
+    #   0.90 = stop when 90% reached → allows for coast + small IMU error.
+    #   If car stops short → increase (try 0.95).
+    #   If car overshoots → decrease (try 0.85).
+    flow_straight_stop_enabled:         true
+    flow_straight_stop_factor:          0.90
+    flow_straight_wait_before_check_s:  0.3
+
+    # ── STUCK DETECTION ────────────────────────────────────────────
+    # TURNING stuck: |gyro_z| < stuck_gyro_min_rads for > stuck_check_after_s
+    #   At parking speed with steer=22°: gyro_z ≈ 0.04–0.08 rad/s
+    #   stuck_gyro_min_rads = 0.015 → detects no rotation within ~1 s
+    #
+    # STRAIGHT stuck: flow_delta < stuck_flow_delta_min_m per window
+    #   At 0.076 m/s: 1.5 s window → expect ~0.11 m → min threshold 0.005 m
+    enable_stuck_detection:   true
+    stuck_check_after_s:      3.0
+    stuck_gyro_min_rads:      0.006   # rad/s — turning stuck threshold
+    stuck_flow_delta_min_m:   0.005   # m — straight stuck threshold
+    stuck_kick_speed_mps:     0.10
+    stuck_kick_duration_s:    0.5
+    stuck_retry_pause_s:      0.2
+    stuck_max_retries:        1
+
+    # ── Ultrasonic emergency ────────────────────────────────────────
+    # 25 mm = absolute last resort. Normal parking clearance is 45 mm.
     drive_ultrasonic_safety: true
-    ultrasonic_stop_m: 0.025
+    ultrasonic_stop_m:       0.025
 
-    enable_stuck_retry: false
-    stuck_check_after_s: 1.2
-    stuck_flow_delta_min: 0.08
-    stuck_yaw_delta_min_deg: 0.4
-    stuck_kick_speed_mps: 0.10
-    stuck_kick_duration_s: 0.6
-    stuck_retry_pause_s: 0.2
-    stuck_max_retries: 2
+    flow_valid_required:        false
+    send_arm_command_on_start:  false
 
-    # Optical flow is logging/monitoring only in this version.
-    flow_valid_required: false
-
-    # Usually false because physical start switch already arms ESP32.
-    send_arm_command_on_start: true
-
-perception_bridge:
-  ros__parameters:
-    parking_metrics_topic: "/parking_metrics"
-    imu_topic: "/imu/data_raw"
-    start_pose_topic: "/autopark/start_pose"
-    slot_topic: "/autopark/slot_info"
-    publish_start_pose: true
-    use_camera_pose: false
-    default_start_x: 0.00
-    default_start_y: 0.70
-    default_start_yaw_deg: 180.0
-    case_detection_mode: "fixed"
-    fixed_case: "right_only"
-    camera_x_scale: -0.01
-    camera_y_scale: 0.01
-    camera_x_offset_m: 0.0
-    camera_y_offset_m: 0.0
-    yaw_from_camera_tilt: false
 
 serial_bridge:
   ros__parameters:
-    drive_port: "/dev/ttyUSB0"
-    us_front_port: ""
-    us_rear_port: ""
-    us_all_port: "/dev/ttyUSB1"
-    baud: 115200
-    debug_serial: false
+    drive_port:              "/dev/ttyUSB0"
+    us_front_port:           ""
+    us_rear_port:            ""
+    us_all_port:             "/dev/ttyUSB1"
+    baud:                    115200
+    debug_serial:            false
+    start_switch_topic:      "/autopark/start_switch"
+    esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
+    esp32_status_topic:      "/autopark/esp32_status"
+
+
+perception_bridge:
+  ros__parameters:
+    parking_metrics_topic:  "/parking_metrics"
+    imu_topic:              "/imu/data_raw"
+    start_pose_topic:       "/autopark/start_pose"
+    slot_topic:             "/autopark/slot_info"
+    publish_start_pose:     true
+    use_camera_pose:        false
+    default_start_x:        0.00
+    default_start_y:        0.70
+    default_start_yaw_deg:  180.0
+    case_detection_mode:    "fixed"
+    fixed_case:             "right_only"
+    camera_x_scale:        -0.01
+    camera_y_scale:         0.01
+    camera_x_offset_m:      0.0
+    camera_y_offset_m:      0.0
+    yaw_from_camera_tilt:   false
+
 
 motion_executor:
   ros__parameters:
-    # Disabled because autopark_master executes timed motions directly.
-    plan_topic: "/autopark/plan_result_disabled"
-    command_topic: "/autopark/cmd_json"
+    plan_topic:          "/autopark/plan_result_disabled"
+    command_topic:       "/autopark/cmd_json"
     open_loop_speed_mps: 0.12
-    segment_pause_s: 0.20
+    segment_pause_s:     0.20
+
+
+flow_distance_node:
+  ros__parameters:
+    image_topic:           "/rear_cam/image_raw"
+    imu_topic:             "/imu/data_raw"
+    output_topic:          "/autopark/flow_distance"
+    scale_m_per_px:        0.0105
+    deadband_px_per_frame: 0.0001
+    crop_ratio:            0.60
+    min_texture_std:       5.0
+    max_v_mps:             1.0
+
 
 lot_detector:
   ros__parameters:
     show_debug_windows: false
-
-flow_distance_node:
-  ros__parameters:
-    image_topic: "/rear_cam/image_raw"
-    imu_topic: "/imu/data_raw"
-    output_topic: "/autopark/flow_distance"
-    scale_m_per_px: 0.0105
-    deadband_px_per_frame: 0.0001
-    crop_ratio: 0.60
-    min_texture_std: 5.0
-    max_v_mps: 1.0

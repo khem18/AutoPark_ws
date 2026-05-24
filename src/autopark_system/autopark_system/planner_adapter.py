@@ -514,19 +514,20 @@ class RealMiddleSlotPlanner:
         return score
 
     def generate_templates(self) -> List[List[Primitive]]:
-        # IMPORTANT:
-        # For now, test both steering sign directions.
-        # The real car and planner coordinate frame may be opposite.
-        # This is still flexible: it searches both right-entry and mirrored candidates.
         base = self.generate_right_only_templates()
         mirrored = self.mirror_templates(base)
 
+        # Car comes from RIGHT (y > 0): use base templates only.
+        # Base has r1_steer = +22° which swings rear LEFT toward slot centre.
+        # Mirrored has r1_steer = −22° which spirals car away — WRONG for right side.
         if self.case_name == "right_only":
-            return base + mirrored
+            return base
 
+        # Car comes from LEFT (y < 0): use mirrored only.
         if self.case_name == "left_only":
-            return mirrored + base
+            return mirrored
 
+        # Both sides: try all templates.
         return base + mirrored
 
     def mirror_templates(self, templates: List[List[Primitive]]) -> List[List[Primitive]]:
@@ -605,8 +606,25 @@ class RealMiddleSlotPlanner:
 
 def make_env(case_name: str) -> ParkingEnv:
     env = ParkingEnv()
-    env.left_obstacle = None
-    env.right_obstacle = None
+
+    # Fake car (67×130 cm) centred in adjacent 76 cm slot.
+    # Middle slot: y ∈ [−0.38, +0.38]
+    # Right slot fake car inner edge at y ≈ +0.50 (with gap)
+    # Left  slot fake car inner edge at y ≈ −0.50 (with gap)
+    # This prevents the planner from choosing spiral paths that cross slot lines.
+
+    if case_name in ("right_only", "both_sides"):
+        env.right_obstacle = RectObstacle(
+            xmin=0.020, xmax=1.370,
+            ymin=0.500, ymax=1.095,
+        )
+
+    if case_name in ("left_only", "both_sides"):
+        env.left_obstacle = RectObstacle(
+            xmin=0.020, xmax=1.370,
+            ymin=-1.095, ymax=-0.500,
+        )
+
     return env
 
 def primitives_to_motions(seq: List[Primitive]) -> List[Dict[str, Any]]:
