@@ -1,4 +1,5 @@
 import json
+import time
 from typing import List, Tuple
 
 import rclpy
@@ -58,26 +59,54 @@ class SerialBridge(Node):
         self.timer = self.create_timer(0.05, self.poll_serial)
 
     def _open(self, port: str, baud: int):
-        if serial is None or not port:
+        if serial is None:
+            self.get_logger().error('pyserial is not installed')
             return None
+
+        if not port:
+            return None
+
         try:
-            return serial.Serial(
+            ser = serial.Serial(
                 port=port,
                 baudrate=baud,
                 timeout=0.05,
-                write_timeout=0.05
+                write_timeout=0.5
             )
+
+            # ESP32 often resets when serial opens.
+            time.sleep(2.0)
+
+            self.get_logger().info(f'OPENED serial {port} @ {baud}')
+            return ser
+
         except Exception as exc:
             self.get_logger().warning(f'cannot open {port}: {exc}')
             return None
 
     def on_cmd(self, msg: String):
+        raw = msg.data.strip()
+
         if self.drive is None:
+            self.get_logger().error(
+                f'drive serial is NOT open. command not sent. drive_port={self.drive_port}'
+            )
             return
+
         try:
-            self.drive.write((msg.data.strip() + '\n').encode('utf-8'))
+            line = raw + '\n'
+            n = self.drive.write(line.encode('utf-8'))
+            self.drive.flush()
+
+            self.get_logger().info(f'DRIVE SERIAL TX {n} bytes -> {raw}')
+
         except Exception as exc:
             self.get_logger().warning(f'drive write failed: {exc}')
+            try:
+                self.drive.close()
+            except Exception:
+                pass
+            self.drive = self._open(self.drive_port, self.baud)
 
     def poll_serial(self):
         self._poll_drive_state()

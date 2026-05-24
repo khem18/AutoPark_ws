@@ -63,7 +63,7 @@ autopark_master:
     flow_valid_required: false
 
     # Usually false because physical start switch already arms ESP32.
-    send_arm_command_on_start: false
+    send_arm_command_on_start: true
 
 perception_bridge:
   ros__parameters:
