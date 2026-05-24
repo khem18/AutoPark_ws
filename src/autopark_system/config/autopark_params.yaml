@@ -27,7 +27,7 @@ autopark_master:
 
     # Main command speed cap sent to ESP32.
     speed_scale: 0.10
-    max_command_steer_deg: 18.0
+    max_command_steer_deg: 22.0
 
     # Steer first, then drive. ESP32 steerReady also gates drive motor.
     steer_wait_seconds: 10.0
@@ -86,7 +86,7 @@ perception_bridge:
 
 serial_bridge:
   ros__parameters:
-    drive_port: "/dev/ttyUSB2"
+    drive_port: "/dev/ttyUSB0"
     us_front_port: ""
     us_rear_port: ""
     us_all_port: "/dev/ttyUSB1"

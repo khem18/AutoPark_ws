@@ -357,7 +357,31 @@ class AutoparkMaster(Node):
         try:
             planned = plan_from_start(pose.x, pose.y, yaw_deg, case_name)
             result = result_to_dict(planned)
-            motions = result.get("motions", [])
+            motions = []
+
+            if isinstance(result, dict):
+                if isinstance(result.get("executable_motions"), list) and len(result.get("executable_motions")) > 0:
+                    motions = result.get("executable_motions")
+                elif isinstance(result.get("motions"), list) and len(result.get("motions")) > 0:
+                    motions = result.get("motions")
+                elif isinstance(result.get("primitive_seq"), list) and len(result.get("primitive_seq")) > 0:
+                    motions = []
+                    for p in result.get("primitive_seq"):
+                        direction = p.get("direction", "r")
+                        gear = 1 if direction == "f" else -1
+                        motions.append({
+                            "gear": gear,
+                            "steer_deg": float(p.get("steer_deg", 0.0)),
+                            "dist_m": float(p.get("dist_m", 0.0)),
+                        })
+
+            self.get_logger().info("PLANNER RESULT SUCCESS=" + str(result.get("success", False)))
+            self.get_logger().info("PLANNER RESULT MOTIONS=" + str(motions))
+
+            if not motions:
+                self.publish_stop("planner_failed_no_motion")
+                return
+ 
         except Exception as exc:
             self.get_logger().error("planner error: " + str(exc))
             result = {

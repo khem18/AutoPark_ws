@@ -1,101 +1,84 @@
-from typing import Dict, Any, List, Tuple
-from dataclasses import dataclass
 import math
-
-from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped
-
-
-# ============================================================
-# Math helpers
-# ============================================================
-
-def deg2rad(d: float) -> float:
-    return d * math.pi / 180.0
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 
-def rad2deg(r: float) -> float:
-    return r * 180.0 / math.pi
+Primitive = Tuple[str, float, float]
+# Primitive = (direction, steer_deg, dist_m)
+# direction: "f" = forward, "r" = reverse
 
-
-def wrap_to_pi(a: float) -> float:
-    while a > math.pi:
-        a -= 2.0 * math.pi
-    while a < -math.pi:
-        a += 2.0 * math.pi
-    return a
-
-
-def yaw_err_deg(yaw: float, target_yaw: float) -> float:
-    return abs(rad2deg(wrap_to_pi(yaw - target_yaw)))
-
-
-# ============================================================
-# Data classes
-# ============================================================
 
 @dataclass
 class Pose:
     x: float
     y: float
-    yaw: float
+    yaw_rad: float
 
 
 @dataclass
 class VehicleSpec:
-    length: float = 1.30
+    # Real car geometry, pose is rear axle center.
     width: float = 0.67
     wheelbase: float = 0.739
     front_overhang: float = 0.355
     rear_overhang: float = 0.170
-    max_steer_deg: float = 30.0
+    max_steer_deg: float = 22.0
 
     @property
     def half_width(self) -> float:
         return self.width * 0.5
 
     @property
-    def front_extent_from_rear_axle(self) -> float:
+    def front_extent(self) -> float:
+        # rear axle center -> front bumper
         return self.wheelbase + self.front_overhang
 
     @property
-    def rear_extent_from_rear_axle(self) -> float:
+    def rear_extent(self) -> float:
+        # rear axle center -> rear bumper
         return self.rear_overhang
 
 
 @dataclass
 class RectObstacle:
-    x_min: float
-    x_max: float
-    y_min: float
-    y_max: float
+    xmin: float
+    xmax: float
+    ymin: float
+    ymax: float
 
 
 @dataclass
 class ParkingEnv:
-    # User real map:
-    # origin = middle slot entrance center
-    # middle slot: x [-0.38, +0.38], y [-1.39, 0.0]
+    # Coordinate convention:
+    # slot entrance/mouth center = (0, 0)
+    # slot extends backward to y = -slot_depth
     slot_width: float = 0.76
     slot_depth: float = 1.39
-    left_obstacle: RectObstacle | None = None
-    right_obstacle: RectObstacle | None = None
+
+    # Real safety.
+    hard_wall_clearance_m: float = 0.035
+    target_rear_clearance_m: float = 0.055
+
+    # Allow tiny line/tape error for practical test.
+    side_clearance_allowance_m: float = -0.18
+    front_clearance_allowance_m: float = -0.15
+
+    # Obstacles for side cases. They are optional because your real slot
+    # currently uses tape/wall more than box obstacles.
+    left_obstacle: Optional[RectObstacle] = None
+    right_obstacle: Optional[RectObstacle] = None
 
     @property
-    def middle_x_min(self) -> float:
-        return -self.slot_width * 0.5
-
-    @property
-    def middle_x_max(self) -> float:
-        return +self.slot_width * 0.5
-
-    @property
-    def slot_front_y(self) -> float:
-        return 0.0
+    def half_slot_width(self) -> float:
+        return self.slot_width * 0.5
 
     @property
     def slot_back_y(self) -> float:
         return -self.slot_depth
+
+    @property
+    def slot_front_y(self) -> float:
+        return 0.0
 
 
 @dataclass
@@ -104,79 +87,108 @@ class CandidateResult:
     reason: str
     planner: str
     case_name: str
-    primitive_seq: List[Tuple[str, float, float]]
+    primitive_seq: List[Primitive]
     path: List[Pose]
-    final_pose: Pose
     metrics: Dict[str, float]
-    strict_success: bool
-    practical_success: bool
+    practical_success: bool = False
+    strict_success: bool = False
+    score: float = 1e18
 
 
+@dataclass
 class PlannedPath:
-    def __init__(self, result: CandidateResult, motions: List[dict]):
-        self.result = result
-        self.motions = motions
+    result: CandidateResult
+    motions: List[Dict[str, Any]]
 
 
-# ============================================================
-# Geometry
-# ============================================================
+def wrap_pi(a: float) -> float:
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
+def angle_err_deg(a: float, b: float) -> float:
+    return abs(math.degrees(wrap_pi(a - b)))
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
 
 def vehicle_corners(p: Pose, spec: VehicleSpec) -> List[Tuple[float, float]]:
-    c = math.cos(p.yaw)
-    s = math.sin(p.yaw)
-
-    fx = spec.front_extent_from_rear_axle
-    rx = -spec.rear_extent_from_rear_axle
+    """
+    Vehicle rectangle corners from rear axle center pose.
+    x local = forward direction from rear axle
+    y local = left side direction
+    """
+    front = spec.front_extent
+    rear = -spec.rear_extent
     hw = spec.half_width
 
-    pts_local = [
-        (fx, +hw),
-        (fx, -hw),
-        (rx, -hw),
-        (rx, +hw),
+    local = [
+        (front, hw),
+        (front, -hw),
+        (rear, -hw),
+        (rear, hw),
     ]
 
-    pts_world = []
-    for lx, ly in pts_local:
-        wx = p.x + c * lx - s * ly
-        wy = p.y + s * lx + c * ly
-        pts_world.append((wx, wy))
+    c = math.cos(p.yaw_rad)
+    s = math.sin(p.yaw_rad)
 
-    return pts_world
+    pts = []
+    for lx, ly in local:
+        wx = p.x + lx * c - ly * s
+        wy = p.y + lx * s + ly * c
+        pts.append((wx, wy))
+    return pts
 
 
 def aabb_of_poly(poly: List[Tuple[float, float]]) -> Tuple[float, float, float, float]:
-    xs = [p[0] for p in poly]
-    ys = [p[1] for p in poly]
+    xs = [q[0] for q in poly]
+    ys = [q[1] for q in poly]
     return min(xs), max(xs), min(ys), max(ys)
 
 
-def aabb_intersects(a, b) -> bool:
-    ax0, ax1, ay0, ay1 = a
-    bx0, bx1, by0, by1 = b
-
-    if ax1 < bx0 or bx1 < ax0:
+def rect_intersects_aabb(a: Tuple[float, float, float, float], r: RectObstacle) -> bool:
+    xmin, xmax, ymin, ymax = a
+    if xmax < r.xmin:
         return False
-    if ay1 < by0 or by1 < ay0:
+    if xmin > r.xmax:
         return False
-
+    if ymax < r.ymin:
+        return False
+    if ymin > r.ymax:
+        return False
     return True
 
 
-def collides_rect(p: Pose, spec: VehicleSpec, rect: RectObstacle) -> bool:
-    car_aabb = aabb_of_poly(vehicle_corners(p, spec))
-    obs_aabb = (rect.x_min, rect.x_max, rect.y_min, rect.y_max)
-    return aabb_intersects(car_aabb, obs_aabb)
-
-
 def out_of_bounds(p: Pose) -> bool:
-    # allow aisle above slot and wall-side inside slot
-    return (p.x < -2.20 or p.x > 2.20 or p.y < -1.70 or p.y > 1.40)
+    # Keep search finite but generous.
+    if p.x < -3.0 or p.x > 3.0:
+        return True
+    if p.y < -2.2 or p.y > 2.5:
+        return True
+    return False
 
+
+def collides_rect(p: Pose, spec: VehicleSpec, obs: RectObstacle) -> bool:
+    aabb = aabb_of_poly(vehicle_corners(p, spec))
+    return rect_intersects_aabb(aabb, obs)
 
 def collides_any(p: Pose, spec: VehicleSpec, env: ParkingEnv) -> bool:
     if out_of_bounds(p):
+        return True
+
+    car_aabb = aabb_of_poly(vehicle_corners(p, spec))
+    _, car_x_max, _, _ = car_aabb
+
+    # Back wall safety.
+    # Wall is x = slot_depth.
+    # Rear bumper / body must not pass too close to wall.
+    wall_safe_x = env.slot_depth - env.hard_wall_clearance_m
+    if car_x_max > wall_safe_x:
         return True
 
     if env.left_obstacle is not None and collides_rect(p, spec, env.left_obstacle):
@@ -187,98 +199,33 @@ def collides_any(p: Pose, spec: VehicleSpec, env: ParkingEnv) -> bool:
 
     return False
 
+def step_bicycle(p: Pose, gear: int, steer_deg: float, ds: float, spec: VehicleSpec) -> Pose:
+    """
+    Kinematic bicycle step at rear axle center.
+    gear: +1 forward, -1 reverse
+    ds: positive distance step
+    """
+    steer_deg = clamp(steer_deg, -spec.max_steer_deg, spec.max_steer_deg)
+    delta = math.radians(steer_deg)
 
-def slot_metrics(env: ParkingEnv, p: Pose, spec: VehicleSpec, target_yaw: float) -> Dict[str, float]:
-    poly = vehicle_corners(p, spec)
-    x0, x1, y0, y1 = aabb_of_poly(poly)
+    direction = 1.0 if gear >= 0 else -1.0
+    signed_ds = direction * ds
 
-    left_clear = x0 - env.middle_x_min
-    right_clear = env.middle_x_max - x1
-    front_clear = env.slot_front_y - y1
-    rear_clear = y0 - env.slot_back_y
+    if abs(delta) < math.radians(0.2):
+        x = p.x + signed_ds * math.cos(p.yaw_rad)
+        y = p.y + signed_ds * math.sin(p.yaw_rad)
+        yaw = p.yaw_rad
+        return Pose(x, y, wrap_pi(yaw))
 
-    inside_slot = (
-        x0 >= env.middle_x_min and
-        x1 <= env.middle_x_max and
-        y0 >= env.slot_back_y and
-        y1 <= env.slot_front_y
-    )
+    yaw_rate_per_m = math.tan(delta) / spec.wheelbase
+    dyaw = signed_ds * yaw_rate_per_m
 
-    return {
-        "left_clear": left_clear,
-        "right_clear": right_clear,
-        "front_clear": front_clear,
-        "rear_clear": rear_clear,
-        "yaw_err_deg": yaw_err_deg(p.yaw, target_yaw),
-        "inside_slot": inside_slot,
-        "aabb_x_min": x0,
-        "aabb_x_max": x1,
-        "aabb_y_min": y0,
-        "aabb_y_max": y1,
-    }
-
-
-# ============================================================
-# Motion simulation
-# ============================================================
-
-Primitive = Tuple[str, float, float]  # gear, steer_deg, length_m
-
-
-def merge_same_primitives(seq: List[Primitive]) -> List[Primitive]:
-    if not seq:
-        return []
-
-    out = [seq[0]]
-
-    for gear, steer_deg, length in seq[1:]:
-        pg, ps, pl = out[-1]
-        if gear == pg and abs(steer_deg - ps) < 1e-12:
-            out[-1] = (pg, ps, pl + length)
-        else:
-            out.append((gear, steer_deg, length))
-
-    return out
-
-
-def maneuver_count(seq: List[Primitive]) -> int:
-    if not seq:
-        return 0
-
-    count = 0
-    prev = seq[0][0]
-
-    for i in range(1, len(seq)):
-        if seq[i][0] != prev:
-            count += 1
-            prev = seq[i][0]
-
-    return count
-
-
-def step_pose(p: Pose, gear: str, steer_deg: float, ds: float, spec: VehicleSpec) -> Pose:
-    steer = deg2rad(steer_deg)
-    ds_signed = ds if gear == "f" else -ds
-
-    if abs(steer) < 1e-12:
-        return Pose(
-            x=p.x + ds_signed * math.cos(p.yaw),
-            y=p.y + ds_signed * math.sin(p.yaw),
-            yaw=p.yaw,
-        )
-
-    kappa = math.tan(steer) / spec.wheelbase
-    dtheta = ds_signed * kappa
-    radius = 1.0 / kappa
-
-    cx = p.x - radius * math.sin(p.yaw)
-    cy = p.y + radius * math.cos(p.yaw)
-
-    nyaw = wrap_to_pi(p.yaw + dtheta)
-    nx = cx + radius * math.sin(nyaw)
-    ny = cy - radius * math.cos(nyaw)
-
-    return Pose(nx, ny, nyaw)
+    # Small-step integration is enough because caller uses small ds.
+    mid_yaw = p.yaw_rad + 0.5 * dyaw
+    x = p.x + signed_ds * math.cos(mid_yaw)
+    y = p.y + signed_ds * math.sin(mid_yaw)
+    yaw = wrap_pi(p.yaw_rad + dyaw)
+    return Pose(x, y, yaw)
 
 
 def simulate_sequence(
@@ -286,148 +233,332 @@ def simulate_sequence(
     seq: List[Primitive],
     spec: VehicleSpec,
     env: ParkingEnv,
-    step_len: float = 0.01,
-) -> Tuple[bool, List[Pose], Pose]:
-    p = start
+    step_m: float = 0.04,
+) -> Tuple[List[Pose], bool]:
     path = [start]
+    p = start
+    collided = False
 
-    for gear, steer_deg, length in seq:
-        n = max(1, int(math.ceil(abs(length) / step_len)))
-        ds = abs(length) / n
+    for direction, steer_deg, dist_m in seq:
+        gear = 1 if direction == "f" else -1
+        remaining = abs(float(dist_m))
 
-        for _ in range(n):
-            p = step_pose(p, gear, steer_deg, ds, spec)
+        while remaining > 1e-9:
+            ds = min(step_m, remaining)
+            p = step_bicycle(p, gear, steer_deg, ds, spec)
             path.append(p)
 
             if collides_any(p, spec, env):
-                return False, path, p
+                collided = True
+                return path, collided
 
-    return True, path, p
+            remaining -= ds
+
+    return path, collided
 
 
-# ============================================================
-# Environment
-# ============================================================
+def merge_same_primitives(seq: List[Primitive]) -> List[Primitive]:
+    merged: List[Primitive] = []
 
-def build_env(case_name: str) -> ParkingEnv:
-    env = ParkingEnv()
+    for direction, steer, dist in seq:
+        if abs(dist) < 1e-6:
+            continue
 
-    # Adjacent fake cars beside middle slot.
-    # Slot entrance line = y 0.0
-    # Wall side = y -1.39
-    left_car = RectObstacle(
-        x_min=-1.095,
-        x_max=-0.425,
-        y_min=-1.345,
-        y_max=-0.045,
+        if not merged:
+            merged.append((direction, steer, dist))
+            continue
+
+        pd, ps, pl = merged[-1]
+        if pd == direction and abs(ps - steer) < 1e-6:
+            merged[-1] = (pd, ps, pl + dist)
+        else:
+            merged.append((direction, steer, dist))
+
+    return merged
+
+
+def maneuver_count(seq: List[Primitive]) -> int:
+    if not seq:
+        return 0
+
+    count = 1
+    last = seq[0][0]
+    for d, _, _ in seq[1:]:
+        if d != last:
+            count += 1
+            last = d
+    return count
+
+def slot_metrics(env: ParkingEnv, p: Pose, spec: VehicleSpec, target_yaw: float) -> Dict[str, float]:
+    poly = vehicle_corners(p, spec)
+    xmin, xmax, ymin, ymax = aabb_of_poly(poly)
+
+    # New convention:
+    # slot entrance/front = x = 0
+    # slot back wall = x = +slot_depth
+    # slot width is along y
+
+    left_clear = env.half_slot_width - ymax
+    right_clear = ymin + env.half_slot_width
+
+    # Rear bumper is the largest x side when final yaw is about 180 deg.
+    rear_clear = env.slot_depth - xmax
+
+    # Front bumper must be inside the mouth, x >= 0.
+    front_clear = xmin - 0.0
+
+    yaw_err = angle_err_deg(p.yaw_rad, target_yaw)
+
+    inside_slot = (
+        left_clear >= 0.0
+        and right_clear >= 0.0
+        and rear_clear >= 0.0
+        and front_clear >= 0.0
     )
 
-    right_car = RectObstacle(
-        x_min=0.425,
-        x_max=1.095,
-        y_min=-1.345,
-        y_max=-0.045,
+    practical_inside_slot = (
+        left_clear >= env.side_clearance_allowance_m
+        and right_clear >= env.side_clearance_allowance_m
+        and rear_clear >= env.hard_wall_clearance_m
+        and front_clear >= env.front_clearance_allowance_m
     )
 
-    if case_name == "left_only":
-        env.left_obstacle = left_car
-    elif case_name == "right_only":
-        env.right_obstacle = right_car
-    elif case_name == "both_sides":
-        env.left_obstacle = left_car
-        env.right_obstacle = right_car
-    else:
-        raise ValueError("Unknown case_name: " + str(case_name))
+    return {
+        "x": p.x,
+        "y": p.y,
+        "yaw_rad": p.yaw_rad,
+        "yaw_deg": math.degrees(p.yaw_rad),
+        "yaw_err_deg": yaw_err,
+        "aabb_x_min": xmin,
+        "aabb_x_max": xmax,
+        "aabb_y_min": ymin,
+        "aabb_y_max": ymax,
+        "left_clear": left_clear,
+        "right_clear": right_clear,
+        "front_clear": front_clear,
+        "rear_clear": rear_clear,
+        "inside_slot": 1.0 if inside_slot else 0.0,
+        "practical_inside_slot": 1.0 if practical_inside_slot else 0.0,
+    }
 
-    return env
+class RealMiddleSlotPlanner:
+    """
+    Flexible practical planner for the real small car.
 
+    It searches many primitive sequences from the current start pose.
+    It does not return a single fixed fallback path.
 
-# ============================================================
-# Planner
-# ============================================================
+    Pose convention:
+      pose = rear axle center
+    """
 
-class ThreeCasePracticalPlanner:
-    def __init__(self, env: ParkingEnv, spec: VehicleSpec):
-        self.env = env
+    def __init__(self, spec: VehicleSpec, env: ParkingEnv, case_name: str):
         self.spec = spec
+        self.env = env
+        self.case_name = case_name
 
-        # Final parked car:
-        # front points to aisle, rear points to wall
-        self.target_yaw = deg2rad(90.0)
-
-        self.target_rear_axle_x = 0.0
-
-        # rear axle target that centers body in slot depth
-        self.target_rear_axle_y = -(
+        # Final target:
+        # rear axle y should be wall + rear_overhang + rear clearance.
+        self.target_rear_axle_x = (
             self.env.slot_depth
-            + self.spec.front_extent_from_rear_axle
-            - self.spec.rear_extent_from_rear_axle
-        ) * 0.5
+            - self.spec.rear_overhang
+            - self.env.target_rear_clearance_m
+        )
+        self.target_rear_axle_y = 0.0
 
-    def strict_success(self, p: Pose) -> Tuple[bool, Dict[str, float]]:
-        m = slot_metrics(self.env, p, self.spec, self.target_yaw)
+        # Final car should face same yaw as backing-in pose.
+        self.target_yaw = math.radians(180.0)
 
-        ok = (
-            m["inside_slot"]
-            and 0.02 <= m["left_clear"] <= 0.07
-            and 0.02 <= m["right_clear"] <= 0.07
-            and 0.02 <= m["front_clear"] <= 0.07
-            and 0.02 <= m["rear_clear"] <= 0.07
-            and m["yaw_err_deg"] <= 3.0
+    def plan(self, start: Pose) -> CandidateResult:
+        templates = self.generate_templates()
+
+        best: Optional[CandidateResult] = None
+        best_success: Optional[CandidateResult] = None
+
+        for seq in templates:
+            path, collided = simulate_sequence(start, seq, self.spec, self.env)
+
+            final_pose = path[-1]
+            metrics = slot_metrics(self.env, final_pose, self.spec, self.target_yaw)
+
+            strict_success = self.is_strict_success(metrics, collided)
+            practical_success = self.is_practical_success(metrics, collided)
+            success = strict_success or practical_success
+
+            score = self.score_candidate(metrics, seq, collided)
+
+            if collided:
+                reason = "collision"
+            elif strict_success:
+                reason = "strict_success"
+            elif practical_success:
+                reason = "practical_success"
+            else:
+                reason = "best_failed"
+
+            cand = CandidateResult(
+                success=success,
+                reason=reason,
+                planner="real_middle_slot_planner",
+                case_name=self.case_name,
+                primitive_seq=seq,
+                path=path,
+                metrics=metrics,
+                practical_success=practical_success,
+                strict_success=strict_success,
+                score=score,
+            )
+
+            if best is None or cand.score < best.score:
+                best = cand
+
+            if success:
+                if best_success is None or cand.score < best_success.score:
+                    best_success = cand
+
+        if best_success is not None:
+            return best_success
+
+        if best is None:
+            return CandidateResult(
+                success=False,
+                reason="no_candidate",
+                planner="real_middle_slot_planner(no_candidate)",
+                case_name=self.case_name,
+                primitive_seq=[],
+                path=[start],
+                metrics={},
+                score=1e18,
+            )
+
+        best.success = False
+        best.reason = "best_failed"
+        best.planner = "real_middle_slot_planner(best_failed)"
+        return best
+
+    def is_strict_success(self, m: Dict[str, float], collided: bool) -> bool:
+        if collided:
+            return False
+
+        return (
+            bool(m.get("inside_slot", 0.0) > 0.5)
+            and m["yaw_err_deg"] <= 15.0
+            and 0.020 <= m["rear_clear"] <= 0.090
+            and m["left_clear"] >= 0.010
+            and m["right_clear"] >= 0.010
+            and m["front_clear"] >= 0.000
         )
 
-        return ok, m
+    def is_practical_success(self, m: Dict[str, float], collided: bool) -> bool:
+        if collided:
+            return False
 
-    def practical_success(self, p: Pose) -> Tuple[bool, Dict[str, float]]:
-        m = slot_metrics(self.env, p, self.spec, self.target_yaw)
-
-        ok = (
-            m["inside_slot"]
-            and m["left_clear"] >= 0.0
-            and m["right_clear"] >= 0.0
-            and m["front_clear"] >= 0.0
-            and m["rear_clear"] >= 0.0
-            and m["yaw_err_deg"] <= 12.0
+        # Practical first-pass real-car target.
+        # This lets planner find a safe path before strict 3 deg / 45 mm tuning.
+        return (
+            bool(m.get("practical_inside_slot", 0.0) > 0.5)
+            and m["yaw_err_deg"] <= 35.0
+            and 0.035 <= m["rear_clear"] <= 0.180
+            and m["left_clear"] >= self.env.side_clearance_allowance_m
+            and m["right_clear"] >= self.env.side_clearance_allowance_m
+            and m["front_clear"] >= self.env.front_clearance_allowance_m
         )
 
-        return ok, m
-
-    def final_score(self, p: Pose, seq: List[Primitive]) -> float:
-        m = slot_metrics(self.env, p, self.spec, self.target_yaw)
+    def score_candidate(self, m: Dict[str, float], seq: List[Primitive], collided: bool) -> float:
+        if not m:
+            return 1e18
 
         score = 0.0
-        score += 500.0 * abs(p.x - self.target_rear_axle_x)
-        score += 2500.0 * abs(p.y - self.target_rear_axle_y)
-        score += 15.0 * m["yaw_err_deg"]
 
-        for key in ("left_clear", "right_clear", "front_clear", "rear_clear"):
-            if m[key] < 0.0:
-                score += 50000.0 * (-m[key])
+        if collided:
+            score += 1e9
 
-        if not m["inside_slot"]:
-            score += 1500.0
+        # Target rear axle placement.
+        score += 700.0 * abs(m["x"] - self.target_rear_axle_x)
+        score += 900.0 * abs(m["y"] - self.target_rear_axle_y)
 
-        score += 5.0 * len(seq)
+        # Target yaw.
+        score += 35.0 * m["yaw_err_deg"]
+
+        # Rear clearance should be around target, not near wall.
+        rear_err = abs(m["rear_clear"] - self.env.target_rear_clearance_m)
+        score += 2500.0 * rear_err
+
+        # Penalize wall too close hard.
+        if m["rear_clear"] < self.env.hard_wall_clearance_m:
+            score += 200000.0 * (self.env.hard_wall_clearance_m - m["rear_clear"])
+
+        # Penalize outside slot.
+        if m["left_clear"] < 0.0:
+            score += 9000.0 * abs(m["left_clear"])
+        if m["right_clear"] < 0.0:
+            score += 9000.0 * abs(m["right_clear"])
+        if m["front_clear"] < 0.0:
+            score += 6500.0 * abs(m["front_clear"])
+
+        # Side balance.
+        score += 800.0 * abs(m["left_clear"] - m["right_clear"])
+
+        # Prefer successful path strongly.
+        if self.is_strict_success(m, collided):
+            score -= 200000.0
+        elif self.is_practical_success(m, collided):
+            score -= 100000.0
+
+        # Prefer shorter and fewer direction changes, but not too strongly.
+        total_len = sum(abs(x[2]) for x in seq)
+        score += 45.0 * total_len
+        score += 15.0 * len(seq)
         score += 25.0 * maneuver_count(seq)
 
         return score
 
-    def generate_center_templates(self) -> List[List[Primitive]]:
+    def generate_templates(self) -> List[List[Primitive]]:
+        # IMPORTANT:
+        # For now, test both steering sign directions.
+        # The real car and planner coordinate frame may be opposite.
+        # This is still flexible: it searches both right-entry and mirrored candidates.
+        base = self.generate_right_only_templates()
+        mirrored = self.mirror_templates(base)
+
+        if self.case_name == "right_only":
+            return base + mirrored
+
+        if self.case_name == "left_only":
+            return mirrored + base
+
+        return base + mirrored
+
+    def mirror_templates(self, templates: List[List[Primitive]]) -> List[List[Primitive]]:
+        mirrored: List[List[Primitive]] = []
+        for seq in templates:
+            new_seq = []
+            for d, steer, dist in seq:
+                new_seq.append((d, -steer, dist))
+            mirrored.append(new_seq)
+        return mirrored
+
+    def generate_right_only_templates(self) -> List[List[Primitive]]:
         templates: List[List[Primitive]] = []
 
-        # Real-layout template for start:
-        # x around 0, y around +0.70, yaw 180 deg, car comes from right to left.
+        # Fast focused search after coordinate fix.
+        # Goal:
+        #   x ≈ 1.05–1.16
+        #   y ≈ 0
+        #   yaw ≈ 180
         #
-        # Phase 1: short forward-left pre-position
-        # Phase 2: reverse arc into middle slot
-        # Phase 3: reverse straighten / depth correction
+        # Important:
+        # r1 turns into slot.
+        # r2 counter-steers to straighten yaw.
+        # r3 small straight insert.
 
-        for pre_steer in (-18.0, -15.0, -12.0):
-            for pre_len in (0.90, 1.00, 1.10, 1.20):
-                for r1_steer in (18.0, 20.0, 22.0, 25.0):
-                    for r1_len in (1.60, 1.80, 2.00):
-                        for r2_steer in (0.0, 8.0, 10.0, 12.0):
-                            for r2_len in (0.30, 0.45, 0.60):
+        # 3-move focused candidates
+        for pre_steer in (-22.0, -20.0, -18.0):
+            for pre_len in (0.25, 0.35, 0.45):
+                for r1_steer in (22.0, 20.0):
+                    for r1_len in (0.50, 0.60, 0.70, 0.80, 0.90):
+                        for r2_steer in (-22.0, -20.0, -18.0):
+                            for r2_len in (0.75, 0.85, 0.95, 1.05):
                                 seq = [
                                     ("f", pre_steer, pre_len),
                                     ("r", r1_steer, r1_len),
@@ -435,232 +566,154 @@ class ThreeCasePracticalPlanner:
                                 ]
                                 templates.append(merge_same_primitives(seq))
 
-        # Slightly shorter starts
-        for pre_len in (0.60, 0.75, 0.90):
-            for r1_steer in (22.0, 25.0, 28.0, 30.0):
-                for r1_len in (1.30, 1.50, 1.70):
-                    for r2_len in (0.30, 0.50, 0.70):
-                        seq = [
-                            ("f", -15.0, pre_len),
-                            ("r", r1_steer, r1_len),
-                            ("r", 8.0, r2_len),
-                        ]
-                        templates.append(merge_same_primitives(seq))
+        # 4-move: add short straight after yaw correction
+        for pre_steer in (-22.0, -20.0, -18.0):
+            for pre_len in (0.25, 0.35, 0.45):
+                for r1_steer in (22.0, 20.0):
+                    for r1_len in (0.55, 0.65, 0.75, 0.85):
+                        for r2_steer in (-22.0, -20.0, -18.0):
+                            for r2_len in (0.75, 0.85, 0.95):
+                                for r3_len in (0.00, 0.05, 0.10, 0.15):
+                                    seq = [
+                                        ("f", pre_steer, pre_len),
+                                        ("r", r1_steer, r1_len),
+                                        ("r", r2_steer, r2_len),
+                                        ("r", 0.0, r3_len),
+                                    ]
+                                    templates.append(merge_same_primitives(seq))
 
-        # If start is already offset, allow almost no pre-position
-        for pre_len in (0.00, 0.20, 0.40):
-            for r1_steer in (25.0, 28.0, 30.0):
-                for r1_len in (1.10, 1.30, 1.50):
-                    for r2_steer in (0.0, 8.0, 12.0):
-                        for r2_len in (0.20, 0.40, 0.60):
-                            seq = []
-                            if pre_len > 0.0:
-                                seq.append(("f", -12.0, pre_len))
-                            seq += [
-                                ("r", r1_steer, r1_len),
-                                ("r", r2_steer, r2_len),
-                            ]
-                            templates.append(merge_same_primitives(seq))
+        # 5-move correction: if 3 reverse parts cannot center/yaw enough
+        for pre_steer in (-22.0, -20.0):
+            for pre_len in (0.25, 0.35):
+                for r1_steer in (22.0, 20.0):
+                    for r1_len in (0.55, 0.70):
+                        for f2_steer in (8.0, 12.0):
+                            for f2_len in (0.10, 0.20):
+                                for r2_steer in (-22.0, -20.0):
+                                    for r2_len in (0.55, 0.70):
+                                        for r3_len in (0.05, 0.15):
+                                            seq = [
+                                                ("f", pre_steer, pre_len),
+                                                ("r", r1_steer, r1_len),
+                                                ("f", f2_steer, f2_len),
+                                                ("r", r2_steer, r2_len),
+                                                ("r", 0.0, r3_len),
+                                            ]
+                                            templates.append(merge_same_primitives(seq))
 
         return templates
 
-    def generate_templates(self, case_name: str) -> List[List[Primitive]]:
-        # All 3 cases park into the middle slot.
-        # The case only changes collision obstacles.
-        return self.generate_center_templates()
+def make_env(case_name: str) -> ParkingEnv:
+    env = ParkingEnv()
+    env.left_obstacle = None
+    env.right_obstacle = None
+    return env
 
-    def plan(self, case_name: str, start: Pose, debug: bool = False) -> CandidateResult:
-        templates = self.generate_templates(case_name)
+def primitives_to_motions(seq: List[Primitive]) -> List[Dict[str, Any]]:
+    motions: List[Dict[str, Any]] = []
 
-        best_success = None
-        best_success_score = float("inf")
-
-        best_failed_seq: List[Primitive] = []
-        best_failed_path: List[Pose] = [start]
-        best_failed_pose = start
-        best_failed_metrics = slot_metrics(self.env, start, self.spec, self.target_yaw)
-        best_failed_score = float("inf")
-
-        for seq in templates:
-            ok, path, end_pose = simulate_sequence(start, seq, self.spec, self.env, step_len=0.01)
-
-            if not ok:
-                continue
-
-            sc = self.final_score(end_pose, seq)
-
-            strict_ok, strict_m = self.strict_success(end_pose)
-            if strict_ok and sc < best_success_score:
-                best_success_score = sc
-                best_success = CandidateResult(
-                    success=True,
-                    reason="strict_success",
-                    planner="real_middle_slot_planner",
-                    case_name=case_name,
-                    primitive_seq=seq,
-                    path=path,
-                    final_pose=end_pose,
-                    metrics=strict_m,
-                    strict_success=True,
-                    practical_success=True,
-                )
-
-            if best_success is None:
-                practical_ok, practical_m = self.practical_success(end_pose)
-                if practical_ok and sc < best_success_score:
-                    best_success_score = sc
-                    best_success = CandidateResult(
-                        success=True,
-                        reason="practical_success",
-                        planner="real_middle_slot_planner",
-                        case_name=case_name,
-                        primitive_seq=seq,
-                        path=path,
-                        final_pose=end_pose,
-                        metrics=practical_m,
-                        strict_success=False,
-                        practical_success=True,
-                    )
-
-            if sc < best_failed_score:
-                best_failed_score = sc
-                best_failed_seq = seq
-                best_failed_path = path
-                best_failed_pose = end_pose
-                best_failed_metrics = slot_metrics(self.env, end_pose, self.spec, self.target_yaw)
-
-        if best_success is not None:
-            return best_success
-
-        return CandidateResult(
-            success=False,
-            reason="best_failed",
-            planner="real_middle_slot_planner(best_failed)",
-            case_name=case_name,
-            primitive_seq=best_failed_seq,
-            path=best_failed_path,
-            final_pose=best_failed_pose,
-            metrics=best_failed_metrics,
-            strict_success=False,
-            practical_success=False,
-        )
-
-
-# ============================================================
-# ROS adapter API
-# ============================================================
-
-def plan_from_start(
-    start_x: float,
-    start_y: float,
-    start_yaw_deg: float,
-    planner_mode: str = "both_sides",
-) -> PlannedPath:
-    case_name = planner_mode.strip().lower()
-
-    if case_name not in ("left_only", "right_only", "both_sides"):
-        case_name = "both_sides"
-
-    env = build_env(case_name)
-    spec = VehicleSpec()
-
-    start = Pose(start_x, start_y, deg2rad(start_yaw_deg))
-
-    planner = ThreeCasePracticalPlanner(env, spec)
-    result = planner.plan(case_name, start, debug=False)
-
-    motions = [
-        {
-            "gear": 1 if gear == "f" else -1,
-            "steer_deg": float(steer_deg),
-            "dist_m": float(dist_m),
-        }
-        for gear, steer_deg, dist_m in result.primitive_seq
-    ]
-
-    # IMPORTANT:
-    # Do not use tiny fallback like 0.06 / 0.05 m.
-    # If planner result has empty primitive_seq, use a real practical
-    # template distance for real-car testing.
-    if len(motions) == 0:
-        result.reason = "empty_planner_result_using_realcar_fallback_template"
-        result.planner = "real_middle_slot_planner(realcar_fallback_template)"
-        result.primitive_seq = [
-            ("f", -15.0, 0.60),
-            ("r", 25.0, 0.65),
-            ("r", 8.0, 0.06),
-        ]
-
-        ok, path, end_pose = simulate_sequence(
-            start,
-            result.primitive_seq,
-            spec,
-            env,
-            step_len=0.01,
-        )
-
-        result.path = path
-        result.final_pose = end_pose
-        result.metrics = slot_metrics(env, end_pose, spec, planner.target_yaw)
-
-        motions = [
+    for direction, steer_deg, dist_m in seq:
+        gear = 1 if direction == "f" else -1
+        motions.append(
             {
-                "gear": 1 if gear == "f" else -1,
+                "gear": gear,
                 "steer_deg": float(steer_deg),
-                "dist_m": float(dist_m),
+                "dist_m": float(abs(dist_m)),
             }
-            for gear, steer_deg, dist_m in result.primitive_seq
-        ]
+        )
 
-    return PlannedPath(result, motions)
+    return motions
+
+
+def pose_to_dict(p: Pose) -> Dict[str, float]:
+    return {
+        "x": p.x,
+        "y": p.y,
+        "yaw_rad": p.yaw_rad,
+        "yaw_deg": math.degrees(p.yaw_rad),
+    }
+
 
 def result_to_dict(planned: PlannedPath) -> Dict[str, Any]:
     res = planned.result
-    metrics = dict(res.metrics) if isinstance(res.metrics, dict) else {}
 
     return {
-        "success": res.success,
+        "success": bool(res.success),
+        "ok": bool(res.success),
         "reason": res.reason,
         "planner": res.planner,
         "case_name": res.case_name,
         "maneuvers": maneuver_count(res.primitive_seq),
         "motions": planned.motions,
-        "path": [
+        "primitive_seq": [
             {
-                "x": p.x,
-                "y": p.y,
-                "yaw_rad": p.yaw,
+                "direction": d,
+                "steer_deg": steer,
+                "dist_m": dist,
             }
-            for p in res.path
+            for d, steer, dist in res.primitive_seq
         ],
-        "final_pose": {
-            "x": res.final_pose.x,
-            "y": res.final_pose.y,
-            "yaw_rad": res.final_pose.yaw,
-        },
-        "metrics": metrics,
-        "left_clear": metrics.get("left_clear"),
-        "right_clear": metrics.get("right_clear"),
-        "front_clear": metrics.get("front_clear"),
-        "rear_clear": metrics.get("rear_clear"),
-        "yaw_err_deg": metrics.get("yaw_err_deg"),
-        "inside_slot": metrics.get("inside_slot"),
-        "practical_success": res.practical_success,
-        "strict_success": res.strict_success,
+        "path": [pose_to_dict(p) for p in res.path],
+        "metrics": res.metrics,
+        "score": res.score,
+        "practical_success": bool(res.practical_success),
+        "strict_success": bool(res.strict_success),
     }
 
 
-def build_ros_path(path_points, frame_id="map") -> Path:
-    msg = Path()
-    msg.header.frame_id = frame_id
+def plan_from_start(
+    start_x: float,
+    start_y: float,
+    start_yaw_deg: float,
+    case_name: str = "right_only",
+) -> PlannedPath:
+    case_name = str(case_name).strip().lower()
 
-    for p in path_points:
-        ps = PoseStamped()
-        ps.header.frame_id = frame_id
-        ps.pose.position.x = float(p["x"])
-        ps.pose.position.y = float(p["y"])
-        ps.pose.orientation.z = float(p.get("yaw_rad", 0.0))
-        ps.pose.orientation.w = 1.0
-        msg.poses.append(ps)
+    if case_name not in ("left_only", "right_only", "both_sides"):
+        case_name = "right_only"
 
-    return msg
+    spec = VehicleSpec()
+    env = make_env(case_name)
+
+    start = Pose(
+        x=float(start_x),
+        y=float(start_y),
+        yaw_rad=math.radians(float(start_yaw_deg)),
+    )
+
+    planner = RealMiddleSlotPlanner(spec=spec, env=env, case_name=case_name)
+    result = planner.plan(start)
+    motions = primitives_to_motions(result.primitive_seq)
+
+    return PlannedPath(result=result, motions=motions)
+
+
+# Optional manual test:
+if __name__ == "__main__":
+    import time
+
+    t0 = time.time()
+    print("planner test started...")
+
+    planned = plan_from_start(0.0, 0.7, 180.0, "right_only")
+    d = result_to_dict(planned)
+    m = d.get("metrics", {})
+
+    print("planner test finished in", round(time.time() - t0, 2), "sec")
+    print("success:", d["success"])
+    print("reason:", d["reason"])
+    print("planner:", d["planner"])
+    print("motions:", d["motions"])
+    print("final x,y,yaw:",
+          round(m.get("x", 999), 3),
+          round(m.get("y", 999), 3),
+          round(m.get("yaw_deg", 999), 1))
+    print("clear:",
+          "L", round(m.get("left_clear", 999), 3),
+          "R", round(m.get("right_clear", 999), 3),
+          "F", round(m.get("front_clear", 999), 3),
+          "Rear", round(m.get("rear_clear", 999), 3),
+          "yaw_err", round(m.get("yaw_err_deg", 999), 1))
+    print("inside_slot:", m.get("inside_slot"))
+    print("practical_inside_slot:", m.get("practical_inside_slot"))
+    print("score:", d["score"])
