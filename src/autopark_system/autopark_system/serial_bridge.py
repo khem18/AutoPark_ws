@@ -1,267 +1,204 @@
 """
-serial_bridge.py  — v_next
-Adds two new published topics from the ESP32 drive status JSON:
-  /autopark/esp32_steer_ready   Bool   (steer_ready field)
-  /autopark/esp32_status        String (full JSON, for debug/logging)
+serial_bridge.py  —  v_next4
+New: watches btn_state transitions from ESP32 and publishes /autopark/cam_check_request.
 """
-
-import json
-import time
+import json, time
 from typing import List, Tuple
-
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Float32MultiArray, Bool
-
-try:
-    import serial
-except ImportError:
-    serial = None
 
 
 class SerialBridge(Node):
     def __init__(self):
         super().__init__('serial_bridge')
-
         for name, default in [
             ('command_topic',            '/autopark/cmd_json'),
             ('ultrasonic_topic',         '/autopark/ultrasonic'),
             ('start_switch_topic',       '/autopark/start_switch'),
-            # NEW
             ('esp32_steer_ready_topic',  '/autopark/esp32_steer_ready'),
             ('esp32_status_topic',       '/autopark/esp32_status'),
-
-            ('drive_port',    '/dev/ttyUSB0'),
+            ('cam_check_request_topic',  '/autopark/cam_check_request'),  # NEW
+            ('drive_port',    '/dev/ttyUSB2'),
+            ('us_all_port',   '/dev/ttyUSB1'),
             ('us_front_port', ''),
             ('us_rear_port',  ''),
-            ('us_all_port',   '/dev/ttyUSB1'),
             ('baud',          115200),
             ('debug_serial',  False),
         ]:
             self.declare_parameter(name, default)
 
-        def gp(n):
-            return self.get_parameter(n).value
+        def gp(n): return self.get_parameter(n).value
 
-        self.command_topic           = str(gp('command_topic'))
-        self.ultrasonic_topic        = str(gp('ultrasonic_topic'))
-        self.start_switch_topic      = str(gp('start_switch_topic'))
-        self.esp32_steer_ready_topic = str(gp('esp32_steer_ready_topic'))
-        self.esp32_status_topic      = str(gp('esp32_status_topic'))
         self.drive_port   = str(gp('drive_port'))
-        self.us_front_port= str(gp('us_front_port'))
-        self.us_rear_port = str(gp('us_rear_port'))
         self.us_all_port  = str(gp('us_all_port'))
-        self.baud         = int(gp('baud'))
-        self.debug_serial = bool(gp('debug_serial'))
+        self.us_front_port = str(gp('us_front_port'))
+        self.us_rear_port  = str(gp('us_rear_port'))
+        self.baud          = int(gp('baud'))
+        self.debug_serial  = bool(gp('debug_serial'))
+
+        try:
+            import serial as _serial
+            self._serial = _serial
+        except ImportError:
+            self._serial = None
+            self.get_logger().error('pyserial not installed')
 
         self.drive    = self._open(self.drive_port,    self.baud)
+        self.us_all   = self._open(self.us_all_port,   self.baud)
         self.us_front = self._open(self.us_front_port, self.baud)
         self.us_rear  = self._open(self.us_rear_port,  self.baud)
-        self.us_all   = self._open(self.us_all_port,   self.baud)
 
-        self.drive_buf     = ''
-        self.us_front_buf  = ''
-        self.us_rear_buf   = ''
-        self.us_all_buf    = ''
+        self.drive_buf = self.us_all_buf = self.us_front_buf = self.us_rear_buf = ''
+        self.last_btn_state = 'idle'    # track transitions
 
-        self.last_start_switch = None
-        self.last_ultra        = None
+        self.create_subscription(String, gp('command_topic'), self.on_cmd, 10)
 
-        self.create_subscription(String, self.command_topic, self.on_cmd, 10)
-
-        self.us_pub           = self.create_publisher(Float32MultiArray, self.ultrasonic_topic,        10)
-        self.start_pub        = self.create_publisher(Bool,              self.start_switch_topic,      10)
-        # NEW publishers
-        self.steer_ready_pub  = self.create_publisher(Bool,   self.esp32_steer_ready_topic, 20)
-        self.esp32_status_pub = self.create_publisher(String, self.esp32_status_topic,      10)
+        self.us_pub           = self.create_publisher(Float32MultiArray, gp('ultrasonic_topic'),        10)
+        self.start_pub        = self.create_publisher(Bool,   gp('start_switch_topic'),      10)
+        self.steer_ready_pub  = self.create_publisher(Bool,   gp('esp32_steer_ready_topic'), 20)
+        self.esp32_status_pub = self.create_publisher(String, gp('esp32_status_topic'),      10)
+        self.cam_req_pub      = self.create_publisher(Bool,   gp('cam_check_request_topic'), 10)  # NEW
 
         self.timer = self.create_timer(0.05, self.poll_serial)
 
-    # ------------------------------------------------------------------
-
-    def _open(self, port: str, baud: int):
-        if serial is None:
-            self.get_logger().error('pyserial not installed')
-            return None
-        if not port:
-            return None
+    def _open(self, port, baud):
+        if not self._serial or not port: return None
         try:
-            ser = serial.Serial(port=port, baudrate=baud, timeout=0.05, write_timeout=0.5)
+            s = self._serial.Serial(port=port, baudrate=baud, timeout=0.05, write_timeout=0.5)
             time.sleep(2.0)
-            self.get_logger().info('OPENED serial {} @ {}'.format(port, baud))
-            return ser
-        except Exception as exc:
-            self.get_logger().warning('cannot open {}: {}'.format(port, exc))
+            self.get_logger().info(f'OPENED {port} @ {baud}')
+            return s
+        except Exception as e:
+            self.get_logger().warning(f'Cannot open {port}: {e}')
             return None
 
     def on_cmd(self, msg: String):
-        raw = msg.data.strip()
         if self.drive is None:
-            self.get_logger().error('drive serial NOT open — command not sent')
+            self.get_logger().error('drive serial NOT open')
             return
         try:
-            line = raw + '\n'
-            n = self.drive.write(line.encode('utf-8'))
+            self.drive.write((msg.data.strip() + '\n').encode('utf-8'))
             self.drive.flush()
-            self.get_logger().info('DRIVE TX {} bytes -> {}'.format(n, raw))
-        except Exception as exc:
-            self.get_logger().warning('drive write failed: {}'.format(exc))
-            try:
-                self.drive.close()
-            except Exception:
-                pass
+            if self.debug_serial:
+                self.get_logger().info(f'TX: {msg.data.strip()}')
+        except Exception as e:
+            self.get_logger().warning(f'drive write: {e}')
             self.drive = self._open(self.drive_port, self.baud)
 
     def poll_serial(self):
-        self._poll_drive_state()
-        values = self._poll_ultrasonic_values()
-        if len(values) == 8:
-            m = Float32MultiArray()
-            m.data = values
+        self._poll_drive()
+        vals = self._poll_us()
+        if len(vals) == 8:
+            m = Float32MultiArray(); m.data = vals
             self.us_pub.publish(m)
-            self.last_ultra = values
 
-    def _poll_drive_state(self):
-        objs = self._read_json_objects(self.drive, 'drive_buf')
-
-        for obj in objs:
+    def _poll_drive(self):
+        for obj in self._read_json(self.drive, 'drive_buf'):
             if self.debug_serial:
-                self.get_logger().info('drive_obj: {}'.format(obj))
+                self.get_logger().info(f'RX: {obj}')
 
-            # ── start_switch ──
+            # start_switch (existing)
             if 'start_switch' in obj:
-                value = bool(obj['start_switch'])
-                self.start_pub.publish(Bool(data=value))
-                self.last_start_switch = value
+                self.start_pub.publish(Bool(data=bool(obj['start_switch'])))
 
-            # ── NEW: steer_ready ──
+            # steer_ready (existing)
             if 'steer_ready' in obj:
-                steer_ready_val = bool(obj['steer_ready'])
-                self.steer_ready_pub.publish(Bool(data=steer_ready_val))
+                self.steer_ready_pub.publish(Bool(data=bool(obj['steer_ready'])))
 
-            # ── NEW: full status JSON → /autopark/esp32_status ──
-            # Publish every status frame so other nodes can monitor wheel angle,
-            # drive pwm, etc. for logging / debugging.
+            # ── NEW: btn_state transition detection ───────────────────────
+            # When ESP32 transitions to "waiting_cam", publish cam_check_request=True.
+            # This tells autopark_master to check camera and respond with LED color.
+            if 'btn_state' in obj:
+                new_state = str(obj['btn_state'])
+                if new_state != self.last_btn_state:
+                    self.get_logger().info(
+                        f'btn_state: {self.last_btn_state} → {new_state}')
+                    if new_state == 'waiting_cam':
+                        self.cam_req_pub.publish(Bool(data=True))
+                    elif new_state == 'idle' and self.last_btn_state != 'idle':
+                        self.cam_req_pub.publish(Bool(data=False))
+                    self.last_btn_state = new_state
+
+            # Full status JSON (for logging/debug)
             if 'mode' in obj or 'steer_deg' in obj:
                 try:
                     self.esp32_status_pub.publish(String(data=json.dumps(obj)))
                 except Exception:
                     pass
 
-    # ------------------------------------------------------------------
-    # Ultrasonic (unchanged from original)
-    # ------------------------------------------------------------------
-
-    def _poll_ultrasonic_values(self) -> List[float]:
+    def _poll_us(self) -> List[float]:
         if self.us_all is not None:
-            objs = self._read_json_objects(self.us_all, 'us_all_buf')
-            vals = self._latest_ultra_from_objs(objs, expected_count=8)
-            if len(vals) == 8:
-                return vals
-        vals_front = []
-        vals_rear  = []
-        if self.us_front is not None:
-            objs_front = self._read_json_objects(self.us_front, 'us_front_buf')
-            vals_front = self._latest_ultra_from_objs(objs_front, expected_count=4)
-        if self.us_rear is not None:
-            objs_rear = self._read_json_objects(self.us_rear, 'us_rear_buf')
-            vals_rear = self._latest_ultra_from_objs(objs_rear, expected_count=4)
-        if len(vals_front) == 4 and len(vals_rear) == 4:
-            return vals_front + vals_rear
+            for obj in self._read_json(self.us_all, 'us_all_buf'):
+                v = self._parse_us(obj, 8)
+                if len(v) == 8: return v
+        front, rear = [], []
+        if self.us_front:
+            for obj in self._read_json(self.us_front, 'us_front_buf'):
+                v = self._parse_us(obj, 4)
+                if len(v) == 4: front = v
+        if self.us_rear:
+            for obj in self._read_json(self.us_rear, 'us_rear_buf'):
+                v = self._parse_us(obj, 4)
+                if len(v) == 4: rear = v
+        if len(front) == 4 and len(rear) == 4:
+            return front + rear
         return []
 
-    def _latest_ultra_from_objs(self, objs, expected_count):
-        latest = []
-        for obj in objs:
-            vals = self._parse_ultra_obj(obj, expected_count)
-            if len(vals) == expected_count:
-                latest = vals
-                if self.debug_serial:
-                    self.get_logger().info('ultra_m: {}'.format(
-                        [round(v, 4) for v in vals]))
-        return latest
-
-    def _parse_ultra_obj(self, obj, expected_count):
+    def _parse_us(self, obj, n):
         arr = obj.get('distances_m', obj.get('distances_cm', []))
-        try:
-            vals = [float(x) for x in arr]
-        except Exception:
-            return []
-        if str(obj.get('unit', 'm')).lower() == 'cm':
-            vals = [v / 100.0 for v in vals]
-        return vals if len(vals) == expected_count else []
+        try: vals = [float(x) for x in arr]
+        except: return []
+        if str(obj.get('unit','m')).lower() == 'cm':
+            vals = [v/100 for v in vals]
+        return vals if len(vals) == n else []
 
-    # ------------------------------------------------------------------
-    # JSON parsing (unchanged)
-    # ------------------------------------------------------------------
-
-    def _read_json_objects(self, ser, buf_name: str) -> List[dict]:
-        if ser is None:
-            return []
+    def _read_json(self, ser, buf_attr) -> List[dict]:
+        if ser is None: return []
         try:
             waiting = ser.in_waiting
-        except Exception as exc:
-            self.get_logger().warning('{} in_waiting failed: {}'.format(buf_name, exc))
+        except Exception as e:
+            self.get_logger().warning(f'{buf_attr}: {e}')
             return []
-        if waiting <= 0:
-            return []
+        if waiting <= 0: return []
         try:
             chunk = ser.read(waiting).decode('utf-8', errors='ignore')
-        except Exception as exc:
-            self.get_logger().warning('{} read failed: {}'.format(buf_name, exc))
+        except Exception as e:
+            self.get_logger().warning(f'{buf_attr} read: {e}')
             return []
-        if not chunk:
-            return []
-        old_buf  = getattr(self, buf_name)
-        new_buf  = old_buf + chunk
-        json_texts, remainder = self._extract_complete_jsons(new_buf)
-        setattr(self, buf_name, remainder)
+        buf = getattr(self, buf_attr) + chunk
+        texts, remainder = self._extract_json(buf)
+        setattr(self, buf_attr, remainder)
         objs = []
-        for text in json_texts:
-            try:
-                objs.append(json.loads(text))
-            except Exception:
-                if self.debug_serial:
-                    self.get_logger().warning('bad json skipped: {}'.format(text))
+        for t in texts:
+            try: objs.append(json.loads(t))
+            except: pass
         return objs
 
-    def _extract_complete_jsons(self, s: str) -> Tuple[List[str], str]:
-        objs = []
-        start = None
-        depth = 0
-        in_string = False
-        escape = False
-        last_consumed = 0
-        for i, ch in enumerate(s):
-            if in_string:
-                if escape:       escape = False
-                elif ch == '\\': escape = True
-                elif ch == '"':  in_string = False
+    def _extract_json(self, s: str) -> Tuple[List[str], str]:
+        objs, start, depth = [], None, 0
+        in_str = esc = False
+        last = 0
+        for i, c in enumerate(s):
+            if in_str:
+                esc = not esc and c == '\\'
+                if not esc and c == '"': in_str = False
                 continue
-            if ch == '"':
-                in_string = True; continue
-            if ch == '{':
+            if c == '"': in_str = True; continue
+            if c == '{':
                 if depth == 0: start = i
-                depth += 1; continue
-            if ch == '}':
-                if depth > 0:
-                    depth -= 1
-                    if depth == 0 and start is not None:
-                        objs.append(s[start:i + 1])
-                        last_consumed = i + 1
-                        start = None
-        remainder = s[last_consumed:]
-        if len(remainder) > 4096:
-            remainder = remainder[-1024:]
-        return objs, remainder
+                depth += 1
+            elif c == '}' and depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    objs.append(s[start:i+1]); last = i+1; start = None
+        rem = s[last:]
+        if len(rem) > 4096: rem = rem[-1024:]
+        return objs, rem
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = SerialBridge()
-    try:
-        rclpy.spin(node)
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    try: rclpy.spin(node)
+    finally: node.destroy_node(); rclpy.shutdown()
