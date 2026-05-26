@@ -94,10 +94,12 @@ serial_bridge:
     us_rear_port:            ""
     baud:                    115200
     debug_serial:            false
+    command_topic:           "/autopark/cmd_json"   # ← added: was missing, caused silent mismatch risk
     start_switch_topic:      "/autopark/start_switch"
     esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
     esp32_status_topic:      "/autopark/esp32_status"
     cam_check_request_topic: "/autopark/cam_check_request"
+    ultrasonic_topic:        "/autopark/ultrasonic"  # ← added: also missing from YAML
 
 
 perception_bridge:

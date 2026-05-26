@@ -102,6 +102,41 @@ class SerialBridge(Node):
             if self.debug_serial:
                 self.get_logger().info(f'US: {[f"{v*1000:.0f}mm" for v in vals]}')
 
+    def _read_json(self, ser, buf_attr):
+        """
+        Read available bytes from `ser`, append to self.<buf_attr>, extract
+        complete JSON objects, and return them as a list of dicts.
+        This method was referenced by _poll_drive but was never defined —
+        causing every poll_serial tick to raise AttributeError and drop all
+        inbound ESP32 data (btn_state, steer_ready, etc.).
+        """
+        if ser is None:
+            return []
+        try:
+            waiting = ser.in_waiting
+        except Exception as e:
+            self.get_logger().warning(f'{buf_attr} in_waiting: {e}')
+            return []
+        if waiting <= 0:
+            return []
+        try:
+            chunk = ser.read(waiting).decode('utf-8', errors='ignore')
+        except Exception as e:
+            self.get_logger().warning(f'{buf_attr} read: {e}')
+            return []
+
+        buf = getattr(self, buf_attr) + chunk
+        texts, remainder = self._extract_json(buf)
+        setattr(self, buf_attr, remainder)
+
+        result = []
+        for t in texts:
+            try:
+                result.append(json.loads(t))
+            except Exception:
+                pass
+        return result
+
     def _poll_drive(self):
         for obj in self._read_json(self.drive, 'drive_buf'):
             if self.debug_serial:
