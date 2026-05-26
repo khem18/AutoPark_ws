@@ -8,6 +8,7 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+
     params = PathJoinSubstitution([
         FindPackageShare('autopark_system'),
         'config',
@@ -15,7 +16,7 @@ def generate_launch_description():
     ])
 
     use_camera_imu = LaunchConfiguration('use_camera_imu')
-    start_vins = LaunchConfiguration('start_vins')
+    start_vins     = LaunchConfiguration('start_vins')
 
     camera_imu_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -26,14 +27,16 @@ def generate_launch_description():
             ])
         ),
         launch_arguments={'start_vins': start_vins}.items(),
-        condition=IfCondition(use_camera_imu),
+        condition=IfCondition(use_camera_imu),   # only starts when use_camera_imu=true
     )
 
     return LaunchDescription([
+
+        # ── Launch arguments ────────────────────────────────────────────────
         DeclareLaunchArgument(
             'use_camera_imu',
-            default_value='true',
-            description='true on RDK real car. false for serial/control-only bench tests.',
+            default_value='false',          # ← CHANGED from 'true' to 'false'
+            description='true = RDK real car with cameras. false = serial/control-only tests.',
         ),
         DeclareLaunchArgument(
             'start_vins',
@@ -41,9 +44,12 @@ def generate_launch_description():
             description='Start VINS only after /rear_cam/image_gray and /imu/data_raw are stable.',
         ),
 
+        # ── Camera + IMU launch (only when use_camera_imu=true) ─────────────
+        # This includes dual_mipi_cam.launch.py which requires nv12_to_bgr.
+        # Skipped when use_camera_imu=false (bench tests / serial-only mode).
         camera_imu_launch,
 
-        # Camera -> /parking_metrics
+        # ── Camera → /parking_metrics (only when use_camera_imu=true) ───────
         Node(
             package='autopark_logic',
             executable='lot_detector',
@@ -53,7 +59,7 @@ def generate_launch_description():
             condition=IfCondition(use_camera_imu),
         ),
 
-        # /parking_metrics -> /local_map + /goal_pose
+        # ── /parking_metrics → /local_map + /goal_pose ─────────────────────
         Node(
             package='autopark_logic',
             executable='local_mapper',
@@ -63,7 +69,8 @@ def generate_launch_description():
             condition=IfCondition(use_camera_imu),
         ),
 
-        # /parking_metrics + /imu/data_raw -> /autopark/start_pose + /autopark/slot_info
+        # ── /parking_metrics + /imu/data_raw → /autopark/start_pose ─────────
+        # perception_bridge runs always (provides default pose when camera off)
         Node(
             package='autopark_system',
             executable='perception_bridge',
@@ -72,7 +79,7 @@ def generate_launch_description():
             parameters=[params],
         ),
 
-        # Optical flow + IMU simple distance estimator
+        # ── Optical flow + IMU distance estimator ───────────────────────────
         Node(
             package='autopark_system',
             executable='flow_distance_node',
@@ -82,7 +89,7 @@ def generate_launch_description():
             condition=IfCondition(use_camera_imu),
         ),
 
-        # ESP32 serial bridge
+        # ── ESP32 serial bridge (always runs) ───────────────────────────────
         Node(
             package='autopark_system',
             executable='serial_bridge',
@@ -91,8 +98,8 @@ def generate_launch_description():
             parameters=[params],
         ),
 
-        # Keep this node present but subscribed to disabled topic in YAML.
-        # autopark_master currently executes motions directly after planning.
+        # ── motion_executor (kept but disabled via YAML plan topic) ─────────
+        # autopark_master executes motions directly — this node is idle.
         Node(
             package='autopark_system',
             executable='motion_executor',
@@ -101,6 +108,7 @@ def generate_launch_description():
             parameters=[params],
         ),
 
+        # ── Main parking controller ─────────────────────────────────────────
         Node(
             package='autopark_system',
             executable='autopark_master',
@@ -108,4 +116,5 @@ def generate_launch_description():
             output='screen',
             parameters=[params],
         ),
+
     ])
