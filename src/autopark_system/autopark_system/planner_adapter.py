@@ -151,7 +151,7 @@ def _analytical_plan(start_x: float, start_y: float,
             "steer_active_hold": True,    # motor holds 0° against spring
         },
         {
-            "gear": -1, "steer_deg": -STEER_MAX, "dist_m": round(s23, 4),
+            "gear": -1, "steer_deg": STEER_MAX, "dist_m": round(s23, 4),
             "label": "rev_arc_90",
             "use_rear_us": False,
             "speed_override": None,
@@ -169,7 +169,7 @@ def _analytical_plan(start_x: float, start_y: float,
 
     primitives: List[Primitive] = [
         ("f",  0.0,       d1),
-        ("r",  -STEER_MAX, s23),
+        ("r",  STEER_MAX, s23),
         ("r",  0.0,       d4),
     ]
 

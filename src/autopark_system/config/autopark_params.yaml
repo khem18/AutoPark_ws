@@ -18,7 +18,7 @@ autopark_master:
     # Start pose — car must be ≥1.28m before slot entrance (in aisle)
     use_default_pose_when_missing: true
     default_start_x:       -1.28
-    default_start_y:        0.70
+    default_start_y:       0.70
     default_start_yaw_deg: 180.0
 
     # Camera check
@@ -38,9 +38,9 @@ autopark_master:
 
     # Calibrated speeds (time fallback)
     forward_turn_speed_mps:       0.055
-    reverse_turn_speed_mps:       0.017    # measured from arc test
-    forward_straight_speed_mps:   0.034    # measured: ~340cm / 99s = 0.034 m/s
-    reverse_straight_speed_mps:   0.030    # estimate — calibrate after arc is fixed
+    reverse_turn_speed_mps:       0.501    # measured from arc test
+    forward_straight_speed_mps:   0.481    # measured: ~340cm / 99s = 0.034 m/s
+    reverse_straight_speed_mps:   0.501    # estimate — calibrate after arc is fixed
     straight_steer_threshold_deg: 3.0
 
     # Timing ← FIXED
@@ -72,7 +72,7 @@ autopark_master:
 
     # Stuck detection
     enable_stuck_detection:   true
-    stuck_check_after_s:      3.0
+    stuck_check_after_s:      8.0
     stuck_gyro_min_rads:      0.006
     stuck_flow_delta_min_m:   0.005
     stuck_kick_speed_mps:     0.10
@@ -88,7 +88,7 @@ autopark_master:
 
 serial_bridge:
   ros__parameters:
-    drive_port:              "/dev/ttyUSB0"
+    drive_port:              "/dev/ttyUSB2"
     us_all_port:             "/dev/ttyUSB1"
     us_front_port:           ""
     us_rear_port:            ""
