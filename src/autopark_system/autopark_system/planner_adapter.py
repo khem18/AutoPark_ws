@@ -31,7 +31,10 @@ SLOT_W    = 0.760
 SLOT_D    = 1.390
 US_REAR_STOP_M = 0.040
 
-R = WB / math.tan(math.radians(STEER_MAX))          # 1.2800 m
+# R: use MEASURED value from physical arc test.
+# Theoretical: WB/tan(30°) = 1.280m
+# Measured: car drove arc at steer=30°, speed=0.05 → diameter=267cm → R=133.5cm
+R = 1.335   # metres — measured from actual arc diameter
 TGT_X_AXLE = SLOT_D - R_OVH - US_REAR_STOP_M        # 1.1800 m
 
 
@@ -120,7 +123,7 @@ def _analytical_plan(start_x: float, start_y: float,
     y0_depth   = start_x    # depth (in aisle = negative)
 
     # ── Validation ────────────────────────────────────────────────────────
-    if y0_depth > -R + 0.05:
+    if y0_depth > -R + 0.06:
         reason = (f"aisle_too_shallow: depth={y0_depth:.3f} > −{R:.3f}m  "
                   f"(car needs ≥{R:.2f}m into aisle; set default_start_x=−{R:.2f})")
         return PlannedPath(
@@ -128,7 +131,7 @@ def _analytical_plan(start_x: float, start_y: float,
                               case_name, [], [], {}, 1e9),
             motions=[])
 
-    d1  = x0_lateral + R
+    d1  = x0_lateral + R + 0.10
     s23 = R * math.pi / 2
     d4  = max(0.0, TGT_X_AXLE - y0_depth - R)
 
@@ -151,7 +154,7 @@ def _analytical_plan(start_x: float, start_y: float,
             "steer_active_hold": True,    # motor holds 0° against spring
         },
         {
-            "gear": -1, "steer_deg": STEER_MAX, "dist_m": round(s23, 4),
+            "gear": -1, "steer_deg": +STEER_MAX, "dist_m": round(s23, 4),  # +30° confirmed correct by user testing
             "label": "rev_arc_90",
             "use_rear_us": False,
             "speed_override": None,

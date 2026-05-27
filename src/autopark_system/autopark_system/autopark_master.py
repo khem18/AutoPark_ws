@@ -47,9 +47,9 @@ class AutoparkMaster(Node):
             ("steer_wait_fallback_s",          6.0),
             ("pause_between_commands",         1.2),
             ("forward_turn_speed_mps",         0.055),
-            ("reverse_turn_speed_mps",         0.076),
-            ("forward_straight_speed_mps",     0.0675),
-            ("reverse_straight_speed_mps",     0.0775),
+            ("reverse_turn_speed_mps",         0.501),
+            ("forward_straight_speed_mps",     0.481),
+            ("reverse_straight_speed_mps",     0.501),
             ("straight_steer_threshold_deg",   3.0),
             ("max_segment_dist_m",             2.5),
             ("min_chunk_dist_m",               0.10),
@@ -57,13 +57,13 @@ class AutoparkMaster(Node):
             ("drive_time_max_s",               60.0),
             ("imu_arc_stop_enabled",           True),
             ("imu_arc_min_steer_deg",          8.0),
-            ("imu_arc_stop_factor",            0.82),
+            ("imu_arc_stop_factor",            0.88),
             ("imu_arc_wait_before_check_s",    0.3),
             ("flow_straight_stop_enabled",     False),
             ("flow_straight_stop_factor",      0.90),
             ("flow_straight_wait_before_check_s", 0.3),
             ("rear_ultrasonic_stop_m",         0.040),
-            ("rear_us_indices",                [5, 6, 7]),
+            ("rear_us_indices",                [6]),
             ("drive_ultrasonic_safety",        True),
             ("ultrasonic_stop_m",              0.025),
             ("enable_stuck_detection",         True),
@@ -77,6 +77,11 @@ class AutoparkMaster(Node):
             ("flow_valid_required",            False),
             ("send_arm_command_on_start",      False),
             ("disable_ultrasonic_block",       True),
+            ("motor_start_delay_s",            1.2),
+            ("d4_speed_mps",                   0.005),   # very slow for rear_us reaction time
+            # Arc time budget when IMU is not available.
+            # Set to slightly more than measured arc time (user: ~10s).
+            ("arc_fallback_time_s",            12.0),
             ("min_clearance_m",                0.12),
         ]:
             self.declare_parameter(name, default)
@@ -127,6 +132,9 @@ class AutoparkMaster(Node):
         self.flow_valid_required           = bool(gp("flow_valid_required"))
         self.send_arm_command_on_start     = bool(gp("send_arm_command_on_start"))
         self.disable_ultrasonic_block      = bool(gp("disable_ultrasonic_block"))
+        self.motor_start_delay_s           = float(gp("motor_start_delay_s"))
+        self.d4_speed_mps                  = float(gp("d4_speed_mps"))
+        self.arc_fallback_time_s           = float(gp("arc_fallback_time_s"))
         self.min_clearance_m               = float(gp("min_clearance_m"))
 
         # State
@@ -349,19 +357,36 @@ class AutoparkMaster(Node):
                 f"gear={cmd['gear']} steer={cmd['steer_deg']:+.0f}°  "
                 f"dist={dist:.3f}m  t={dt:.2f}s")
 
-            # Steer settle
+            # ── Steer settle ─────────────────────────────────────────────
+            steer_active_hold = bool(cmd.get("steer_active_hold", False))
+            self.get_logger().info(
+                f"  steer_active_hold={steer_active_hold}  "
+                f"({'straight=True keeps motor on' if steer_active_hold else 'arc=False locks then off'})")
             steer_gear = int(cmd["gear"]) or 1
             self._cmd({"type":"drive","gear":steer_gear,"speed_mps":0.0,
-                       "steer_deg":cmd["steer_deg"],"duration":self.steer_ready_timeout_s+1.0})
+                       "steer_deg":cmd["steer_deg"],
+                       "duration": self.steer_ready_timeout_s + self.steer_settle_pause_s + 2.0,
+                       "steer_active_hold": steer_active_hold})
             if not self._wait_steer_ready():
                 self.get_logger().warning("  steer_ready timeout")
             if self.steer_settle_pause_s > 0:
                 self._sleep(self.steer_settle_pause_s)
 
-            # Drive
+            # ── Drive ────────────────────────────────────────────────────
             imu_start  = self.imu_yaw_deg
             flow_start = self.flow_distance_m
             self._cmd(cmd)
+
+            # Motor-start delay: STRAIGHT moves only.
+            # Arc: IMU stops it; delay would cause overshoot.
+            # Straight: delay compensates lag so time_stop fires at correct distance.
+            if not is_turning:
+                motor_delay = self._wait_motor_start(flow_start)
+                self.get_logger().info(
+                    f"  Timer start after {motor_delay:.2f}s motor delay")
+            else:
+                self.get_logger().info("  Arc: no motor_start_delay (IMU/time stops arc)")
+
             stop, elapsed, retries = self._wait_stop(
                 dt, dist, cmd["steer_deg"], is_turning, use_rear_us,
                 imu_start, flow_start, seg)
@@ -465,6 +490,24 @@ class AutoparkMaster(Node):
             time.sleep(0.04)
         return False
 
+    def _wait_motor_start(self, flow_start) -> float:
+        """Wait for car to start moving. Straight moves only."""
+        t0 = time.monotonic()
+        if self.flow_valid and flow_start is not None:
+            deadline = t0 + 3.0
+            while rclpy.ok() and time.monotonic() < deadline:
+                if self.flow_distance_m is not None:
+                    if abs((self.flow_distance_m or 0.0) - (flow_start or 0.0)) >= 0.003:
+                        delay = time.monotonic() - t0
+                        self.get_logger().info(f"  Motor start: flow detected after {delay:.2f}s")
+                        return delay
+                time.sleep(0.02)
+        delay = self.motor_start_delay_s
+        self._sleep(delay)
+        self.get_logger().info(
+            f"  Motor start: fixed delay {delay:.2f}s (set motor_start_delay_s in YAML)")
+        return delay
+
     # ── Motion command ────────────────────────────────────────────────────
     def _motion_to_cmd(self, motion) -> Dict[str, Any]:
         gear  = int(motion.get("gear", -1))
@@ -478,17 +521,57 @@ class AutoparkMaster(Node):
         gear  = 1 if gear>0 else (-1 if gear<0 else 0)
         steer = self.clamp(steer, -self.max_command_steer_deg, self.max_command_steer_deg)
         turning = abs(steer) > self.straight_steer_threshold_deg
-        cmd_speed = min(0.09 if turning else 0.08, self.speed_scale) if gear != 0 else 0.0
+        use_rear_us_flag = bool(motion.get("use_rear_us", False))
+        if gear == 0:
+            cmd_speed = 0.0
+        elif use_rear_us_flag:
+            # d4: very slow so rear_us sensor has time to react.
+            # Tune d4_speed_mps in YAML (0.02 m/s = slow crawl into slot).
+            cmd_speed = min(self.d4_speed_mps, self.speed_scale)
+        else:
+            cmd_speed = min(0.09 if turning else 0.08, self.speed_scale)
         if gear == 0 or dist <= 0.0:
             dt = self.drive_time_min_s
+        elif turning:
+            # Arc stop hierarchy:
+            #   1. imu_arc_stop (primary) — fires at 79.2° when IMU is live
+            #   2. time_stop   (fallback) — dt must be > actual arc time
+            # IMU available → give full drive_time_max_s; imu stops it.
+            # IMU silent     → use arc_fallback_time_s (12s default).
+            #   reverse_turn_speed_mps=0.501 → 4.01s (too short; car does ~45°)
+            #   actual arc speed ≈ 0.25 m/s → arc needs ~10s for 90°
+            imu_fresh = (self.last_imu_time > 0
+                         and (time.monotonic() - self.last_imu_time) < 2.0)
+            if imu_fresh:
+                dt = self.drive_time_max_s   # IMU controls stop
+            else:
+                dt = self.clamp(self.arc_fallback_time_s,
+                                self.drive_time_min_s, self.drive_time_max_s)
+                self.get_logger().warning(
+                    f"  IMU not available — arc fallback: {dt:.1f}s "
+                    f"(tune arc_fallback_time_s in YAML; arc ~10s measured)")
         else:
-            cal = (self.forward_turn_speed_mps    if turning and gear>0 else
-                   self.reverse_turn_speed_mps    if turning else
-                   self.forward_straight_speed_mps if gear>0 else
-                   self.reverse_straight_speed_mps)
-            dt = self.clamp(dist/max(abs(cal),0.001), self.drive_time_min_s, self.drive_time_max_s)
+            use_rear_us = bool(motion.get("use_rear_us", False))
+            if use_rear_us:
+                # d4 (reverse into slot): rear_us is primary stop.
+                # Use drive_time_max_s so the slow speed doesn't cause time_stop too early.
+                dt = self.drive_time_max_s
+            else:
+                cal = (self.forward_straight_speed_mps if gear>0
+                       else self.reverse_straight_speed_mps)
+                dt = self.clamp(dist/max(abs(cal),0.001), self.drive_time_min_s, self.drive_time_max_s)
+        # steer_active_hold: True for straight (motor holds 0°), False for arc (locks at -/+30°)
+        steer_active_hold = bool(motion.get("steer_active_hold", False))
+        # Straight moves: add motor_start_delay_s to ESP32 duration.
+        # ESP32 must keep motor running until after autopark_master's timer fires.
+        # Without fix: ESP32 stops at (dt+0.7s), master stops at (delay+dt) → 0.5s short.
+        if not turning:
+            esp32_duration = dt + self.motor_start_delay_s
+        else:
+            esp32_duration = dt
         return {"type":"drive","gear":gear,"speed_mps":cmd_speed,
-                "steer_deg":steer,"target_dist_m":dist,"duration":dt}
+                "steer_deg":steer,"target_dist_m":dist,"duration":esp32_duration,
+                "steer_active_hold": steer_active_hold}
 
     # ── Sensors ───────────────────────────────────────────────────────────
     def get_ultrasonic_min_m(self) -> float:

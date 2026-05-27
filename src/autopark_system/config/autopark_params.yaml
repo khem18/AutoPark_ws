@@ -17,8 +17,8 @@ autopark_master:
 
     # Start pose — car must be ≥1.28m before slot entrance (in aisle)
     use_default_pose_when_missing: true
-    default_start_x:       -1.28
-    default_start_y:       0.70
+    default_start_x:       -1.28    # must be ≤ -R=-1.335m (measured arc radius)
+    default_start_y:        0.70
     default_start_yaw_deg: 180.0
 
     # Camera check
@@ -34,7 +34,16 @@ autopark_master:
     steer_ready_timeout_s:  10.0    # arc settle may take longer at higher PWM
     steer_settle_pause_s:   1.5     # longer: steer needs time to reach -30° against spring
     steer_wait_fallback_s:  6.0
-    pause_between_commands: 2.0     # longer pause to fully stop before next move
+    pause_between_commands: 5.0     # longer pause to fully stop before next move
+    # Time from drive command sent to motor physically spinning.
+    # Fallback when optical flow is not available.
+    # Tune: (d_expected - d_actual) / speed = (1.98 - 1.43) / 0.481 = 1.14s → use 1.2
+    motor_start_delay_s:    1.2
+    # Arc time budget when IMU is not available.
+    # User confirmed: arc takes ~10s to complete 90°.
+    # Set slightly above 10s so time_stop fires after full arc.
+    # Tune: if car overshoots → lower; if undershoots → raise.
+    arc_fallback_time_s:    12.0
 
     # Calibrated speeds (time fallback)
     forward_turn_speed_mps:       0.055
@@ -63,8 +72,9 @@ autopark_master:
     # Rear US stop — d4 move PRIMARY stop
     # Sensor 6 (index 5) stops at 40mm
     # Sensors 7,8 (indices 6,7) are emergency at 25mm
-    rear_ultrasonic_stop_m:  0.040
-    rear_us_indices: [7]               # ← only sensor 7 for 40mm stop
+    rear_ultrasonic_stop_m:  0.100
+    rear_us_indices: [6]               # ← 6 = ultrasonic x7
+    d4_speed_mps:            0.005
 
     # All-sensor emergency stop
     drive_ultrasonic_safety: true
@@ -72,7 +82,7 @@ autopark_master:
 
     # Stuck detection
     enable_stuck_detection:   true
-    stuck_check_after_s:      8.0
+    stuck_check_after_s:      3.0
     stuck_gyro_min_rads:      0.006
     stuck_flow_delta_min_m:   0.005
     stuck_kick_speed_mps:     0.10
@@ -94,12 +104,10 @@ serial_bridge:
     us_rear_port:            ""
     baud:                    115200
     debug_serial:            false
-    command_topic:           "/autopark/cmd_json"   # ← added: was missing, caused silent mismatch risk
     start_switch_topic:      "/autopark/start_switch"
     esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
     esp32_status_topic:      "/autopark/esp32_status"
     cam_check_request_topic: "/autopark/cam_check_request"
-    ultrasonic_topic:        "/autopark/ultrasonic"  # ← added: also missing from YAML
 
 
 perception_bridge:
