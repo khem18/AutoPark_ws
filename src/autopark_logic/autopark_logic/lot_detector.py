@@ -252,19 +252,25 @@ class LotDetector(Node):
                     cv2.line(overlay, (target_x, target_y), (gate_x, gate_y), (0, 255, 0), 1)
 
                     # 2. CALCULATE KART DISTANCE TO FRONT GATE
-                    dist_outward_cm = (480 - gate_y) * cm_per_pixel_y
-                    dist_along_cm = (320 - gate_x) * cm_per_pixel_x
-                    
-                    cam_offset_y = -4.0   
-                    cam_offset_x = 56.0   
-                    
-                    kart_y_fwd = dist_along_cm + cam_offset_y
-                    kart_x_right = dist_outward_cm + cam_offset_x 
-                    
-                    k_y = int(kart_y_fwd)
-                    k_x = int(kart_x_right)
+                    # BEV image axes:
+                    #   gate_y (row, up/down)    = FORWARD distance: car → slot entrance
+                    #   gate_x (col, left/right) = SIDEWAYS distance: car → slot center
+                    #
+                    # k_x published as vals[2] → perception_bridge → pose.x (along aisle, meters)
+                    # k_y published as vals[3] → perception_bridge → pose.y (perpendicular, meters)
+                    #
+                    # Tune cam_offset_fwd: place car at known distance (e.g. 80cm before slot),
+                    # read vals[2] raw (before offset), then:
+                    #   cam_offset_fwd = -(known_cm - raw_cm)
+                    dist_fwd_cm  = (480 - gate_y) * cm_per_pixel_y   # forward  (row axis)
+                    dist_side_cm = (320 - gate_x) * cm_per_pixel_x   # sideways (column axis)
+
+                    cam_offset_fwd  = -64.0   # tune: -(real_dist_cm - camera_dist_cm)
+                    cam_offset_side =  56.0   # camera horizontal mount offset (keep same)
+
+                    k_x = int(dist_fwd_cm  + cam_offset_fwd)   # along aisle → pose.x (/100)
+                    k_y = int(dist_side_cm + cam_offset_side)  # perpendicular → pose.y (/100)
                     k_tlt = int(tilt_degrees)
-                    
                     # ==============================================================
                     # 3. PUBLISH THE DATA ARRAY (Start Point, End Point, Tilt)
                     # ==============================================================

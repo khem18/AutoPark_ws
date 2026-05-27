@@ -33,7 +33,7 @@ class AutoparkMaster(Node):
             ("imu_topic",                "/imu/data_raw"),
             ("esp32_steer_ready_topic",  "/autopark/esp32_steer_ready"),
             ("planner_mode",                   "right_only"),
-            ("use_default_pose_when_missing",  True),
+            ("use_default_pose_when_missing",   False),
             ("default_start_x",                -1.28),
             ("default_start_y",                 0.70),
             ("default_start_yaw_deg",          180.0),

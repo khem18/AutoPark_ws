@@ -22,7 +22,7 @@ autopark_master:
     default_start_yaw_deg: 180.0
 
     # Camera check
-    camera_check_enabled:    false   # false = always yellow, bypass camera
+    camera_check_enabled:    true   # false = always yellow, bypass camera
     camera_pose_max_age_s:   3.0
     cam_check_request_topic: "/autopark/cam_check_request"
 
@@ -119,7 +119,11 @@ perception_bridge:
     default_start_yaw_deg:  180.0
     case_detection_mode:    "fixed"
     fixed_case:             "right_only"
-
+    camera_metrics_timeout_s:  1.0    # ← NEW: pose only published when detection fresh
+    camera_x_scale:   0.01    # was -0.01 (sign was also wrong for pose.x)
+    camera_y_scale:   0.01
+    camera_x_offset_m: 0.0
+    camera_y_offset_m: 0.0
 
 motion_executor:
   ros__parameters:
