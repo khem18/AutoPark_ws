@@ -48,7 +48,7 @@ class AutoparkMaster(Node):
             ("pause_between_commands",         1.2),
             ("forward_turn_speed_mps",         0.055),
             ("reverse_turn_speed_mps",         0.501),
-            ("forward_straight_speed_mps",     0.481),
+            ("forward_straight_speed_mps",     0.404),
             ("reverse_straight_speed_mps",     0.501),
             ("straight_steer_threshold_deg",   3.0),
             ("max_segment_dist_m",             2.5),
@@ -57,12 +57,12 @@ class AutoparkMaster(Node):
             ("drive_time_max_s",               60.0),
             ("imu_arc_stop_enabled",           True),
             ("imu_arc_min_steer_deg",          8.0),
-            ("imu_arc_stop_factor",            0.88),
+            ("imu_arc_stop_factor",            0.83),
             ("imu_arc_wait_before_check_s",    0.3),
             ("flow_straight_stop_enabled",     False),
             ("flow_straight_stop_factor",      0.90),
             ("flow_straight_wait_before_check_s", 0.3),
-            ("rear_ultrasonic_stop_m",         0.040),
+            ("rear_ultrasonic_stop_m",         0.100),
             ("rear_us_indices",                [6]),
             ("drive_ultrasonic_safety",        True),
             ("ultrasonic_stop_m",              0.025),
@@ -78,7 +78,7 @@ class AutoparkMaster(Node):
             ("send_arm_command_on_start",      False),
             ("disable_ultrasonic_block",       True),
             ("motor_start_delay_s",            1.2),
-            ("d4_speed_mps",                   0.005),   # very slow for rear_us reaction time
+            ("d4_speed_mps",                   0.003),   # very slow for rear_us reaction time
             # Arc time budget when IMU is not available.
             # Set to slightly more than measured arc time (user: ~10s).
             ("arc_fallback_time_s",            12.0),
@@ -417,7 +417,7 @@ class AutoparkMaster(Node):
 
         arc_trig: Optional[float] = None
         if is_turning and self.imu_arc_stop_enabled and abs(steer_deg) > 0.5:
-            Rv = 0.739 / math.tan(math.radians(abs(steer_deg)))
+            Rv = 1.335
             arc_trig = math.degrees((dist_m * self.imu_arc_stop_factor) / Rv)
 
         flow_trig: Optional[float] = None
