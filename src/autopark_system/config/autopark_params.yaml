@@ -16,7 +16,7 @@ autopark_master:
     esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
 
     # Start pose — car must be ≥1.28m before slot entrance (in aisle)
-    use_default_pose_when_missing: true
+    use_default_pose_when_missing: false
     default_start_x:       -1.28    # must be ≤ -R=-1.335m (measured arc radius)
     default_start_y:        0.70
     default_start_yaw_deg: 180.0
@@ -27,7 +27,7 @@ autopark_master:
     cam_check_request_topic: "/autopark/cam_check_request"
 
     # Steer / speed
-    speed_scale:           0.05     # slippery floor: low speed = less wheel spin
+    speed_scale:           0.03     # slippery floor: low speed = less wheel spin
     max_command_steer_deg: 30.0
 
     # Steer settle
@@ -48,7 +48,7 @@ autopark_master:
     # Calibrated speeds (time fallback)
     forward_turn_speed_mps:       0.055
     reverse_turn_speed_mps:       0.501    # measured from arc test
-    forward_straight_speed_mps:   0.404    # measured: ~340cm / 99s = 0.034 m/s
+    forward_straight_speed_mps:   0.481    # measured: ~340cm / 99s = 0.034 m/s
     reverse_straight_speed_mps:   0.501    # estimate — calibrate after arc is fixed
     straight_steer_threshold_deg: 3.0
 
@@ -72,13 +72,13 @@ autopark_master:
     # Rear US stop — d4 move PRIMARY stop
     # Sensor 6 (index 5) stops at 40mm
     # Sensors 7,8 (indices 6,7) are emergency at 25mm
-    rear_ultrasonic_stop_m:  0.100
+    rear_ultrasonic_stop_m:  0.200
     rear_us_indices: [6]               # ← 6 = ultrasonic x7
     d4_speed_mps:            0.003
 
     # All-sensor emergency stop
-    drive_ultrasonic_safety: true
-    ultrasonic_stop_m:       0.025
+    drive_ultrasonic_safety: false
+    ultrasonic_stop_m:       0.050
 
     # Stuck detection
     enable_stuck_detection:   true
@@ -94,7 +94,7 @@ autopark_master:
     send_arm_command_on_start:  false
     disable_ultrasonic_block:   true
     min_clearance_m:            0.12
-
+    us_safety_start_delay_s:    0.50
 
 serial_bridge:
   ros__parameters:
@@ -113,7 +113,7 @@ serial_bridge:
 perception_bridge:
   ros__parameters:
     publish_start_pose:     true
-    use_camera_pose:        false
+    use_camera_pose:        true
     default_start_x:        -1.28
     default_start_y:         0.70
     default_start_yaw_deg:  180.0

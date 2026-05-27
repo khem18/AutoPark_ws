@@ -272,8 +272,8 @@ class LotDetectorSim(Node):
                     # 3. PUBLISH THE DATA ARRAY (Start Point, End Point, Tilt)
                     # ==============================================================
                     
-                    # ONLY publish if the spot is between 26cm and 85cm (Valid Spot)
-                    if 26 <= real_width_cm <= 85:
+                    # ONLY publish if the spot is between 26cm and 100cm (Valid Spot)
+                    if 26 <= real_width_cm <= 100:
                         metrics_msg = Float32MultiArray()
                         
                         car_start_x = 0.0
@@ -300,7 +300,7 @@ class LotDetectorSim(Node):
                     cv2.putText(overlay, f"WIDTH: {real_width_cm} cm", (text_x - 70, text_y), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                    if 10 <= real_width_cm <= 85:
+                    if 80 <= real_width_cm <= 97:
                         cv2.putText(overlay, "PERFECT SPOT!", (text_x - 70, text_y + 45), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     

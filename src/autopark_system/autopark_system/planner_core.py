@@ -95,8 +95,8 @@ class ParkingEnv:
     #
     # Middle slot centered at x=0
     # Slot width = 0.76, depth = 1.39
-    slot_width: float = 0.76
-    slot_depth: float = 1.39
+    slot_width: float = 0.87
+    slot_depth: float = 1.50
     lane_y: float = 2.17
 
     # two parked fake cars on both sides of the middle slot

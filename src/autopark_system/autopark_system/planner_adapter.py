@@ -27,9 +27,9 @@ F_OVH     = 0.355
 R_OVH     = 0.170
 CAR_W     = 0.670
 STEER_MAX = 30.0
-SLOT_W    = 0.760
-SLOT_D    = 1.390
-US_REAR_STOP_M = 0.100
+SLOT_W    = 0.870
+SLOT_D    = 1.500
+US_REAR_STOP_M = 0.200
 
 # R: use MEASURED value from physical arc test.
 # Theoretical: WB/tan(30°) = 1.280m
@@ -131,9 +131,9 @@ def _analytical_plan(start_x: float, start_y: float,
                               case_name, [], [], {}, 1e9),
             motions=[])
 
-    d1  = x0_lateral + R + 0.30
+    d1  = x0_lateral + R + 0.12
     s23 = R * math.pi / 2
-    d4  = y0_depth - R + 0.20 
+    d4  = y0_depth + 0.34 
 
     if d1 < -0.01:
         reason = f"lateral_too_left: d1={d1:.3f} (lateral={x0_lateral:.3f} < −R)"

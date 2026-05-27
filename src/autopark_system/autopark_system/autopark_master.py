@@ -48,7 +48,7 @@ class AutoparkMaster(Node):
             ("pause_between_commands",         1.2),
             ("forward_turn_speed_mps",         0.055),
             ("reverse_turn_speed_mps",         0.501),
-            ("forward_straight_speed_mps",     0.404),
+            ("forward_straight_speed_mps",     0.481),
             ("reverse_straight_speed_mps",     0.501),
             ("straight_steer_threshold_deg",   3.0),
             ("max_segment_dist_m",             2.5),
@@ -62,10 +62,10 @@ class AutoparkMaster(Node):
             ("flow_straight_stop_enabled",     False),
             ("flow_straight_stop_factor",      0.90),
             ("flow_straight_wait_before_check_s", 0.3),
-            ("rear_ultrasonic_stop_m",         0.100),
+            ("rear_ultrasonic_stop_m",         0.200),
             ("rear_us_indices",                [6]),
             ("drive_ultrasonic_safety",        True),
-            ("ultrasonic_stop_m",              0.025),
+            ("ultrasonic_stop_m",              0.050),
             ("enable_stuck_detection",         True),
             ("stuck_check_after_s",            3.0),
             ("stuck_gyro_min_rads",            0.006),
@@ -83,6 +83,7 @@ class AutoparkMaster(Node):
             # Set to slightly more than measured arc time (user: ~10s).
             ("arc_fallback_time_s",            12.0),
             ("min_clearance_m",                0.12),
+            ("us_safety_start_delay_s",        0.50),   # grace period before US checks fire
         ]:
             self.declare_parameter(name, default)
 
@@ -136,6 +137,7 @@ class AutoparkMaster(Node):
         self.d4_speed_mps                  = float(gp("d4_speed_mps"))
         self.arc_fallback_time_s           = float(gp("arc_fallback_time_s"))
         self.min_clearance_m               = float(gp("min_clearance_m"))
+        self.us_safety_start_delay_s       = float(gp("us_safety_start_delay_s"))
 
         # State
         self.latest_pose:       Optional[Pose2D] = None
@@ -349,7 +351,7 @@ class AutoparkMaster(Node):
             use_rear_us = bool(motion.get("use_rear_us", False))
             cmd   = self._motion_to_cmd(motion)
             dist  = float(cmd["target_dist_m"])
-            dt    = float(cmd["duration"])
+            dt    = float(cmd.get("master_duration", cmd["duration"]))  # pure travel time
             is_turning = abs(cmd["steer_deg"]) > self.straight_steer_threshold_deg
 
             self.get_logger().info(
@@ -427,13 +429,15 @@ class AutoparkMaster(Node):
         while rclpy.ok():
             now = time.monotonic(); elapsed = now - start_t
 
-            # Rear US primary (d4)
-            if use_rear_us and self.get_rear_us_m() <= self.rear_ultrasonic_stop_m:
-                return (f"rear_us_stop_seg_{seg}", elapsed, retries)
+            # Rear US primary (d4) — grace period prevents false-trigger at seg start
+            if use_rear_us and elapsed >= self.us_safety_start_delay_s:
+                if self.get_rear_us_m() <= self.rear_ultrasonic_stop_m:
+                    return (f"rear_us_stop_seg_{seg}", elapsed, retries)
 
-            # Emergency US
-            if self.drive_ultrasonic_safety and self.get_ultrasonic_min_m() < self.ultrasonic_stop_m:
-                return (f"ultrasonic_emergency_seg_{seg}", elapsed, retries)
+            # Emergency US — grace period prevents false-trigger from sensor noise at start
+            if self.drive_ultrasonic_safety and elapsed >= self.us_safety_start_delay_s:
+                if self.get_ultrasonic_min_m() < self.ultrasonic_stop_m:
+                    return (f"ultrasonic_emergency_seg_{seg}", elapsed, retries)
 
             # IMU arc
             if arc_trig and elapsed >= self.imu_arc_wait_before_check_s:
@@ -571,6 +575,7 @@ class AutoparkMaster(Node):
             esp32_duration = dt
         return {"type":"drive","gear":gear,"speed_mps":cmd_speed,
                 "steer_deg":steer,"target_dist_m":dist,"duration":esp32_duration,
+                "master_duration": dt,          # pure travel time for _wait_stop
                 "steer_active_hold": steer_active_hold}
 
     # ── Sensors ───────────────────────────────────────────────────────────
