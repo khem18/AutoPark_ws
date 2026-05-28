@@ -25,5 +25,6 @@ setup(
         'serial_bridge = autopark_system.serial_bridge:main',
         'perception_bridge = autopark_system.perception_bridge:main',
         'flow_distance_node = autopark_system.flow_distance_node:main',
+        'vins_pose_bridge = autopark_system.vins_pose_bridge:main',
     ]},
 )

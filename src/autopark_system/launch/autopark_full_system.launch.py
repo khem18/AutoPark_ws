@@ -127,4 +127,11 @@ def generate_launch_description():
             parameters=[params],
         ),
 
+        Node(
+            package='autopark_system',
+            executable='vins_pose_bridge',
+            name='vins_pose_bridge',
+            output='screen',
+            parameters=[params],
+        ),
     ])

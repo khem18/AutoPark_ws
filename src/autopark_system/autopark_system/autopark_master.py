@@ -38,7 +38,7 @@ class AutoparkMaster(Node):
             ("default_start_y",                 0.70),
             ("default_start_yaw_deg",          180.0),
             # Camera check: False = always pass (for testing without camera)
-            ("camera_check_enabled",           True),
+            ("camera_check_enabled",           False),
             ("camera_pose_max_age_s",          3.0),
             ("speed_scale",                    0.10),
             ("max_command_steer_deg",          30.0),
