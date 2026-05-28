@@ -131,9 +131,9 @@ def _analytical_plan(start_x: float, start_y: float,
                               case_name, [], [], {}, 1e9),
             motions=[])
 
-    d1  = x0_lateral + R + 0.12
+    d1  = x0_lateral + R + 0.1
     s23 = R * math.pi / 2
-    d4  = y0_depth + 0.34 
+    d4  = y0_depth + 0.3
 
     if d1 < -0.01:
         reason = f"lateral_too_left: d1={d1:.3f} (lateral={x0_lateral:.3f} < −R)"
