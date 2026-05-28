@@ -110,30 +110,41 @@ def _analytical_plan(start_x: float, start_y: float,
       yaw = π              (car front faces −x = faces aisle)
 
     Equations:
-      R    = WB / tan(30°)  = 1.2800 m
-      d1   = y_lateral + R           ← forward setup LEFT  (gear=+1, steer=0°)
-      s23  = R × π/2 = 2.011 m       ← reverse CCW arc      (gear=−1, steer=−30°)
-      d4   = 1.180 − x_depth − R     ← reverse into slot    (gear=−1, steer=0°)
-                                        rear US 40mm = PRIMARY stop
+      R    = WB / tan(30°)  = 1.2800 m  (measured: 1.335 m)
+      d1   = y_lateral + R + 0.1        ← forward setup LEFT  (gear=+1, steer=0°)
+      s23  = R × π/2 = 2.097 m          ← reverse CCW arc      (gear=−1, steer=+30°)
+      d4   = TGT_X_AXLE − (y0_depth+R)  ← reverse into slot    (gear=−1, steer=0°)
+                                           rear US 200 mm = PRIMARY stop
 
-    After arc: car at (x=0, y=0, yaw=3π/2)
-      → perfectly centred at slot entrance, ready to reverse in
+    Camera detection range: x = −0.225 m to −1.125 m (−22.5 cm to −112.5 cm).
+    The arc requires only that (y0_depth + R) > 0, i.e. start_x > −R = −1.335 m,
+    which is satisfied across the full camera detection range.
+
+    After arc: car at lateral=0 (centred), depth = y0_depth + R (slot entrance region),
+    then d4 reverses straight into the slot until rear US fires.
     """
     x0_lateral = start_y    # lateral offset (right=+)
     y0_depth   = start_x    # depth (in aisle = negative)
 
     # ── Validation ────────────────────────────────────────────────────────
-    if y0_depth > -R + 0.06:
-        reason = (f"aisle_too_shallow: depth={y0_depth:.3f} > −{R:.3f}m  "
-                  f"(car needs ≥{R:.2f}m into aisle; set default_start_x=−{R:.2f})")
+    # Only reject if the car is already past the slot entrance (positive depth).
+    # The old gate (-R + 0.06 = -1.275 m) wrongly rejected the entire camera
+    # detection range (-1.125 m to -0.225 m).  The arc fits in the aisle as
+    # long as start_x < 0, with the arc end point at y0_depth + R.
+    if y0_depth > -0.10:
+        reason = (f"aisle_too_shallow: depth={y0_depth:.3f} m  "
+                  f"(car must be at least 10 cm before slot entrance, i.e. start_x ≤ −0.10)")
         return PlannedPath(
             result=PlanResult(False, False, False, reason, "analytical_v4",
                               case_name, [], [], {}, 1e9),
             motions=[])
 
-    d1  = x0_lateral + R + 0.1
+    d1  = x0_lateral + R + 0.50
     s23 = R * math.pi / 2
-    d4  = y0_depth + 0.3
+    # d4: distance to reverse straight into slot after the arc.
+    # Arc brings rear axle to depth (y0_depth + R); we need to reach TGT_X_AXLE.
+    # Minimum 0.05 m so the motion is always present; rear US is the real stop.
+    d4  = -y0_depth + 0.45
 
     if d1 < -0.01:
         reason = f"lateral_too_left: d1={d1:.3f} (lateral={x0_lateral:.3f} < −R)"
@@ -188,8 +199,10 @@ def _analytical_plan(start_x: float, start_y: float,
         "x_f": x_f, "y_f": y_f,
         "R_m": R,
         "d1_m": d1, "s23_m": s23, "d4_m": d4,
+        # arc_end_depth: positive = arc dips into slot entrance (OK); negative = stays in aisle.
+        "arc_end_depth_m": round(y0_depth + R, 4),
         "arc_in_aisle": (y0_depth + R) <= 0.01,
-        "arc_steer_note": "−30° (LEFT steer + reverse = CCW = correct direction)",
+        "arc_steer_note": "+30° (RIGHT steer + reverse = CCW = correct direction)",
     }
 
     ok = (metrics["rear_clear"] >= 0.015

@@ -56,6 +56,9 @@ class AutoparkMaster(Node):
             ("drive_time_min_s",               1.0),
             ("drive_time_max_s",               60.0),
             ("imu_arc_stop_enabled",           True),
+            ("imu_arc_reversal_enabled",       True),
+            ("imu_arc_reversal_min_deg",        10.0),  # min peak before reversal counts
+            ("imu_arc_reversal_drop_deg",        3.0),  # drop from peak to trigger stop
             ("imu_arc_min_steer_deg",          8.0),
             ("imu_arc_stop_factor",            0.83),
             ("imu_arc_wait_before_check_s",    0.3),
@@ -67,6 +70,11 @@ class AutoparkMaster(Node):
             ("drive_ultrasonic_safety",        True),
             ("ultrasonic_stop_m",              0.050),
             ("enable_stuck_detection",         True),
+            # IMU straight heading correction (d1 / d4)
+            ("imu_straight_correct_enabled",   True),
+            ("imu_straight_correct_thresh_deg", 2.0),   # start correcting if drift exceeds this
+            ("imu_straight_correct_gain",       1.5),   # P-gain: correction = -drift * gain
+            ("imu_straight_correct_max_deg",    8.0),   # max steer correction allowed (deg)
             ("stuck_check_after_s",            3.0),
             ("stuck_gyro_min_rads",            0.006),
             ("stuck_flow_delta_min_m",         0.005),
@@ -112,6 +120,10 @@ class AutoparkMaster(Node):
         self.drive_time_min_s              = float(gp("drive_time_min_s"))
         self.drive_time_max_s              = float(gp("drive_time_max_s"))
         self.imu_arc_stop_enabled          = bool(gp("imu_arc_stop_enabled"))
+        self.imu_arc_reversal_enabled      = bool(gp("imu_arc_reversal_enabled"))
+        self.imu_arc_reversal_min_deg      = float(gp("imu_arc_reversal_min_deg"))
+        self.imu_arc_reversal_drop_deg     = float(gp("imu_arc_reversal_drop_deg"))
+        self._arc_peak: float              = 0.0
         self.imu_arc_min_steer_deg         = float(gp("imu_arc_min_steer_deg"))
         self.imu_arc_stop_factor           = float(gp("imu_arc_stop_factor"))
         self.imu_arc_wait_before_check_s   = float(gp("imu_arc_wait_before_check_s"))
@@ -123,6 +135,10 @@ class AutoparkMaster(Node):
         self.drive_ultrasonic_safety       = bool(gp("drive_ultrasonic_safety"))
         self.ultrasonic_stop_m             = float(gp("ultrasonic_stop_m"))
         self.enable_stuck_detection        = bool(gp("enable_stuck_detection"))
+        self.imu_straight_correct_enabled  = bool(gp("imu_straight_correct_enabled"))
+        self.imu_straight_correct_thresh_deg = float(gp("imu_straight_correct_thresh_deg"))
+        self.imu_straight_correct_gain     = float(gp("imu_straight_correct_gain"))
+        self.imu_straight_correct_max_deg  = float(gp("imu_straight_correct_max_deg"))
         self.stuck_check_after_s           = float(gp("stuck_check_after_s"))
         self.stuck_gyro_min_rads           = float(gp("stuck_gyro_min_rads"))
         self.stuck_flow_delta_min_m        = float(gp("stuck_flow_delta_min_m"))
@@ -416,6 +432,7 @@ class AutoparkMaster(Node):
     def _wait_stop(self, drive_time_s, dist_m, steer_deg, is_turning,
                    use_rear_us, imu_start, flow_start, seg) -> Tuple[str,float,int]:
         start_t = time.monotonic(); last_log = 0.0; retries = 0; stuck_done = False
+        self._arc_peak = 0.0  # reset arc peak for reversal detection
 
         arc_trig: Optional[float] = None
         if is_turning and self.imu_arc_stop_enabled and abs(steer_deg) > 0.5:
@@ -425,6 +442,17 @@ class AutoparkMaster(Node):
         flow_trig: Optional[float] = None
         if not is_turning and self.flow_straight_stop_enabled and flow_start is not None:
             flow_trig = dist_m * self.flow_straight_stop_factor
+
+        # IMU straight heading correction — only for straight moves (d1, d4).
+        # If yaw drifts beyond imu_straight_correct_thresh_deg, send a corrective
+        # steer command to nudge the car back on heading.
+        imu_straight_correct = (
+            not is_turning
+            and self.imu_straight_correct_enabled
+            and abs(steer_deg) < 0.5   # only for nominally straight moves
+        )
+        last_correction_t: float = 0.0
+        current_correction_deg: float = 0.0
 
         while rclpy.ok():
             now = time.monotonic(); elapsed = now - start_t
@@ -441,14 +469,59 @@ class AutoparkMaster(Node):
 
             # IMU arc
             if arc_trig and elapsed >= self.imu_arc_wait_before_check_s:
-                if abs(self._adelta(imu_start, self.imu_yaw_deg)) >= arc_trig:
+                cur_arc = abs(self._adelta(imu_start, self.imu_yaw_deg))
+                if cur_arc >= arc_trig:
                     return (f"imu_arc_stop_seg_{seg}", elapsed, retries)
+                # Arc reversal detection: if arc decreases from its peak, car rotated back.
+                # Stop immediately and proceed to next move.
+                if self.imu_arc_reversal_enabled:
+                    if cur_arc > self._arc_peak:
+                        self._arc_peak = cur_arc
+                    elif (self._arc_peak >= self.imu_arc_reversal_min_deg
+                            and (self._arc_peak - cur_arc) >= self.imu_arc_reversal_drop_deg):
+                        self.get_logger().warning(
+                            f"  IMU_ARC_REVERSAL peak={self._arc_peak:.1f}° "
+                            f"current={cur_arc:.1f}° -> stop arc early")
+                        return (f"imu_arc_reversal_seg_{seg}", elapsed, retries)
 
             # Flow straight
             if (flow_trig and self.flow_valid and self.flow_distance_m is not None
                     and elapsed >= self.flow_straight_wait_before_check_s):
                 if abs((self.flow_distance_m or 0.0) - (flow_start or 0.0)) >= flow_trig:
                     return (f"flow_stop_seg_{seg}", elapsed, retries)
+
+            # IMU straight heading correction
+            # Uses the original gear from the motion command (positive = forward, negative = reverse).
+            if imu_straight_correct and elapsed >= 0.3:
+                drift = self._adelta(imu_start, self.imu_yaw_deg)
+                cmd_gear = 1 if seg == 1 else -1  # seg1=fwd_setup(+1), seg3=d4(-1)
+                if abs(drift) >= self.imu_straight_correct_thresh_deg:
+                    # P-controller: steer opposite to drift direction, clamped
+                    new_corr = self.clamp(
+                        -drift * self.imu_straight_correct_gain,
+                        -self.imu_straight_correct_max_deg,
+                        +self.imu_straight_correct_max_deg)
+                    if (abs(new_corr - current_correction_deg) >= 1.0
+                            or now - last_correction_t >= 0.5):
+                        current_correction_deg = new_corr
+                        last_correction_t = now
+                        self._cmd({"type": "drive", "gear": cmd_gear,
+                                   "speed_mps": self.speed_scale,
+                                   "steer_deg": round(current_correction_deg, 1),
+                                   "duration": drive_time_s,
+                                   "steer_active_hold": True})
+                        self.get_logger().info(
+                            f"  IMU_CORR drift={drift:.1f}° -> steer={current_correction_deg:.1f}°")
+                elif abs(drift) < self.imu_straight_correct_thresh_deg * 0.3 and current_correction_deg != 0.0:
+                    # Heading recovered — restore straight steer
+                    current_correction_deg = 0.0
+                    last_correction_t = now
+                    self._cmd({"type": "drive", "gear": cmd_gear,
+                               "speed_mps": self.speed_scale,
+                               "steer_deg": 0.0,
+                               "duration": drive_time_s,
+                               "steer_active_hold": True})
+                    self.get_logger().info("  IMU_CORR heading recovered -> steer=0°")
 
             # Stuck
             if (self.enable_stuck_detection and not stuck_done
@@ -546,24 +619,26 @@ class AutoparkMaster(Node):
             #   actual arc speed ≈ 0.25 m/s → arc needs ~10s for 90°
             imu_fresh = (self.last_imu_time > 0
                          and (time.monotonic() - self.last_imu_time) < 2.0)
-            if imu_fresh:
-                dt = self.drive_time_max_s   # IMU controls stop
+            if imu_fresh and self.imu_arc_stop_enabled:
+                # IMU is live AND arc stop is enabled: give full budget, IMU controls stop.
+                # If imu_arc_stop_enabled=false, fall through to time fallback.
+                dt = self.drive_time_max_s
             else:
                 dt = self.clamp(self.arc_fallback_time_s,
                                 self.drive_time_min_s, self.drive_time_max_s)
+                reason = "IMU arc stop disabled" if imu_fresh else "IMU not available"
                 self.get_logger().warning(
-                    f"  IMU not available — arc fallback: {dt:.1f}s "
-                    f"(tune arc_fallback_time_s in YAML; arc ~10s measured)")
+                    f"  {reason} — arc fallback: {dt:.1f}s "
+                    f"(tune arc_fallback_time_s in YAML)")
         else:
-            use_rear_us = bool(motion.get("use_rear_us", False))
-            if use_rear_us:
-                # d4 (reverse into slot): rear_us is primary stop.
-                # Use drive_time_max_s so the slow speed doesn't cause time_stop too early.
-                dt = self.drive_time_max_s
-            else:
-                cal = (self.forward_straight_speed_mps if gear>0
-                       else self.reverse_straight_speed_mps)
-                dt = self.clamp(dist/max(abs(cal),0.001), self.drive_time_min_s, self.drive_time_max_s)
+            # All straight moves use calculated duration (dist/speed), same as d1.
+            # rear_us fires as a stop trigger independently of the time budget.
+            # Add motor_start_delay_s so time_stop fires AFTER the motor physically starts.
+            cal = (self.forward_straight_speed_mps if gear>0
+                   else self.reverse_straight_speed_mps)
+            travel_t = dist / max(abs(cal), 0.001)
+            dt = self.clamp(travel_t + self.motor_start_delay_s,
+                            self.drive_time_min_s, self.drive_time_max_s)
         # steer_active_hold: True for straight (motor holds 0°), False for arc (locks at -/+30°)
         steer_active_hold = bool(motion.get("steer_active_hold", False))
         # Straight moves: add motor_start_delay_s to ESP32 duration.

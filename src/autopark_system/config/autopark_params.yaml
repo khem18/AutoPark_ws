@@ -27,7 +27,7 @@ autopark_master:
     cam_check_request_topic: "/autopark/cam_check_request"
 
     # Steer / speed
-    speed_scale:           0.03     # slippery floor: low speed = less wheel spin
+    speed_scale:           0.05     # slippery floor: low speed = less wheel spin
     max_command_steer_deg: 30.0
 
     # Steer settle
@@ -38,7 +38,7 @@ autopark_master:
     # Time from drive command sent to motor physically spinning.
     # Fallback when optical flow is not available.
     # Tune: (d_expected - d_actual) / speed = (1.98 - 1.43) / 0.481 = 1.14s → use 1.2
-    motor_start_delay_s:    1.2
+    motor_start_delay_s:    1.8
     # Arc time budget when IMU is not available.
     # User confirmed: arc takes ~10s to complete 90°.
     # Set slightly above 10s so time_stop fires after full arc.
@@ -61,8 +61,17 @@ autopark_master:
     # IMU arc stop (arc move)
     imu_arc_stop_enabled:         true
     imu_arc_min_steer_deg:        8.0
-    imu_arc_stop_factor:          0.83
+    imu_arc_stop_factor:          0.55
     imu_arc_wait_before_check_s:  0.3
+    imu_arc_reversal_enabled:    true
+    imu_arc_reversal_min_deg:    10.0   # only trigger after arc reaches 10°
+    imu_arc_reversal_drop_deg:    3.0   # stop if arc drops 3° from its peak
+
+    # IMU straight heading correction (move 1 fwd_setup and move 3 d4)
+    imu_straight_correct_enabled:    true
+    imu_straight_correct_thresh_deg: 2.0
+    imu_straight_correct_gain:       1.5
+    imu_straight_correct_max_deg:    8.0
 
     # Flow stop (disabled)
     flow_straight_stop_enabled:         true
@@ -82,7 +91,7 @@ autopark_master:
 
     # Stuck detection
     enable_stuck_detection:   true
-    stuck_check_after_s:      3.0
+    stuck_check_after_s:      15.0
     stuck_gyro_min_rads:      0.006
     stuck_flow_delta_min_m:   0.005
     stuck_kick_speed_mps:     0.10
@@ -120,7 +129,7 @@ perception_bridge:
     case_detection_mode:    "fixed"
     fixed_case:             "right_only"
     camera_metrics_timeout_s:  5.0    # ← NEW: pose only published when detection fresh
-    camera_x_scale:   0.01    # was -0.01 (sign was also wrong for pose.x)
+    camera_x_scale:   -0.01    # was -0.01 (sign was also wrong for pose.x)
     camera_y_scale:   0.01
     camera_x_offset_m: 0.0
     camera_y_offset_m: 0.0
