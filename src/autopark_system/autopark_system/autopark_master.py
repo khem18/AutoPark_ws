@@ -602,8 +602,8 @@ class AutoparkMaster(Node):
         if gear == 0:
             cmd_speed = 0.0
         elif use_rear_us_flag:
-            # d4: very slow so rear_us sensor has time to react.
-            # Tune d4_speed_mps in YAML (0.02 m/s = slow crawl into slot).
+            # d4: very slow so the car crawls into the slot.
+            # Duration-only stop — no rear_us, no flow.
             cmd_speed = min(self.d4_speed_mps, self.speed_scale)
         else:
             cmd_speed = min(0.09 if turning else 0.08, self.speed_scale)
@@ -631,13 +631,23 @@ class AutoparkMaster(Node):
                     f"  {reason} — arc fallback: {dt:.1f}s "
                     f"(tune arc_fallback_time_s in YAML)")
         else:
-            # All straight moves use calculated duration (dist/speed), same as d1.
-            # rear_us fires as a stop trigger independently of the time budget.
+            # All straight moves use calculated duration (dist/speed).
+            # For d4 (use_rear_us_flag=True) the command speed is d4_speed_mps
+            # (very slow crawl), so duration MUST be based on d4_speed_mps —
+            # using reverse_straight_speed_mps would give a tiny dt that fires
+            # the time-stop before the car has moved at all.
             # Add motor_start_delay_s so time_stop fires AFTER the motor physically starts.
-            cal = (self.forward_straight_speed_mps if gear>0
-                   else self.reverse_straight_speed_mps)
+            if use_rear_us_flag:
+                cal = max(abs(self.d4_speed_mps), 0.001)
+            else:
+                cal = (self.forward_straight_speed_mps if gear > 0
+                       else self.reverse_straight_speed_mps)
             travel_t = dist / max(abs(cal), 0.001)
-            dt = self.clamp(travel_t + self.motor_start_delay_s,
+            # dt = pure travel time only.
+            # motor_start_delay_s is NOT added here — _wait_motor_start() physically
+            # waits that delay before the timer starts, so adding it here would
+            # cause the car to over-travel by (motor_start_delay_s × real_speed).
+            dt = self.clamp(travel_t,
                             self.drive_time_min_s, self.drive_time_max_s)
         # steer_active_hold: True for straight (motor holds 0°), False for arc (locks at -/+30°)
         steer_active_hold = bool(motion.get("steer_active_hold", False))

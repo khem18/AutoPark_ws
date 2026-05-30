@@ -175,7 +175,7 @@ def _analytical_plan(start_x: float, start_y: float,
         {
             "gear": -1, "steer_deg": 0.0, "dist_m": round(d4, 4),
             "label": "rev_straight_d4",
-            "use_rear_us": True,
+            "use_rear_us": False,
             "speed_override": "slow",
             "steer_active_hold": True,    # motor holds 0° against spring
         },
