@@ -27,7 +27,7 @@ autopark_master:
     cam_check_request_topic: "/autopark/cam_check_request"
 
     # Steer / speed
-    speed_scale:           0.05     # slippery floor: low speed = less wheel spin
+    speed_scale:           0.01     # slippery floor: low speed = less wheel spin
     max_command_steer_deg: 30.0
 
     # Steer settle
@@ -46,10 +46,10 @@ autopark_master:
     arc_fallback_time_s:    12.0
 
     # Calibrated speeds (time fallback)
-    forward_turn_speed_mps:       0.055
-    reverse_turn_speed_mps:       0.501    # measured from arc test
-    forward_straight_speed_mps:   0.481    # measured: ~340cm / 99s = 0.034 m/s
-    reverse_straight_speed_mps:   0.501    # estimate — calibrate after arc is fixed
+    forward_turn_speed_mps:       0.225
+    reverse_turn_speed_mps:       0.236    # measured from arc test
+    forward_straight_speed_mps:   0.225    # measured: ~340cm / 99s = 0.034 m/s
+    reverse_straight_speed_mps:   0.236    # estimate — calibrate after arc is fixed
     straight_steer_threshold_deg: 3.0
 
     # Timing ← FIXED
@@ -61,7 +61,7 @@ autopark_master:
     # IMU arc stop (arc move)
     imu_arc_stop_enabled:         true
     imu_arc_min_steer_deg:        8.0
-    imu_arc_stop_factor:          0.55
+    imu_arc_stop_factor:          0.64
     imu_arc_wait_before_check_s:  0.3
     imu_arc_reversal_enabled:    true
     imu_arc_reversal_min_deg:    10.0   # only trigger after arc reaches 10°
@@ -107,8 +107,8 @@ autopark_master:
 
 serial_bridge:
   ros__parameters:
-    drive_port:              "/dev/ttyUSB0"
-    us_all_port:             "/dev/ttyUSB1"
+    drive_port:              "/dev/ttyUSB2"
+    us_all_port:             "/dev/ttyUSB0"
     us_front_port:           ""
     us_rear_port:            ""
     baud:                    115200
