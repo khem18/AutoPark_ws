@@ -650,7 +650,14 @@ class AutoparkMaster(Node):
             dt = self.clamp(travel_t,
                             self.drive_time_min_s, self.drive_time_max_s)
         # steer_active_hold: True for straight (motor holds 0°), False for arc (locks at -/+30°)
-        steer_active_hold = bool(motion.get("steer_active_hold", False))
+        # For straight moves, MUST be True — the return spring pulls to +30°.
+        # Without it: steer reaches 0°, motor locks off, spring pulls wheel back to ~30°.
+        # Drive command arrives needing err <= 8° but wheel is at 30° → drive never starts.
+        # Arc: spring helps hold +30°, so steerActiveHold=False is correct.
+        if "steer_active_hold" in motion:
+            steer_active_hold = bool(motion["steer_active_hold"])
+        else:
+            steer_active_hold = not turning  # True for straight, False for arc
         # Straight moves: add motor_start_delay_s to ESP32 duration.
         # ESP32 must keep motor running until after autopark_master's timer fires.
         # Without fix: ESP32 stops at (dt+0.7s), master stops at (delay+dt) → 0.5s short.
