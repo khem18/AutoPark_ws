@@ -139,12 +139,12 @@ def _analytical_plan(start_x: float, start_y: float,
                               case_name, [], [], {}, 1e9),
             motions=[])
 
-    d1  = x0_lateral + R + 0.55
+    d1  = x0_lateral + R + 0.30
     s23 = R * math.pi / 2
     # d4: distance to reverse straight into slot after the arc.
     # Arc brings rear axle to depth (y0_depth + R); we need to reach TGT_X_AXLE.
     # Minimum 0.05 m so the motion is always present; rear US is the real stop.
-    d4  = -y0_depth + 0.20
+    d4  = -y0_depth + 0.40
 
     if d1 < -0.01:
         reason = f"lateral_too_left: d1={d1:.3f} (lateral={x0_lateral:.3f} < −R)"

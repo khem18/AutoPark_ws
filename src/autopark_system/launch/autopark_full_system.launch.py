@@ -142,6 +142,7 @@ def generate_launch_description():
             parameters=[{
                 'enc_port':   '/dev/ttyUSB1',
                 'drive_port': '/dev/ttyUSB2',
+                'speed_scale': 0.01,
             }]
         ),
     ])
