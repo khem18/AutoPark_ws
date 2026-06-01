@@ -1,14 +1,12 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Bool
 from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import cv2
 import numpy as np
 import math
-import os
-
 
 class LotDetector(Node):
     def __init__(self):
@@ -29,64 +27,23 @@ class LotDetector(Node):
         )
         self.bridge = CvBridge()
 
-        # --- CREATE THE PARKING METRICS PUBLISHER ---
+        # --- PARKING METRICS PUBLISHER ---
         self.metrics_pub = self.create_publisher(Float32MultiArray, '/parking_metrics', 10)
+
+        # --- OBSTACLE ALERT PUBLISHER ---
+        self.obstacle_pub = self.create_publisher(Bool, '/lot_obstacle', 10)
 
         # --- AWB MEMORY ---
         self.gain_b = 1.0
         self.gain_g = 1.0
         self.gain_r = 1.0
 
-        # ============================================================
-        # FIX 1: Thread-safe display
-        # rclpy.spin() runs callbacks in a background thread.
-        # cv2.imshow() MUST be called from the main thread on X11.
-        # We store the latest frames here and show them in a timer.
-        # ============================================================
-        self.latest_frames = {}
+        self.get_logger().info("Lot Detector Started! Obstacle alert ON → /lot_obstacle")
 
-        # FIX 2: Let OpenCV manage its own window thread.
-        # This is required when imshow is driven by a ROS timer
-        # rather than a tight while-loop in the main thread.
-        cv2.startWindowThread()
-
-        # FIX 3: Warn clearly if DISPLAY is not forwarded.
-        # ssh -X sets DISPLAY; if it is missing, imshow is a no-op.
-        display = os.environ.get('DISPLAY', '')
-        if not display:
-            self.get_logger().warn(
-                'DISPLAY is not set! '
-                'Debug windows will not appear. '
-                'Connect with: ssh -X user@host'
-            )
-        else:
-            self.get_logger().info(f'DISPLAY={display}  (X11 forwarding active)')
-
-        # 30 fps display timer — runs in the main thread via spin()
-        self.display_timer = self.create_timer(0.033, self._display_callback)
-
-        self.get_logger().info(
-            'Lot Detector Started! Safety Bypass ACTIVE. '
-            'Publishing to /parking_metrics'
-        )
-
-    # ------------------------------------------------------------------
-    # DISPLAY CALLBACK  (main-thread safe)
-    # ------------------------------------------------------------------
-    def _display_callback(self):
-        """Show whatever frames the latest camera callback stored."""
-        if not self.latest_frames:
-            return
-        for win_name, frame in self.latest_frames.items():
-            if frame is not None:
-                cv2.imshow(win_name, frame)
-        cv2.waitKey(1)
-
-    # ------------------------------------------------------------------
-    # CAMERA CALLBACK  (background thread — no imshow here)
-    # ------------------------------------------------------------------
     def listener_callback(self, data):
+        # ==============================================================
         # 1. READ AND RESIZE CAMERA FEED
+        # ==============================================================
         raw_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
         frame = cv2.resize(raw_image, (640, 480))
 
@@ -120,12 +77,16 @@ class LotDetector(Node):
         # ==============================================================
         # 2. BIRD'S EYE VIEW (IPM) TRANSFORM
         # ==============================================================
+
+        # SOURCE POINTS: Tracing the yellow lines
         src_pts = np.float32([
             [20.0,  380.0],   # Bottom-Left
             [620.0, 380.0],   # Bottom-Right
             [210.0, 210.0],   # Top-Left
             [430.0, 210.0]    # Top-Right
         ])
+
+        # DESTINATION POINTS: Force lines to be perfectly straight vertical
         dst_pts = np.float32([
             [200.0, 480.0],
             [440.0, 480.0],
@@ -142,7 +103,9 @@ class LotDetector(Node):
         kernel_shrink = np.ones((10, 10), np.uint8)
         floor_mask = cv2.erode(floor_mask, kernel_shrink)
 
-        # 3. DETECT YELLOW LINES
+        # ==============================================================
+        # 3. DETECT YELLOW LINES (ANTI-SKIN & FILL-FACTOR GEOMETRY)
+        # ==============================================================
         blurred_bev = cv2.medianBlur(bev_frame, 21)
         hsv = cv2.cvtColor(blurred_bev, cv2.COLOR_BGR2HSV)
 
@@ -152,21 +115,22 @@ class LotDetector(Node):
         v = clahe.apply(v)
         hsv_enhanced = cv2.merge([h, s, v])
 
+        # ANTI-SKIN TONE & STATIC
         lower_yellow = np.array([18, 40, 30])
         upper_yellow = np.array([45, 255, 255])
         yellow_mask = cv2.inRange(hsv_enhanced, lower_yellow, upper_yellow)
 
+        # ERASER & BAND-AID
         kernel_eraser = np.ones((7, 7), np.uint8)
         yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel_eraser)
 
         kernel_vertical = np.ones((40, 5), np.uint8)
         yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel_vertical)
 
+        # SLICE OFF THE OVERHANG
         yellow_mask = cv2.bitwise_and(yellow_mask, floor_mask)
 
-        contours, _ = cv2.findContours(
-            yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        contours, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         valid_lines = []
         for cnt in contours:
@@ -187,12 +151,12 @@ class LotDetector(Node):
             box_area = length * thickness
             fill_factor = area / box_area if box_area > 0 else 0
 
-            if (length > 80 and thickness < 70
-                    and aspect_ratio > 3.0 and fill_factor > 0.65):
+            if length > 80 and thickness < 70 and aspect_ratio > 3.0 and fill_factor > 0.65:
                 valid_lines.append({
                     'cx': cx, 'cy': cy,
                     'thickness': thickness, 'rect': rect
                 })
+
                 box = cv2.boxPoints(rect)
                 box = np.int32(box)
                 cv2.drawContours(bev_frame, [box], 0, (0, 0, 255), 2)
@@ -203,7 +167,9 @@ class LotDetector(Node):
         line1 = None
         line2 = None
 
+        # ==============================================================
         # 4. MEASURE THE TRUE PERPENDICULAR INNER GAP
+        # ==============================================================
         if len(valid_lines) >= 2:
             line1 = valid_lines[0]
 
@@ -244,6 +210,7 @@ class LotDetector(Node):
                 offset2 = line2['thickness'] / 2
                 pixel_gap = center_distance - offset1 - offset2
 
+                # --- CALIBRATED SCALES ---
                 cm_per_pixel_x = 0.1825
                 cm_per_pixel_y = 0.247
 
@@ -256,9 +223,10 @@ class LotDetector(Node):
                     end_x = int(start_x + nx * pixel_gap)
                     end_y = int(start_y + ny * pixel_gap)
 
-                    cv2.line(overlay, (start_x, start_y), (end_x, end_y),
-                             (0, 255, 255), 3)
+                    # DRAWING: Yellow measuring tape
+                    cv2.line(overlay, (start_x, start_y), (end_x, end_y), (0, 255, 255), 3)
 
+                    # 1. FIND THE "FRONT GATE"
                     target_x = start_x + (end_x - start_x) // 2
                     target_y = start_y + (end_y - start_y) // 2
 
@@ -283,59 +251,69 @@ class LotDetector(Node):
                     tilt_degrees = math.degrees(screen_angle_rad)
 
                     cv2.circle(overlay, (gate_x, gate_y), 8, (0, 0, 255), -1)
-                    cv2.line(overlay, (target_x, target_y), (gate_x, gate_y),
-                             (0, 255, 0), 1)
+                    cv2.line(overlay, (target_x, target_y), (gate_x, gate_y), (0, 255, 0), 1)
 
+                    # 2. CALCULATE KART DISTANCE TO FRONT GATE
                     dist_outward_cm = (480 - gate_y) * cm_per_pixel_y
-                    dist_along_cm = (320 - gate_x) * cm_per_pixel_x
+                    dist_along_cm   = (320 - gate_x) * cm_per_pixel_x
 
                     cam_offset_y = -4.0
-                    cam_offset_x = 22.5
+                    cam_offset_x = 56.0
 
-                    kart_y_fwd = dist_along_cm + cam_offset_y
+                    kart_y_fwd   = dist_along_cm + cam_offset_y
                     kart_x_right = dist_outward_cm + cam_offset_x
 
+                    # --- LATERAL CALIBRATION CORRECTION ---
+                    # 5-point cal: (103,103),(92,98),(83,93),(74,88),(71,83) → R²=0.97
                     k_y = int(kart_y_fwd)
                     k_x = int(0.5915 * kart_x_right + 42.96)
                     k_tlt = int(tilt_degrees)
 
-                    # PUBLISH (valid spot range)
-                    if 75 <= real_width_cm <= 90:  # 75 is min for a tight lot, 90 is max for a roomy spot 
+                    # ==============================================================
+                    # 3. PUBLISH THE DATA ARRAY
+                    # ==============================================================
+
+                    # ONLY publish if the spot is between 75cm and 95cm (Valid Spot)
+                    if 75 <= real_width_cm <= 95:
                         metrics_msg = Float32MultiArray()
+
+                        car_start_x  = 0.0
+                        car_start_y  = 0.0
+                        end_target_x = 150.0        # Fixed parking lot depth (cm)
+                        end_target_y = float(k_y)   # Lateral offset: car center → front gate center
+                        kart_tilt    = float(k_tlt)
+
                         metrics_msg.data = [
-                            0.0,           # car_start_x
-                            0.0,           # car_start_y
-                            float(k_x),    # end_target_x
-                            float(k_y),    # end_target_y
-                            float(k_tlt)   # kart_tilt
+                            car_start_x,
+                            car_start_y,
+                            end_target_x,
+                            end_target_y,
+                            kart_tilt
                         ]
+
                         self.metrics_pub.publish(metrics_msg)
 
-                    # --- DRAW HUD TEXT ---
+                    # ==============================================================
+                    # DISPLAY TEXT ON SCREEN
+                    # ==============================================================
                     text_x = start_x + (end_x - start_x) // 2
                     text_y = start_y + (end_y - start_y) // 2 - 15
-                    cv2.putText(overlay, f"WIDTH: {real_width_cm} cm",
-                                (text_x - 70, text_y),
+                    cv2.putText(overlay, f"WIDTH: {real_width_cm} cm", (text_x - 70, text_y),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                    if 75 <= real_width_cm <= 90:
-                        cv2.putText(overlay, "PERFECT SPOT!",
-                                    (text_x - 70, text_y + 45),
+                    if 75 <= real_width_cm <= 95:
+                        cv2.putText(overlay, "PERFECT SPOT!", (text_x - 70, text_y + 45),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-                    cv2.putText(overlay, f"FRONT CENTER: X={k_x}cm, Y={k_y}cm",
-                                (20, 30),
+                    cv2.putText(overlay, f"WALL: X={k_x}cm, Y={k_y}cm", (20, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-                    cv2.putText(overlay, f"TILT: {k_tlt} DEG",
-                                (20, 60),
+                    cv2.putText(overlay, f"TILT: {k_tlt} DEG", (20, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
         # ==============================================================
         # 5. SPATIAL AWARENESS: "AVERAGE PIXEL" ANOMALY DETECTION
         # ==============================================================
-        safe_floor_mask = cv2.bitwise_and(
-            floor_mask, cv2.bitwise_not(yellow_mask)
-        )
+        safe_floor_mask = cv2.bitwise_and(floor_mask, cv2.bitwise_not(yellow_mask))
         avg_bgr = cv2.mean(blurred_bev, mask=safe_floor_mask)[:3]
         avg_background = np.full(bev_frame.shape, avg_bgr, dtype=np.uint8)
 
@@ -343,19 +321,19 @@ class LotDetector(Node):
         diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
 
         _, object_mask = cv2.threshold(diff_gray, 40, 255, cv2.THRESH_BINARY)
+
         object_mask = cv2.bitwise_and(object_mask, safe_floor_mask)
-        object_mask = cv2.morphologyEx(
-            object_mask, cv2.MORPH_OPEN, kernel_eraser
-        )
+        object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_OPEN, kernel_eraser)
 
-        obj_contours, _ = cv2.findContours(
-            object_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        obj_contours, _ = cv2.findContours(object_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        run_safety_check = False
+        # ==============================================================
+        # 6. OBSTACLE SAFETY CHECK — publishes /lot_obstacle (Bool)
+        # ==============================================================
+        lot_blocked = False
 
-        if run_safety_check and line1 is not None and line2 is not None:
-            left_boundary_x = line1['cx']
+        if line1 is not None and line2 is not None:
+            left_boundary_x  = line1['cx']
             right_boundary_x = line2['cx']
 
             for ocnt in obj_contours:
@@ -365,49 +343,56 @@ class LotDetector(Node):
                         obj_cx = int(M["m10"] / M["m00"])
                         obj_cy = int(M["m01"] / M["m00"])
 
-                        if obj_cx < left_boundary_x:
-                            zone_text = "LEFT SIDE LOT"
-                            color = (255, 100, 0)
-                        elif obj_cx > right_boundary_x:
-                            zone_text = "RIGHT SIDE LOT"
-                            color = (255, 100, 0)
-                        else:
-                            zone_text = "DANGER: INSIDE LOT!"
-                            color = (0, 0, 255)
+                        inside_lot = (left_boundary_x <= obj_cx <= right_boundary_x)
 
-                        x, y, w, h_r = cv2.boundingRect(ocnt)
-                        cv2.rectangle(overlay, (x, y), (x + w, y + h_r),
-                                      color, 3)
-                        cv2.circle(overlay, (obj_cx, obj_cy), 5, color, -1)
-                        cv2.putText(overlay, zone_text, (x - 20, y - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        if inside_lot:
+                            # --- OBSTACLE IS INSIDE THE LOT ---
+                            lot_blocked = True
+                            zone_text = "!! OBSTACLE IN LOT !!"
+                            color = (0, 0, 255)  # Red
+
+                            # Bounding box + centre dot
+                            x, y, w, h = cv2.boundingRect(ocnt)
+                            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, 3)
+                            cv2.circle(overlay, (obj_cx, obj_cy), 6, color, -1)
+                            cv2.putText(overlay, zone_text, (x - 20, y - 12),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+                            # Full-screen red flash banner
+                            cv2.rectangle(overlay, (0, 0), (640, 50), (0, 0, 200), -1)
+                            cv2.putText(overlay,
+                                        "DANGER: OBSTACLE INSIDE LOT — PARKING BLOCKED",
+                                        (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                        (255, 255, 255), 2)
+                        else:
+                            # Object outside lot — orange marker only
+                            zone_text = "OBJECT (outside lot)"
+                            color = (255, 140, 0)
+                            x, y, w, h = cv2.boundingRect(ocnt)
+                            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, 2)
+                            cv2.putText(overlay, zone_text, (x - 20, y - 12),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+
+        # Publish obstacle alert every frame
+        self.obstacle_pub.publish(Bool(data=lot_blocked))
 
         cv2.addWeighted(overlay, 0.4, bev_frame, 0.6, 0, bev_frame)
 
-        # ==============================================================
-        # FIX: Store frames for the display timer instead of calling
-        # imshow() here in the background thread.
-        # ==============================================================
-        self.latest_frames = {
-            '1. Normal img':  frame,
-            '2. BEV img':     bev_frame,
-            '3. Line Mask':   yellow_mask,
-            '4. Anomaly Mask': object_mask,
-        }
+        # 7. SHOW THE FEEDS
+        cv2.imshow("1. Normal img", frame)
+        cv2.imshow("2. BEV img", bev_frame)
+        cv2.imshow("3. Line Mask", yellow_mask)
+        cv2.imshow("4. Anomaly Mask", object_mask)
+        cv2.waitKey(1)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = LotDetector()
-
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        cv2.destroyAllWindows()
-        rclpy.shutdown()
+    rclpy.spin(node)
+    node.destroy_node()
+    cv2.destroyAllWindows()
+    rclpy.shutdown()
 
 
 if __name__ == '__main__':
