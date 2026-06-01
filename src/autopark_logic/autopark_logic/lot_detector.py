@@ -258,7 +258,7 @@ class LotDetector(Node):
                     dist_along_cm   = (320 - gate_x) * cm_per_pixel_x
 
                     cam_offset_y = -4.0
-                    cam_offset_x = 56.0
+                    cam_offset_x = 22.5
 
                     kart_y_fwd   = dist_along_cm + cam_offset_y
                     kart_x_right = dist_outward_cm + cam_offset_x
@@ -279,7 +279,7 @@ class LotDetector(Node):
 
                         car_start_x  = 0.0
                         car_start_y  = 0.0
-                        end_target_x = 150.0        # Fixed parking lot depth (cm)
+                        end_target_x = float (k_x)        # Fixed parking lot depth (cm)
                         end_target_y = float(k_y)   # Lateral offset: car center → front gate center
                         kart_tilt    = float(k_tlt)
 

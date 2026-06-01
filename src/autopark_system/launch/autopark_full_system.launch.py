@@ -140,7 +140,7 @@ def generate_launch_description():
             executable='encoder_bridge',
             name='encoder_bridge',
             parameters=[{
-                'enc_port':   '/dev/ttyUSB0',
+                'enc_port':   '/dev/ttyUSB1',
                 'drive_port': '/dev/ttyUSB2',
             }]
         ),
