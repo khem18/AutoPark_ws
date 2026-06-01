@@ -16,13 +16,13 @@ autopark_master:
     esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
 
     # Start pose — car must be ≥1.28m before slot entrance (in aisle)
-    use_default_pose_when_missing: false
+    use_default_pose_when_missing: true  # FIX: use default pose when camera not running
     default_start_x:       -1.28    # must be ≤ -R=-1.335m (measured arc radius)
     default_start_y:        0.70
     default_start_yaw_deg: 180.0
 
     # Camera check
-    camera_check_enabled:    true   # false = always yellow, bypass camera
+    camera_check_enabled:    false  # FIX: set true only when camera+vision pipeline is running
     camera_pose_max_age_s:   3.0
     cam_check_request_topic: "/autopark/cam_check_request"
 
@@ -32,7 +32,7 @@ autopark_master:
 
     # Steer settle
     steer_ready_timeout_s:  10.0    # arc settle may take longer at higher PWM
-    steer_settle_pause_s:   1.5     # longer: steer needs time to reach -30° against spring
+    steer_settle_pause_s:   3.5     # FIX: 3.5s gives servo time to physically reach 0° from 30° spring position
     steer_wait_fallback_s:  6.0
     pause_between_commands: 5.0     # longer pause to fully stop before next move
     # Time from drive command sent to motor physically spinning.
@@ -48,8 +48,8 @@ autopark_master:
     # Calibrated speeds (time fallback)
     forward_turn_speed_mps:       0.225
     reverse_turn_speed_mps:       0.236    # measured from arc test
-    forward_straight_speed_mps:   0.225    # measured: ~340cm / 99s = 0.034 m/s
-    reverse_straight_speed_mps:   0.236    # estimate — calibrate after arc is fixed
+    forward_straight_speed_mps:   0.060    # FIX: must match enc_fwd_speed_mps so drive_time_s covers full encoder run
+    reverse_straight_speed_mps:   0.040    # FIX: must match enc_rev_speed_mps so drive_time_s covers full encoder run
     straight_steer_threshold_deg: 3.0
 
     # Timing ← FIXED
@@ -61,7 +61,7 @@ autopark_master:
     # IMU arc stop (arc move)
     imu_arc_stop_enabled:         true
     imu_arc_min_steer_deg:        8.0
-    imu_arc_stop_factor:          0.64
+    imu_arc_stop_factor:          0.56
     imu_arc_wait_before_check_s:  0.3
     imu_arc_reversal_enabled:    true
     imu_arc_reversal_min_deg:    10.0   # only trigger after arc reaches 10°
@@ -74,7 +74,7 @@ autopark_master:
     imu_straight_correct_max_deg:    8.0
 
     # Flow stop (disabled)
-    flow_straight_stop_enabled:         true
+    flow_straight_stop_enabled:         false  # FIX: disabled so encoder controls Move 3 straight stop
     flow_straight_stop_factor:          0.90
     flow_straight_wait_before_check_s:  0.3
 
@@ -108,7 +108,10 @@ autopark_master:
 serial_bridge:
   ros__parameters:
     drive_port:              "/dev/ttyUSB2"
-    us_all_port:             "/dev/ttyUSB0"
+    # FIX: encoder_bridge handles straight (|steer|≤5°) moves; skip forwarding them
+    enc_handles_straight:    true
+    enc_straight_thresh_deg: 5.0
+    us_all_port:             "/dev/ttyUSB1"
     us_front_port:           ""
     us_rear_port:            ""
     baud:                    115200

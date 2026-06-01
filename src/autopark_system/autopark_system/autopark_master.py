@@ -170,6 +170,9 @@ class AutoparkMaster(Node):
         self.busy = False
         self.lock = threading.Lock()
 
+        # Encoder closed-loop result event — set when /enc_result arrives
+        self.enc_result_event = threading.Event()
+
         # Subscriptions
         self.create_subscription(Bool,              gp("cam_check_request_topic"), self.on_cam_check_request, 10)
         self.create_subscription(Bool,              gp("start_switch_topic"),      self.on_start_switch,       10)
@@ -180,6 +183,8 @@ class AutoparkMaster(Node):
         self.create_subscription(Float32MultiArray, gp("flow_distance_topic"),     self.on_flow_distance,      20)
         self.create_subscription(Imu,               gp("imu_topic"),               self.on_imu,                50)
         self.create_subscription(Bool,              gp("esp32_steer_ready_topic"), self.on_esp32_steer_ready,  20)
+        # v_next6: encoder_bridge publishes /enc_result when closed-loop straight move done
+        self.create_subscription(String, "/enc_result", self.on_enc_result, 10)
 
         self.cmd_pub  = self.create_publisher(String, gp("command_topic"), 10)
         self.plan_pub = self.create_publisher(String, gp("plan_topic"),    10)
@@ -293,6 +298,11 @@ class AutoparkMaster(Node):
         self.esp32_steer_ready      = bool(msg.data)
         self.esp32_steer_ready_seen = True
 
+    def on_enc_result(self, msg):
+        """encoder_bridge finished a closed-loop straight move — signal _wait_stop."""
+        self.enc_result_event.set()
+        self.get_logger().info(f"ENC_RESULT received: {msg.data}")
+
     # ── Parking thread ────────────────────────────────────────────────────
     def _autopark_thread(self):
         try:
@@ -393,6 +403,9 @@ class AutoparkMaster(Node):
             # ── Drive ────────────────────────────────────────────────────
             imu_start  = self.imu_yaw_deg
             flow_start = self.flow_distance_m
+            # Clear encoder result event before sending drive cmd (straight moves)
+            if not is_turning:
+                self.enc_result_event.clear()
             self._cmd(cmd)
 
             # Motor-start delay: STRAIGHT moves only.
@@ -489,6 +502,12 @@ class AutoparkMaster(Node):
                     and elapsed >= self.flow_straight_wait_before_check_s):
                 if abs((self.flow_distance_m or 0.0) - (flow_start or 0.0)) >= flow_trig:
                     return (f"flow_stop_seg_{seg}", elapsed, retries)
+
+            # Encoder closed-loop done — straight moves only
+            # encoder_bridge publishes /enc_result when it reaches the target distance.
+            # This is the primary stop condition for straight moves when encoder is used.
+            if not is_turning and self.enc_result_event.is_set():
+                return (f"enc_result_stop_seg_{seg}", elapsed, retries)
 
             # IMU straight heading correction
             # Uses the original gear from the motion command (positive = forward, negative = reverse).
@@ -631,20 +650,18 @@ class AutoparkMaster(Node):
                     f"  {reason} — arc fallback: {dt:.1f}s "
                     f"(tune arc_fallback_time_s in YAML)")
         else:
-            # All straight moves use calculated duration (dist/speed).
-            # For d4 (use_rear_us_flag=True) the command speed is d4_speed_mps
-            # (very slow crawl), so duration MUST be based on d4_speed_mps —
-            # using reverse_straight_speed_mps gives a tiny dt that fires
-            # the time-stop before the car has moved at all.
-            # Add motor_start_delay_s so time_stop fires AFTER the motor physically starts.
-            if use_rear_us_flag:
-                cal = max(abs(self.d4_speed_mps), 0.001)
-            else:
-                cal = (self.forward_straight_speed_mps if gear > 0
-                       else self.reverse_straight_speed_mps)
-            travel_t = dist / max(abs(cal), 0.001)
-            dt = self.clamp(travel_t + self.motor_start_delay_s,
-                            self.drive_time_min_s, self.drive_time_max_s)
+            # Straight moves (Move 1 fwd_setup, Move 3 rev_straight_d4):
+            # Encoder bridge controls the stop via /enc_result — NO timer needed.
+            # Wheel diameter = 7 inches → circumference = 0.5585 m.
+            # The ESP32 sends rightDistM in metres; driveStraight() stops when
+            #   fabs(rightDistM - startDist) >= target_m  (pure distance, no time).
+            #
+            # drive_time_max_s here is only a SAFETY timeout (120 s) in case the
+            # encoder fails completely — normal operation stops via enc_result_stop.
+            dt = self.drive_time_max_s
+            self.get_logger().info(
+                f"  Straight: encoder-only stop (timer={dt:.0f}s safety-only  "
+                f"dist={dist:.3f}m  wheel=7in)")
         # steer_active_hold: True for straight (motor holds 0°), False for arc (locks at -/+30°)
         # steer_active_hold: True for straight (motor holds 0°), False for arc.
         # For straight moves MUST be True — the return spring pulls to +30°.

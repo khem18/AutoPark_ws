@@ -1,9 +1,12 @@
 """
-serial_bridge.py  —  v_next5
-Fixes:
-  1. Ultrasonic parsing: handles BOTH JSON and pipe-text format
-       "x1: 47.85 cm | x2: 23.14 cm | ... | x8: 219.93 cm |"
-  2. btn_state transition → cam_check_request (unchanged)
+serial_bridge.py  —  v_next7
+Fixes vs v_next5:
+  1. enc_handles_straight param: when True, do NOT forward straight
+     drive commands (|steer_deg|≤5° and speed>0) to ttyUSB2.
+     encoder_bridge.cpp handles those with closed-loop encoder control.
+     Arc commands (|steer_deg|>5°) and non-drive commands are always forwarded.
+  2. Subscribes to /enc_busy so it knows when encoder is actively driving —
+     even if a steer command sneaks through, it stops forwarding while busy.
 """
 import json, re, time
 from typing import List, Tuple
@@ -28,6 +31,11 @@ class SerialBridge(Node):
             ('us_rear_port',  ''),
             ('baud',          115200),
             ('debug_serial',  False),
+            # v6: when True, encoder_bridge handles straight moves;
+            # serial_bridge skips forwarding them to avoid port conflicts.
+            ('enc_handles_straight', True),
+            # threshold in degrees — must match encoder_bridge straight_steer_thresh
+            ('enc_straight_thresh_deg', 5.0),
         ]:
             self.declare_parameter(name, default)
 
@@ -39,6 +47,11 @@ class SerialBridge(Node):
         self.us_rear_port  = str(gp('us_rear_port'))
         self.baud          = int(gp('baud'))
         self.debug_serial  = bool(gp('debug_serial'))
+        self.enc_handles_straight   = bool(gp('enc_handles_straight'))
+        self.enc_straight_thresh    = float(gp('enc_straight_thresh_deg'))
+
+        # v6: enc_busy flag set by /enc_busy topic from encoder_bridge
+        self.enc_busy = False
 
         try:
             import serial as _serial
@@ -54,10 +67,10 @@ class SerialBridge(Node):
 
         self.drive_buf = self.us_all_buf = self.us_front_buf = self.us_rear_buf = ''
         self.last_btn_state = 'idle'
-        # Line buffers for non-JSON formats
         self.us_all_line_buf = self.us_front_line_buf = self.us_rear_line_buf = ''
 
         self.create_subscription(String, gp('command_topic'), self.on_cmd, 10)
+        self.create_subscription(Bool, '/enc_busy', self.on_enc_busy, 10)
 
         self.us_pub           = self.create_publisher(Float32MultiArray, gp('ultrasonic_topic'),        10)
         self.start_pub        = self.create_publisher(Bool,   gp('start_switch_topic'),      10)
@@ -66,7 +79,14 @@ class SerialBridge(Node):
         self.cam_req_pub      = self.create_publisher(Bool,   gp('cam_check_request_topic'), 10)
 
         self.timer = self.create_timer(0.05, self.poll_serial)
-        self.get_logger().info('serial_bridge v_next5 started')
+        self.get_logger().info(
+            f'serial_bridge v_next6 started  '
+            f'enc_handles_straight={self.enc_handles_straight}  '
+            f'thresh={self.enc_straight_thresh}°')
+
+    def on_enc_busy(self, msg: Bool):
+        """Track whether encoder_bridge is actively driving a straight move."""
+        self.enc_busy = bool(msg.data)
 
     def _open(self, port, baud):
         if not self._serial or not port: return None
@@ -79,10 +99,43 @@ class SerialBridge(Node):
             self.get_logger().warning(f'Cannot open {port}: {e}')
             return None
 
+    def _is_straight_drive(self, json_str: str) -> bool:
+        """Return True if this is a straight drive command encoder_bridge should handle."""
+        try:
+            obj = json.loads(json_str)
+            if obj.get('type') != 'drive':
+                return False
+            steer = abs(float(obj.get('steer_deg', 999.0)))
+            speed = float(obj.get('speed_mps', 0.0))
+            gear  = int(obj.get('gear', 0))
+            return steer <= self.enc_straight_thresh and speed > 0.0 and gear != 0
+        except Exception:
+            return False
+
     def on_cmd(self, msg: String):
         if self.drive is None:
             self.get_logger().error('drive serial NOT open')
             return
+
+        # v7 filter logic (replaces v6 steer-deg filter):
+        # Only skip forwarding while encoder_bridge is ACTIVELY DRIVING (enc_busy=True).
+        # When enc_busy=False (encoder not yet started or not valid), forward everything
+        # so the motor always gets a command even if encoder fallback is needed.
+        #
+        # Why v6 filter was wrong: it blocked straight commands by steer_deg BEFORE
+        # encoder_bridge could confirm it was ready. If encoder isValid()=False,
+        # encoder_bridge would also skip the command → motor gets NOTHING.
+        if self.enc_busy:
+            try:
+                obj = json.loads(msg.data)
+                if obj.get('type') == 'drive' and float(obj.get('speed_mps', 0)) > 0:
+                    if self.debug_serial:
+                        self.get_logger().info(
+                            f'SKIP (enc_busy=True): {msg.data.strip()[:80]}')
+                    return
+            except Exception:
+                pass
+
         try:
             self.drive.write((msg.data.strip() + '\n').encode('utf-8'))
             self.drive.flush()
@@ -103,13 +156,6 @@ class SerialBridge(Node):
                 self.get_logger().info(f'US: {[f"{v*1000:.0f}mm" for v in vals]}')
 
     def _read_json(self, ser, buf_attr):
-        """
-        Read available bytes from `ser`, append to self.<buf_attr>, extract
-        complete JSON objects, and return them as a list of dicts.
-        This method was referenced by _poll_drive but was never defined —
-        causing every poll_serial tick to raise AttributeError and drop all
-        inbound ESP32 data (btn_state, steer_ready, etc.).
-        """
         if ser is None:
             return []
         try:
@@ -183,13 +229,6 @@ class SerialBridge(Node):
 
     def _read_us_sensor(self, ser, json_buf_attr: str, line_buf_attr: str,
                         expected_n: int) -> List[float]:
-        """
-        Read ultrasonic sensor. Handles two formats:
-          A) JSON:  {"distances_cm": [47.85, 23.14, ...]}
-                    {"distances_m":  [0.4785, 0.2314, ...]}
-          B) Text:  "x1: 47.85 cm | x2: 23.14 cm | ... | x8: 219.93 cm |"
-        Returns list of floats in METRES, or [] if nothing valid yet.
-        """
         if ser is None:
             return []
         try:
@@ -207,7 +246,6 @@ class SerialBridge(Node):
 
         result = []
 
-        # ── Try JSON format first ──────────────────────────────────────────
         json_buf = getattr(self, json_buf_attr) + chunk
         json_texts, json_remainder = self._extract_json(json_buf)
         setattr(self, json_buf_attr, json_remainder)
@@ -222,11 +260,9 @@ class SerialBridge(Node):
         if result:
             return result
 
-        # ── Try pipe-text format ───────────────────────────────────────────
-        # Format: "x1: 47.85 cm | x2: 23.14 cm | ... | x8: 219.93 cm |"
         line_buf = getattr(self, line_buf_attr) + chunk
         lines = line_buf.split('\n')
-        setattr(self, line_buf_attr, lines[-1])  # keep incomplete last line
+        setattr(self, line_buf_attr, lines[-1])
         for line in lines[:-1]:
             vals = self._parse_us_text(line.strip(), expected_n)
             if len(vals) == expected_n:
@@ -244,23 +280,16 @@ class SerialBridge(Node):
             vals = [v / 100.0 for v in vals]
         if len(vals) != n:
             return []
-        # Clamp to reasonable range (0.01m – 5.0m)
         return [max(0.01, min(5.0, v)) for v in vals]
 
     def _parse_us_text(self, line: str, n: int) -> List[float]:
-        """
-        Parse 'x1: 47.85 cm | x2: 23.14 cm | ... | x8: 219.93 cm |'
-        Returns values in METRES.
-        """
-        # Match all "xN: VALUE cm" patterns
         matches = re.findall(r'x\d+:\s*([\d.]+)\s*cm', line)
         if len(matches) != n:
             return []
         try:
-            vals_m = [float(v) / 100.0 for v in matches]  # cm → m
+            vals_m = [float(v) / 100.0 for v in matches]
         except Exception:
             return []
-        # Clamp to 0.01 – 5.0 m
         return [max(0.01, min(5.0, v)) for v in vals_m]
 
     def _extract_json(self, s: str) -> Tuple[List[str], str]:
