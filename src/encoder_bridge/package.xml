@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>encoder_bridge</name>
+  <version>1.0.0</version>
+  <description>Encoder closed-loop bridge for AutoPark — any starting pose</description>
+  <maintainer email="ddddd@autopark.local">ddddd</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

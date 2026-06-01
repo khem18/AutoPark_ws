@@ -134,4 +134,14 @@ def generate_launch_description():
             output='screen',
             parameters=[params],
         ),
+
+        Node(
+            package='encoder_bridge',
+            executable='encoder_bridge',
+            name='encoder_bridge',
+            parameters=[{
+                'enc_port':   '/dev/ttyUSB0',
+                'drive_port': '/dev/ttyUSB2',
+            }]
+        ),
     ])

@@ -107,7 +107,7 @@ autopark_master:
 
 serial_bridge:
   ros__parameters:
-    drive_port:              "/dev/ttyUSB0"
+    drive_port:              ""
     us_all_port:             "/dev/ttyUSB1"
     us_front_port:           ""
     us_rear_port:            ""
