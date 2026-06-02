@@ -399,6 +399,13 @@ class AutoparkMaster(Node):
                 f"  steer_active_hold={steer_active_hold}  "
                 f"({'straight=True keeps motor on' if steer_active_hold else 'arc=False locks then off'})")
             steer_gear = int(cmd["gear"]) or 1
+            # FIX: reset steer_ready_seen before sending settle CMD.
+            # Without this reset, a stale steer_ready signal from the PREVIOUS move
+            # (Move3 steer=0°) can make _wait_steer_ready() return immediately
+            # before the servo physically reaches the new target (e.g. -14.5°).
+            # Result: drive starts while steer is still moving → "still steering."
+            self.esp32_steer_ready      = False
+            self.esp32_steer_ready_seen = False
             self._cmd({"type":"drive","gear":steer_gear,"speed_mps":0.0,
                        "steer_deg":cmd["steer_deg"],
                        "duration": self.steer_ready_timeout_s + self.steer_settle_pause_s + 2.0,
@@ -588,7 +595,8 @@ class AutoparkMaster(Node):
     # ── Steer ready ───────────────────────────────────────────────────────
     def _wait_steer_ready(self) -> bool:
         deadline = time.monotonic() + self.steer_ready_timeout_s
-        self.esp32_steer_ready = False
+        self.esp32_steer_ready      = False
+        self.esp32_steer_ready_seen = False  # ensure fresh wait for THIS move's steer_ready
         while rclpy.ok() and time.monotonic() < deadline:
             if self.esp32_steer_ready: return True
             if (not self.esp32_steer_ready_seen

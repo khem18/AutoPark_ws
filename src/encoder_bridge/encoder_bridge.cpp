@@ -31,6 +31,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <atomic>
 
 // ── JSON helpers ─────────────────────────────────────────────
 static float jsonFloat(const std::string& s, const char* key, float def = 0.0f) {
@@ -168,6 +169,11 @@ private:
         // ── Non-drive: abort drive, let serial_bridge handle ───
         if (type != "drive") {
             if (type == "stop" || type == "disarm" || type == "manual") {
+                if (monitor_thread_.joinable()) {
+                    monitor_abort_.store(true);
+                    monitor_thread_.join();
+                    monitor_abort_.store(false);
+                }
                 if (drive_thread_.joinable()) {
                     driver_->abort();
                     drive_thread_.join();
@@ -265,39 +271,87 @@ private:
             return;
         }
 
-        // ── Start encoder-controlled drive ─────────────────────
+        bool forward = (gear > 0);
+
+        // ── MONITOR MODE: gear=+1 (Move1 forward curved) ─────────────────
+        // serial_bridge + ESP32 control speed & steer. encoder_bridge only
+        // monitors wheel distance and publishes enc_result when target reached.
+        // enc_busy stays FALSE so serial_bridge does NOT filter drive cmds,
+        // ensuring ESP32 keeps receiving the correct steer angle (-14.5°).
+        if (forward) {
+            if (monitor_thread_.joinable()) {
+                monitor_abort_.store(true);
+                monitor_thread_.join();
+                monitor_abort_.store(false);
+            }
+            if (drive_thread_.joinable()) {
+                driver_->abort();
+                drive_thread_.join();
+            }
+
+            float safety_s = target_m / 0.025f + 30.0f;
+            RCLCPP_INFO(get_logger(),
+                "  → Monitor mode (ESP32 controls steer+speed):"
+                " target=%.4fm  safety=%.1fs", target_m, safety_s);
+
+            monitor_thread_ = std::thread(
+                [this, target_m, safety_s]() {
+                for (int i = 0; i < 30 && !enc_->isValid(); i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+                float start_dist = enc_->getSnapshot().rightDistM;
+                auto  t_start    = std::chrono::steady_clock::now();
+
+                while (!monitor_abort_.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    float dist    = std::fabs(enc_->getSnapshot().rightDistM - start_dist);
+                    float elapsed = std::chrono::duration<float>(
+                        std::chrono::steady_clock::now() - t_start).count();
+
+                    if (dist < target_m && elapsed < safety_s) continue;
+
+                    const char* res = (dist >= target_m) ? "SUCCESS" : "TIMEOUT";
+                    RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
+                        "Monitor done: %s  dist=%.4fm  target=%.4fm  t=%.1fs",
+                        res, dist, target_m, elapsed);
+
+                    auto msg = std_msgs::msg::String();
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                        "{\"enc_result\":\"%s\",\"dist\":%.4f,\"target\":%.4f}",
+                        res, dist, target_m);
+                    msg.data = buf;
+                    pub_result_->publish(msg);
+                    return;
+                }
+            });
+            return;  // serial_bridge forwards drive cmd to ESP32 normally
+        }
+
+        // ── DRIVE MODE: gear=-1 (Move3 reverse straight) ─────────────────
+        // encoder_bridge controls speed+distance via driveStraight().
+        // enc_busy=True blocks serial_bridge from forwarding speed commands.
         if (drive_thread_.joinable()) {
             driver_->abort();
             drive_thread_.join();
         }
 
-        bool  forward = (gear > 0);
-
-        // Safety timeout based on wheel geometry (7-inch / 0.1778 m diameter).
-        // At minimum ramp speed (min_speed_mps = 0.025 m/s), worst case time =
-        //   target_m / 0.025 + 30 s buffer.
-        // This timeout only fires if the encoder completely stops sending data
-        // (hardware failure). Normal stop is by distance → enc_result published.
-        const float wheel_diam_m  = 0.1778f;  // 7 inches
-        const float wheel_circ_m  = 3.14159f * wheel_diam_m;   // 0.5585 m
-        (void)wheel_circ_m;  // used for documentation; dist already in metres from ESP32
-        float timeout = target_m / 0.025f + 30.0f;  // worst-case at min ramp speed + buffer
-        RCLCPP_INFO(get_logger(),
-            "  Safety timeout=%.1fs  (%.3fm / 0.025 m/s + 30s buffer)", timeout, target_m);
-
-        // v4: use calibrated speed, NOT the autopark speed_scale value
-        float drive_speed = forward ? enc_fwd_speed_ : enc_rev_speed_;
+        float timeout    = target_m / 0.025f + 30.0f;
+        float drive_speed = enc_rev_speed_;
 
         RCLCPP_INFO(get_logger(),
-            "  → Encoder drive: target=%.4fm  speed=%.3f m/s  gear=%+d",
-            target_m, drive_speed, gear);
+            "  Safety timeout=%.1fs  (%.3fm / 0.025 m/s + 30s buffer)",
+            timeout, target_m);
+        RCLCPP_INFO(get_logger(),
+            "  → Encoder drive: target=%.4fm  speed=%.3f m/s  gear=-1",
+            target_m, drive_speed);
 
         set_busy(true);
 
         drive_thread_ = std::thread(
-            [this, target_m, forward, drive_speed, timeout]() {
+            [this, target_m, drive_speed, timeout]() {
             StraightResult result = driver_->driveStraight(
-                target_m, forward, drive_speed, timeout);
+                target_m, false, drive_speed, timeout);
 
             RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
                 "Straight done: %s  dist=%.4fm  target=%.4fm",
@@ -343,6 +397,8 @@ private:
     rclcpp::TimerBase::SharedPtr                           timer_;
 
     std::thread drive_thread_;
+    std::thread monitor_thread_;        // forward move distance monitor
+    std::atomic<bool> monitor_abort_{false};
 };
 
 

@@ -34,7 +34,7 @@ US_REAR_STOP_M = 0.200
 # R: use MEASURED value from physical arc test.
 # Theoretical: WB/tan(30°) = 1.280m
 # User measured: R = 167cm = 1.670m
-R = 1.670   # metres — measured from actual arc diameter
+R = 1.335   # metres — measured from actual arc diameter
 TGT_X_AXLE = SLOT_D - R_OVH - US_REAR_STOP_M        # 1.1800 m
 
 
@@ -154,7 +154,7 @@ def _analytical_plan(start_x: float, start_y: float,
     theta_0    = yaw_rad - math.pi           # yaw deviation from π (ideal = 0)
     theta_1    = theta_m1 - theta_0         # yaw change needed in Move1
 
-    d1_geo     = x0_lateral + R      # original lateral formula (baseline)
+    d1_geo     = x0_lateral + R + 0.17            # original lateral formula (baseline)
 
     if abs(theta_1) < math.radians(1.0):
         # Nearly straight ahead — keep original formula, steer = 0
@@ -184,7 +184,7 @@ def _analytical_plan(start_x: float, start_y: float,
     # When θm1=15.9° (y=0.70): s23 = 1.727m (shorter arc). ✓
     s23 = R * (math.pi / 2 - theta_m1)   # = πR × (90-θm1_deg) / 180
     s23 = max(s23, 0.10)  # safety: never negative
-    d4  = -y0_depth + 0.40
+    d4  = -y0_depth + 0.30
 
     if d1 < -0.01:
         reason = f"lateral_too_left: d1={d1:.3f} (lateral={x0_lateral:.3f} < −R)"
