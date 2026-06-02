@@ -143,6 +143,14 @@ public:
         // v4: publish busy flag so serial_bridge can skip forwarding straight cmds
         pub_busy_   = create_publisher<std_msgs::msg::Bool>("/enc_busy", 10);
 
+        // Subscribe to steer_ready: used by monitor thread to confirm
+        // steer servo has physically settled AFTER the drive CMD arrives.
+        create_subscription<std_msgs::msg::Bool>(
+            "/autopark/esp32_steer_ready", 20,
+            [this](const std_msgs::msg::Bool::SharedPtr msg) {
+                if (msg->data) steer_ready_flag_.store(true);
+            });
+
         timer_ = create_wall_timer(
             std::chrono::milliseconds(100),
             [this]() { publish_status(); });
@@ -294,10 +302,43 @@ private:
                 "  → Monitor mode (ESP32 controls steer+speed):"
                 " target=%.4fm  safety=%.1fs", target_m, safety_s);
 
+            // Reset steer_ready flag — we need a FRESH signal after
+            // the drive CMD arrives (ESP32 transitions steer for new CMD).
+            steer_ready_flag_.store(false);
+
             monitor_thread_ = std::thread(
                 [this, target_m, safety_s]() {
                 for (int i = 0; i < 30 && !enc_->isValid(); i++)
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+                // ── Wait for steer_ready AFTER drive CMD ──────────────────
+                // The ESP32 sends steer_ready when the servo physically
+                // reaches the target angle after the drive CMD transition.
+                // Only start counting encoder distance AFTER this confirmation.
+                float pre_dist_start = enc_->getSnapshot().rightDistM;
+                const float steer_wait_s = 12.0f;
+                auto steer_deadline = std::chrono::steady_clock::now()
+                                      + std::chrono::duration<float>(steer_wait_s);
+
+                while (!monitor_abort_.load() && !steer_ready_flag_.load()) {
+                    if (std::chrono::steady_clock::now() >= steer_deadline) {
+                        RCLCPP_WARN(rclcpp::get_logger("encoder_bridge"),
+                            "Steer ready timeout %.0fs — starting count anyway", steer_wait_s);
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+
+                if (steer_ready_flag_.load()) {
+                    RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
+                        "Steer ready confirmed — starting encoder distance count");
+                }
+
+                // Measure how far car moved during steer settle (pre-travel)
+                float pre_travel = std::fabs(enc_->getSnapshot().rightDistM - pre_dist_start);
+                float adjusted_target = std::max(0.01f, target_m - pre_travel);
+                RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
+                    "Pre-travel=%.4fm  adjusted_target=%.4fm", pre_travel, adjusted_target);
 
                 float start_dist = enc_->getSnapshot().rightDistM;
                 auto  t_start    = std::chrono::steady_clock::now();
@@ -308,18 +349,19 @@ private:
                     float elapsed = std::chrono::duration<float>(
                         std::chrono::steady_clock::now() - t_start).count();
 
-                    if (dist < target_m && elapsed < safety_s) continue;
+                    if (dist < adjusted_target && elapsed < safety_s) continue;
 
-                    const char* res = (dist >= target_m) ? "SUCCESS" : "TIMEOUT";
+                    const char* res = (dist >= adjusted_target) ? "SUCCESS" : "TIMEOUT";
+                    float total_dist = pre_travel + dist;
                     RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
                         "Monitor done: %s  dist=%.4fm  target=%.4fm  t=%.1fs",
-                        res, dist, target_m, elapsed);
+                        res, total_dist, target_m, elapsed);
 
                     auto msg = std_msgs::msg::String();
                     char buf[256];
                     snprintf(buf, sizeof(buf),
                         "{\"enc_result\":\"%s\",\"dist\":%.4f,\"target\":%.4f}",
-                        res, dist, target_m);
+                        res, total_dist, target_m);
                     msg.data = buf;
                     pub_result_->publish(msg);
                     return;
@@ -399,6 +441,7 @@ private:
     std::thread drive_thread_;
     std::thread monitor_thread_;        // forward move distance monitor
     std::atomic<bool> monitor_abort_{false};
+    std::atomic<bool> steer_ready_flag_{false};  // set by /esp32_steer_ready
 };
 
 
