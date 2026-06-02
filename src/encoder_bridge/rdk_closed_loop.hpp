@@ -60,13 +60,17 @@ public:
     }
     // Straight drive — steer_deg always 0 for equal wheel speed
     void driveStraight(float speedMps, int gear, float durationS) {
+        driveWithSteer(speedMps, gear, 0.0f, durationS);
+    }
+    // Drive with explicit steer angle (for curved Move1)
+    void driveWithSteer(float speedMps, int gear, float steerDeg, float durationS) {
         char buf[256];
         snprintf(buf, sizeof(buf),
             "{\"type\":\"drive\","
             "\"speed_mps\":%.4f,\"gear\":%d,"
-            "\"steer_deg\":0.0,\"duration\":%.2f,"
+            "\"steer_deg\":%.2f,\"duration\":%.2f,"
             "\"steer_active_hold\":true}",
-            speedMps, gear, durationS);
+            speedMps, gear, steerDeg, durationS);
         writeLine(buf);
     }
 private:

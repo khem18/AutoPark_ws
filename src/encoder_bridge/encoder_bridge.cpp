@@ -287,6 +287,22 @@ private:
         // enc_busy stays FALSE so serial_bridge does NOT filter drive cmds,
         // ensuring ESP32 keeps receiving the correct steer angle (-14.5°).
         if (forward) {
+            // ── DRIVE MODE for forward/curved Move1 ──────────────────────
+            // Same as Move3 Drive mode:
+            //   enc_busy=True → serial_bridge BLOCKS the drive CMD
+            //   → ESP32 NEVER receives the drive CMD
+            //   → ESP32 steer stays from the settle CMD (no transition!)
+            //   → DriveSerial sends speed + CORRECT steer angle
+            //
+            // Root cause of old Monitor mode failure:
+            //   Monitor mode left enc_busy=False → serial_bridge forwarded
+            //   the drive CMD to ESP32 → ESP32 transitioned steer → brief
+            //   steer deviation at drive start → partial curve in Move1.
+            //
+            // Fix: block the drive CMD (enc_busy=True) and use driveWithSteer()
+            //   which passes the actual steer angle from the motion (-14.5°).
+            //   Settle CMD (still active, 12s duration) keeps steer on ESP32.
+            //   No transition, no steer deviation. Exactly like Move3. ✓
             if (monitor_thread_.joinable()) {
                 monitor_abort_.store(true);
                 monitor_thread_.join();
@@ -297,77 +313,92 @@ private:
                 drive_thread_.join();
             }
 
-            float safety_s = target_m / 0.025f + 30.0f;
-            RCLCPP_INFO(get_logger(),
-                "  → Monitor mode (ESP32 controls steer+speed):"
-                " target=%.4fm  safety=%.1fs", target_m, safety_s);
+            float timeout    = target_m / 0.025f + 30.0f;
+            float drive_speed = enc_fwd_speed_;   // calibrated forward speed (0.06 m/s)
 
-            // Reset steer_ready flag — we need a FRESH signal after
-            // the drive CMD arrives (ESP32 transitions steer for new CMD).
+            RCLCPP_INFO(get_logger(),
+                "  Safety timeout=%.1fs  (%.3fm / 0.025 m/s + 30s buffer)",
+                timeout, target_m);
+            RCLCPP_INFO(get_logger(),
+                "  → Encoder drive: target=%.4fm  speed=%.3f m/s  steer=%.1f°  gear=+1",
+                target_m, drive_speed, steer_deg);
+
+            set_busy(true);  // block serial_bridge from forwarding drive CMD
+
+            // Reset steer_ready flag before starting drive thread
             steer_ready_flag_.store(false);
 
-            monitor_thread_ = std::thread(
-                [this, target_m, safety_s]() {
+            drive_thread_ = std::thread(
+                [this, target_m, drive_speed, timeout, steer_deg]() {
                 for (int i = 0; i < 30 && !enc_->isValid(); i++)
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-                // ── Wait for steer_ready AFTER drive CMD ──────────────────
-                // The ESP32 sends steer_ready when the servo physically
-                // reaches the target angle after the drive CMD transition.
-                // Only start counting encoder distance AFTER this confirmation.
-                float pre_dist_start = enc_->getSnapshot().rightDistM;
-                const float steer_wait_s = 12.0f;
-                auto steer_deadline = std::chrono::steady_clock::now()
-                                      + std::chrono::duration<float>(steer_wait_s);
+                // Step 1: Send ONE drive command: steer=-14.5° + speed in one shot.
+                // enc_busy=True already blocked the autopark_master drive CMD, so
+                // this DriveSerial command has exclusive control.
+                // steer_active_hold=true → ESP32 moves servo to steer_deg,
+                // fires steer_ready when physically there, then holds while motor runs.
+                drive_->driveWithSteer(drive_speed, 1, steer_deg, timeout);
 
-                while (!monitor_abort_.load() && !steer_ready_flag_.load()) {
+                RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
+                    "  Waiting for steer_ready (servo at %.1f°)...", steer_deg);
+
+                // Step 2: Wait for steer_ready — hardware confirmation that servo
+                // physically reached steer_deg. No time-based guess needed.
+                float pre_dist_start = enc_->getSnapshot().rightDistM;
+                auto  steer_deadline = std::chrono::steady_clock::now()
+                                       + std::chrono::seconds(15);
+
+                while (!drive_thread_.joinable() || true) {  // loop
+                    if (steer_ready_flag_.load()) break;      // ← steer confirmed ✓
                     if (std::chrono::steady_clock::now() >= steer_deadline) {
                         RCLCPP_WARN(rclcpp::get_logger("encoder_bridge"),
-                            "Steer ready timeout %.0fs — starting count anyway", steer_wait_s);
+                            "Steer ready timeout 15s — counting anyway");
                         break;
                     }
+                    if (/* abort check */ false) return;
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
 
-                if (steer_ready_flag_.load()) {
-                    RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
-                        "Steer ready confirmed — starting encoder distance count");
-                }
+                // Step 3: Measure any pre-travel during steer settle and adjust target
+                float pre_travel     = std::fabs(enc_->getSnapshot().rightDistM - pre_dist_start);
+                float adj_target     = std::max(0.01f, target_m - pre_travel);
+                float start_dist     = enc_->getSnapshot().rightDistM;
+                auto  t_start        = std::chrono::steady_clock::now();
 
-                // Measure how far car moved during steer settle (pre-travel)
-                float pre_travel = std::fabs(enc_->getSnapshot().rightDistM - pre_dist_start);
-                float adjusted_target = std::max(0.01f, target_m - pre_travel);
                 RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
-                    "Pre-travel=%.4fm  adjusted_target=%.4fm", pre_travel, adjusted_target);
+                    "  Steer ready ✓  pre_travel=%.4fm  counting %.4fm",
+                    pre_travel, adj_target);
 
-                float start_dist = enc_->getSnapshot().rightDistM;
-                auto  t_start    = std::chrono::steady_clock::now();
-
-                while (!monitor_abort_.load()) {
+                // Step 4: Count encoder distance until target
+                while (true) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(20));
                     float dist    = std::fabs(enc_->getSnapshot().rightDistM - start_dist);
                     float elapsed = std::chrono::duration<float>(
                         std::chrono::steady_clock::now() - t_start).count();
 
-                    if (dist < adjusted_target && elapsed < safety_s) continue;
+                    if (dist < adj_target && elapsed < timeout) continue;
 
-                    const char* res = (dist >= adjusted_target) ? "SUCCESS" : "TIMEOUT";
-                    float total_dist = pre_travel + dist;
+                    const char* res = (dist >= adj_target) ? "SUCCESS" : "TIMEOUT";
+                    float total     = pre_travel + dist;
+                    drive_->stop("distance_reached");
+                    set_busy(false);
+
                     RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
-                        "Monitor done: %s  dist=%.4fm  target=%.4fm  t=%.1fs",
-                        res, total_dist, target_m, elapsed);
+                        "Fwd done: %s  total=%.4fm  target=%.4fm  t=%.1fs",
+                        res, total, target_m, elapsed);
 
                     auto msg = std_msgs::msg::String();
                     char buf[256];
                     snprintf(buf, sizeof(buf),
                         "{\"enc_result\":\"%s\",\"dist\":%.4f,\"target\":%.4f}",
-                        res, total_dist, target_m);
+                        res, total, target_m);
                     msg.data = buf;
                     pub_result_->publish(msg);
                     return;
                 }
             });
-            return;  // serial_bridge forwards drive cmd to ESP32 normally
+            return;
         }
 
         // ── DRIVE MODE: gear=-1 (Move3 reverse straight) ─────────────────
