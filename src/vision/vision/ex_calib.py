@@ -9,7 +9,7 @@ class AutoCalibrator(Node):
     def __init__(self):
         super().__init__('auto_calibrate')
         # Change to your camera topic if needed (e.g., /image_raw)
-        self.subscription = self.create_subscription(Image, 'front_cam/image_raw', self.process_frame, 10)
+        self.subscription = self.create_subscription(Image, 'rear_cam/image_raw', self.process_frame, 10)
         self.bridge = CvBridge()
         
         # Checkerboard setup

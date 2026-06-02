@@ -1,4 +1,5 @@
-
+import os
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = 'autopark_logic'
@@ -11,6 +12,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        # Include all launch files so 'ros2 launch' can find them
+        (os.path.join('share', package_name, 'launch'), glob(os.path.join('launch', '*launch.[pxy][yma]*'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -25,11 +28,12 @@ setup(
     },
     entry_points={
         'console_scripts': [
-			'lot_detector = autopark_logic.lot_detector:main',
-			'lot_detector_sim = autopark_logic.lot_detector_sim:main',
-			'local_mapper = autopark_logic.local_mapper:main',
-			'local_mapeer_sim = autopark_logic.local_mapper_sim',
-                        'vins_preflight_check = autopark_logic.vins_preflight_check:main',
+            'lot_detector = autopark_logic.lot_detector:main',
+            'lot_detector_sim = autopark_logic.lot_detector_sim:main',
+            'local_mapper = autopark_logic.local_mapper:main',
+            # FIXED: Corrected spelling and added :main
+            'local_mapper_sim = autopark_logic.local_mapper_sim:main', 
+            'rearcam_tracker = autopark_logic.rearcam_tracker:main',
         ],
     },
 )

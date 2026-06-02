@@ -32,7 +32,9 @@ autopark_master:
 
     # Steer settle
     steer_ready_timeout_s:  10.0    # arc settle may take longer at higher PWM
-    steer_settle_pause_s:   0.5     # Small buffer after steer_ready — hardware confirms servo arrived.
+    steer_settle_pause_s:   9.0     # Servo speed ≈7°/s vs spring from +30°.
+    # Worst case Move1 steer=-19°: 49°/7°/s=7.0s travel + 2.0s margin = 9.0s.
+    # encoder_bridge does NOT wait for steer_ready — settle happens here in Python.
     # 9.0s = 7.0s travel + 2.0s margin (steer_ready fires at 0.12s, not physical arrival).
     # Move3 steer=0°: 30°/7°/s=4.3s, settled with 4.7s to spare.
     steer_wait_fallback_s:  6.0
@@ -63,7 +65,7 @@ autopark_master:
     # IMU arc stop (arc move)
     imu_arc_stop_enabled:         true
     imu_arc_min_steer_deg:        8.0
-    imu_arc_stop_factor:          0.64
+    imu_arc_stop_factor:          0.63
     imu_arc_wait_before_check_s:  0.3
     imu_arc_reversal_enabled:    true
     imu_arc_reversal_min_deg:    10.0   # only trigger after arc reaches 10°
@@ -109,11 +111,11 @@ autopark_master:
 
 serial_bridge:
   ros__parameters:
-    drive_port:              "/dev/ttyUSB1"
+    drive_port:              "/dev/ttyUSB2"
     # FIX: encoder_bridge handles straight (|steer|≤5°) moves; skip forwarding them
     enc_handles_straight:    true
     enc_straight_thresh_deg: 5.0
-    us_all_port:             "/dev/ttyUSB2"
+    us_all_port:             "/dev/ttyUSB1"
     us_front_port:           ""
     us_rear_port:            ""
     baud:                    115200

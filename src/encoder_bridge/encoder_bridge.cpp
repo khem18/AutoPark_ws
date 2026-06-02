@@ -231,10 +231,14 @@ private:
                                         : "No target dist or zero speed",
                 gear, (int)speed_ok, (int)dist_ok, (int)steer_ok);
             // FIX: do NOT abort running drive when rejecting a command.
-            // Previously: any rejected CMD (e.g. IMU correction steer=3°, dist=-1)
-            // would abort the encoder drive mid-move → Move3 stopped at 0.98m/1.29m.
-            // Rejected cmds go to serial_bridge (steer servo update etc.) — safe to ignore
-            // here while encoder is running. Abort only on explicit stop/disarm.
+            // If this is a forward steer-settle CMD (speed=0, gear>0),
+            // reset steer_ready_flag HERE so the drive_thread_ (started on
+            // the NEXT drive CMD) waits for a fresh signal from this settle.
+            if (!speed_ok && gear > 0) {
+                steer_ready_flag_.store(false);
+                RCLCPP_INFO(get_logger(),
+                    "  → Fwd settle CMD: steer_ready_flag reset, awaiting servo");
+            }
             return;
         }
 
@@ -323,87 +327,87 @@ private:
                 "  → Encoder drive: target=%.4fm  speed=%.3f m/s  steer=%.1f°  gear=+1",
                 target_m, drive_speed, steer_deg);
 
-            set_busy(true);  // block serial_bridge from forwarding drive CMD
+            // ── MONITOR MODE for Move1 (gear=+1, curved) ──────────────────
+            // enc_busy stays FALSE → serial_bridge forwards the drive CMD to ESP32
+            // using the SAME channel as the settle CMD.
+            // ESP32 transitions: speed 0→0.01, SAME steer → no servo re-init,
+            // no channel switch, no spring transient. ✓
+            // encoder_bridge just monitors encoder distance and publishes enc_result.
+            if (monitor_thread_.joinable()) {
+                monitor_abort_.store(true);
+                monitor_thread_.join();
+                monitor_abort_.store(false);
+            }
+            if (drive_thread_.joinable()) {
+                driver_->abort();
+                drive_thread_.join();
+            }
 
-            // Reset steer_ready flag before starting drive thread
-            steer_ready_flag_.store(false);
+            float safety_s = target_m / 0.025f + 30.0f;
+            RCLCPP_INFO(get_logger(),
+                "  → Monitor mode (serial_bridge→ESP32): target=%.4fm  safety=%.1fs",
+                target_m, safety_s);
 
-            drive_thread_ = std::thread(
-                [this, target_m, drive_speed, timeout, steer_deg]() {
-                for (int i = 0; i < 30 && !enc_->isValid(); i++)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            monitor_thread_ = std::thread(
+                [this, target_m, safety_s]() {
+                try {
+                    for (int i = 0; i < 30 && !enc_->isValid(); i++)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-                // Step 1: Send ONE drive command: steer=-14.5° + speed in one shot.
-                // enc_busy=True already blocked the autopark_master drive CMD, so
-                // this DriveSerial command has exclusive control.
-                // steer_active_hold=true → ESP32 moves servo to steer_deg,
-                // fires steer_ready when physically there, then holds while motor runs.
-                drive_->driveWithSteer(drive_speed, 1, steer_deg, timeout);
+                    float start_dist = enc_->getSnapshot().rightDistM;
+                    auto  t_start    = std::chrono::steady_clock::now();
 
-                RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
-                    "  Waiting for steer_ready (servo at %.1f°)...", steer_deg);
+                    while (!monitor_abort_.load()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                        float dist    = std::fabs(enc_->getSnapshot().rightDistM - start_dist);
+                        float elapsed = std::chrono::duration<float>(
+                            std::chrono::steady_clock::now() - t_start).count();
 
-                // Step 2: Wait for steer_ready — hardware confirmation that servo
-                // physically reached steer_deg. No time-based guess needed.
-                float pre_dist_start = enc_->getSnapshot().rightDistM;
-                auto  steer_deadline = std::chrono::steady_clock::now()
-                                       + std::chrono::seconds(15);
+                        if (dist < target_m && elapsed < safety_s) continue;
 
-                while (!drive_thread_.joinable() || true) {  // loop
-                    if (steer_ready_flag_.load()) break;      // ← steer confirmed ✓
-                    if (std::chrono::steady_clock::now() >= steer_deadline) {
-                        RCLCPP_WARN(rclcpp::get_logger("encoder_bridge"),
-                            "Steer ready timeout 15s — counting anyway");
-                        break;
+                        const char* res = (dist >= target_m) ? "SUCCESS" : "TIMEOUT";
+                        RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
+                            "Monitor done: %s  dist=%.4fm  target=%.4fm  t=%.1fs",
+                            res, dist, target_m, elapsed);
+
+                        auto msg = std_msgs::msg::String();
+                        char buf[256];
+                        snprintf(buf, sizeof(buf),
+                            "{\"enc_result\":\"%s\",\"dist\":%.4f,\"target\":%.4f}",
+                            res, dist, target_m);
+                        msg.data = buf;
+                        pub_result_->publish(msg);
+                        return;
                     }
-                    if (/* abort check */ false) return;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                }
-
-                // Step 3: Measure any pre-travel during steer settle and adjust target
-                float pre_travel     = std::fabs(enc_->getSnapshot().rightDistM - pre_dist_start);
-                float adj_target     = std::max(0.01f, target_m - pre_travel);
-                float start_dist     = enc_->getSnapshot().rightDistM;
-                auto  t_start        = std::chrono::steady_clock::now();
-
-                RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
-                    "  Steer ready ✓  pre_travel=%.4fm  counting %.4fm",
-                    pre_travel, adj_target);
-
-                // Step 4: Count encoder distance until target
-                while (true) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                    float dist    = std::fabs(enc_->getSnapshot().rightDistM - start_dist);
-                    float elapsed = std::chrono::duration<float>(
-                        std::chrono::steady_clock::now() - t_start).count();
-
-                    if (dist < adj_target && elapsed < timeout) continue;
-
-                    const char* res = (dist >= adj_target) ? "SUCCESS" : "TIMEOUT";
-                    float total     = pre_travel + dist;
-                    drive_->stop("distance_reached");
-                    set_busy(false);
-
-                    RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
-                        "Fwd done: %s  total=%.4fm  target=%.4fm  t=%.1fs",
-                        res, total, target_m, elapsed);
-
-                    auto msg = std_msgs::msg::String();
-                    char buf[256];
-                    snprintf(buf, sizeof(buf),
-                        "{\"enc_result\":\"%s\",\"dist\":%.4f,\"target\":%.4f}",
-                        res, total, target_m);
-                    msg.data = buf;
-                    pub_result_->publish(msg);
-                    return;
+                } catch (const std::exception & e) {
+                    RCLCPP_ERROR(rclcpp::get_logger("encoder_bridge"),
+                        "Monitor thread exception: %s — publishing TIMEOUT", e.what());
+                    try {
+                        auto msg = std_msgs::msg::String();
+                        char buf[256];
+                        snprintf(buf, sizeof(buf),
+                            "{\"enc_result\":\"ERROR\",\"dist\":0.0,\"target\":%.4f}",
+                            target_m);
+                        msg.data = buf;
+                        pub_result_->publish(msg);
+                    } catch (...) {}
+                } catch (...) {
+                    RCLCPP_ERROR(rclcpp::get_logger("encoder_bridge"),
+                        "Monitor thread unknown exception");
                 }
             });
-            return;
+            return;  // enc_busy stays FALSE — serial_bridge forwards drive CMD
         }
 
         // ── DRIVE MODE: gear=-1 (Move3 reverse straight) ─────────────────
         // encoder_bridge controls speed+distance via driveStraight().
         // enc_busy=True blocks serial_bridge from forwarding speed commands.
+        // Clean up monitor_thread_ from Move1 before starting drive thread.
+        if (monitor_thread_.joinable()) {
+            monitor_abort_.store(true);
+            monitor_thread_.join();
+            monitor_abort_.store(false);
+        }
         if (drive_thread_.joinable()) {
             driver_->abort();
             drive_thread_.join();

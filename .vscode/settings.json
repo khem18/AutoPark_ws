@@ -1,0 +1,31 @@
+{
+    "ROS2.distro": "humble",
+    "python.autoComplete.extraPaths": [
+        "/home/ddddd/AutoPark_ws/build/vision",
+        "/home/ddddd/AutoPark_ws/install/vision/lib/python3.10/site-packages",
+        "/home/ddddd/AutoPark_ws/build/bringup",
+        "/home/ddddd/AutoPark_ws/install/bringup/lib/python3.10/site-packages",
+        "/home/ddddd/AutoPark_ws/build/autopark_system",
+        "/home/ddddd/AutoPark_ws/install/autopark_system/lib/python3.10/site-packages",
+        "/home/ddddd/AutoPark_ws/build/autopark_logic",
+        "/home/ddddd/AutoPark_ws/install/autopark_logic/lib/python3.10/site-packages",
+        "/opt/tros/humble/lib/python3.10/site-packages",
+        "/opt/tros/humble/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/ddddd/AutoPark_ws/build/vision",
+        "/home/ddddd/AutoPark_ws/install/vision/lib/python3.10/site-packages",
+        "/home/ddddd/AutoPark_ws/build/bringup",
+        "/home/ddddd/AutoPark_ws/install/bringup/lib/python3.10/site-packages",
+        "/home/ddddd/AutoPark_ws/build/autopark_system",
+        "/home/ddddd/AutoPark_ws/install/autopark_system/lib/python3.10/site-packages",
+        "/home/ddddd/AutoPark_ws/build/autopark_logic",
+        "/home/ddddd/AutoPark_ws/install/autopark_logic/lib/python3.10/site-packages",
+        "/opt/tros/humble/lib/python3.10/site-packages",
+        "/opt/tros/humble/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}
