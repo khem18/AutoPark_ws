@@ -141,7 +141,7 @@ def generate_launch_description():
             name='encoder_bridge',
             parameters=[{
                 'enc_port':            '/dev/ttyUSB0',
-                'drive_port':          '/dev/ttyUSB2',
+                'drive_port':          '/dev/ttyUSB1',
                 'speed_scale':         0.01,
                 # Calibrated driving speeds from closed_loop_demo.cpp (pic 2):
                 # Move 1 forward  0.50 m real at 0.06 m/s → enc_fwd_speed_mps = 0.06

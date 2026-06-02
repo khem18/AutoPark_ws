@@ -61,7 +61,7 @@ autopark_master:
     # IMU arc stop (arc move)
     imu_arc_stop_enabled:         true
     imu_arc_min_steer_deg:        8.0
-    imu_arc_stop_factor:          0.56
+    imu_arc_stop_factor:          0.30
     imu_arc_wait_before_check_s:  0.3
     imu_arc_reversal_enabled:    true
     imu_arc_reversal_min_deg:    10.0   # only trigger after arc reaches 10°
@@ -107,11 +107,11 @@ autopark_master:
 
 serial_bridge:
   ros__parameters:
-    drive_port:              "/dev/ttyUSB2"
+    drive_port:              "/dev/ttyUSB1"
     # FIX: encoder_bridge handles straight (|steer|≤5°) moves; skip forwarding them
     enc_handles_straight:    true
     enc_straight_thresh_deg: 5.0
-    us_all_port:             "/dev/ttyUSB1"
+    us_all_port:             "/dev/ttyUSB2"
     us_front_port:           ""
     us_rear_port:            ""
     baud:                    115200

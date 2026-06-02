@@ -380,6 +380,14 @@ class AutoparkMaster(Node):
             dt    = float(cmd.get("master_duration", cmd["duration"]))  # pure travel time
             is_turning = abs(cmd["steer_deg"]) > self.straight_steer_threshold_deg
 
+            # FIX: read no_imu_correct HERE — before steer_ready wait — so
+            # Move1 (no_imu_correct=True) gets steer_ready + motor_start_delay
+            # exactly like Move3. Previously this was read AFTER the steer_ready
+            # check, causing Move1 to skip it and drive instantly without steering.
+            no_imu_correct = bool(motion.get("no_imu_correct", False))
+            if no_imu_correct:
+                is_turning = False   # Move1: encoder stops it, not IMU arc
+
             self.get_logger().info(
                 f"MOVE {seg}/{total} [{label}]  "
                 f"gear={cmd['gear']} steer={cmd['steer_deg']:+.0f}°  "
@@ -408,9 +416,8 @@ class AutoparkMaster(Node):
                 self.enc_result_event.clear()
             self._cmd(cmd)
 
-            # Motor-start delay: STRAIGHT moves only.
-            # Arc: IMU stops it; delay would cause overshoot.
-            # Straight: delay compensates lag so time_stop fires at correct distance.
+            # Motor-start delay: STRAIGHT moves only (Move1 + Move3).
+            # Arc (Move2): IMU stops it; motor delay would cause overshoot.
             if not is_turning:
                 motor_delay = self._wait_motor_start(flow_start)
                 self.get_logger().info(
@@ -420,7 +427,7 @@ class AutoparkMaster(Node):
 
             stop, elapsed, retries = self._wait_stop(
                 dt, dist, cmd["steer_deg"], is_turning, use_rear_us,
-                imu_start, flow_start, seg)
+                imu_start, flow_start, seg, no_imu_correct=no_imu_correct)
 
             imu_d = self._adelta(imu_start, self.imu_yaw_deg)
             self.get_logger().info(
@@ -443,7 +450,8 @@ class AutoparkMaster(Node):
 
     # ── Wait / sensor stop ────────────────────────────────────────────────
     def _wait_stop(self, drive_time_s, dist_m, steer_deg, is_turning,
-                   use_rear_us, imu_start, flow_start, seg) -> Tuple[str,float,int]:
+                   use_rear_us, imu_start, flow_start, seg,
+                   no_imu_correct: bool = False) -> Tuple[str,float,int]:
         start_t = time.monotonic(); last_log = 0.0; retries = 0; stuck_done = False
         self._arc_peak = 0.0  # reset arc peak for reversal detection
 
@@ -459,10 +467,13 @@ class AutoparkMaster(Node):
         # IMU straight heading correction — only for straight moves (d1, d4).
         # If yaw drifts beyond imu_straight_correct_thresh_deg, send a corrective
         # steer command to nudge the car back on heading.
+        # no_imu_correct=True: Move1 drives straight after steer_ready with no IMU correction.
+        # Same as Move3 before IMU correction was added. Encoder stops the move.
         imu_straight_correct = (
             not is_turning
             and self.imu_straight_correct_enabled
             and abs(steer_deg) < 0.5   # only for nominally straight moves
+            and not no_imu_correct     # Move1 flag disables IMU correction
         )
         last_correction_t: float = 0.0
         current_correction_deg: float = 0.0

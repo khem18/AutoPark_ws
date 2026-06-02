@@ -1,5 +1,5 @@
 """
-planner_adapter.py  —  Analytical Geometric Perpendicular Parking Planner v4
+planner_adapter.py  —  Analytical Geometric Perpendicular Parking Planner v5
 =============================================================================
 Arc steer = −30° (LEFT steer, gear=−1 → CCW rotation → correct path direction)
 
@@ -33,8 +33,8 @@ US_REAR_STOP_M = 0.200
 
 # R: use MEASURED value from physical arc test.
 # Theoretical: WB/tan(30°) = 1.280m
-# Measured: car drove arc at steer=30°, speed=0.05 → diameter=267cm → R=133.5cm
-R = 1.335   # metres — measured from actual arc diameter
+# User measured: R = 167cm = 1.670m
+R = 1.670   # metres — measured from actual arc diameter
 TGT_X_AXLE = SLOT_D - R_OVH - US_REAR_STOP_M        # 1.1800 m
 
 
@@ -135,34 +135,73 @@ def _analytical_plan(start_x: float, start_y: float,
         reason = (f"aisle_too_shallow: depth={y0_depth:.3f} m  "
                   f"(car must be at least 10 cm before slot entrance, i.e. start_x ≤ −0.10)")
         return PlannedPath(
-            result=PlanResult(False, False, False, reason, "analytical_v4",
+            result=PlanResult(False, False, False, reason, "analytical_v5",
                               case_name, [], [], {}, 1e9),
             motions=[])
 
-    d1  = x0_lateral + R + 0.30
-    s23 = R * math.pi / 2
-    # d4: distance to reverse straight into slot after the arc.
-    # Arc brings rear axle to depth (y0_depth + R); we need to reach TGT_X_AXLE.
-    # Minimum 0.05 m so the motion is always present; rear US is the real stop.
+    # ── Move 1 geometric formula (from diagram) ───────────────────────────
+    # θm1 = atan2(R − y0, x0 + R)
+    #   y0 = x0_lateral (lateral offset from slot centre)
+    #   x0 = −y0_depth  (aisle depth, positive = further from slot)
+    # θ1  = θm1 − θ0   where θ0 = yaw deviation from π (= 0 when perfectly aligned)
+    # steer1 chosen so r1 = d1/θ1 ≥ r_min (= WB/tan(30°) = 1.280 m)
+    # Benefit: when x0_lateral (y0) is small, θ1 is large and the steer in Move1
+    # pre-angles the car so the arc (Move2) still fits within steer_max = 30°.
+    R_MIN_STEER = WB / math.tan(math.radians(STEER_MAX))   # 1.280 m
+
+    x0_aisle   = -y0_depth    # aisle depth (positive)
+    theta_m1   = math.atan2(R - x0_lateral, x0_aisle + R)
+    theta_0    = yaw_rad - math.pi           # yaw deviation from π (ideal = 0)
+    theta_1    = theta_m1 - theta_0         # yaw change needed in Move1
+
+    d1_geo     = x0_lateral + R      # original lateral formula (baseline)
+
+    if abs(theta_1) < math.radians(1.0):
+        # Nearly straight ahead — keep original formula, steer = 0
+        d1         = max(d1_geo, 0.10)
+        steer1_deg = 0.0
+    else:
+        # Curved Move1: r1 = d1/|θ1|, steer = atan(WB/r1)
+        # Use geometric d1 as baseline; r1 from that.
+        # If r1 < r_min (steer would exceed 30°), extend d1 to r_min*|θ1|.
+        d1_geo     = max(d1_geo, 0.10)
+        r1_from_geo = d1_geo / abs(theta_1)
+        r1          = max(r1_from_geo, R_MIN_STEER)
+        d1          = r1 * abs(theta_1)
+        # Negative steer: Move1 gear=+1 forward with LEFT steer → yaw decreases.
+        # This pre-angles in the SAME direction as the arc (arc also decreases yaw π→π/2).
+        # Positive steer would yaw AWAY from arc direction (wrong).
+        steer1_deg  = -min(
+            math.degrees(math.atan(WB / r1)),
+            STEER_MAX)
+
+    d1  = max(d1, 0.10)
+    # Move 2 arc distance — user formula (from diagram):
+    # s23 = πR × (90° − θm1) / 180°  =  R × (π/2 − θm1)
+    # Move 1 pre-angles the car by θm1, so arc only covers the remaining
+    # (90° − θm1) degrees to complete the 90° slot-entry turn.
+    # When θm1=0° (no pre-angle): s23 = R×π/2 = 2.097m (original value).
+    # When θm1=15.9° (y=0.70): s23 = 1.727m (shorter arc). ✓
+    s23 = R * (math.pi / 2 - theta_m1)   # = πR × (90-θm1_deg) / 180
+    s23 = max(s23, 0.10)  # safety: never negative
     d4  = -y0_depth + 0.40
 
     if d1 < -0.01:
         reason = f"lateral_too_left: d1={d1:.3f} (lateral={x0_lateral:.3f} < −R)"
         return PlannedPath(
-            result=PlanResult(False, False, False, reason, "analytical_v4",
+            result=PlanResult(False, False, False, reason, "analytical_v5",
                               case_name, [], [], {}, 1e9),
             motions=[])
-
-    d1 = max(0.0, d1)
 
     # ── Motion sequence ────────────────────────────────────────────────────
     motions = [
         {
-            "gear": +1, "steer_deg": 0.0, "dist_m": round(d1, 4),
+            "gear": +1, "steer_deg": round(steer1_deg, 2), "dist_m": round(d1, 4),
             "label": "fwd_setup",
             "use_rear_us": False,
             "speed_override": None,
             "steer_active_hold": True,    # motor holds 0° against spring
+            "no_imu_correct": True,       # Move1: steer_ready then drive straight, no IMU correction
         },
         {
             "gear": -1, "steer_deg": +STEER_MAX, "dist_m": round(s23, 4),  # +30° confirmed correct by user testing
@@ -198,7 +237,7 @@ def _analytical_plan(start_x: float, start_y: float,
         "yaw_err_deg": 0.0,
         "x_f": x_f, "y_f": y_f,
         "R_m": R,
-        "d1_m": d1, "s23_m": s23, "d4_m": d4,
+        "d1_m": d1, "steer1_deg": round(steer1_deg, 2), "theta1_deg": round(math.degrees(theta_1), 2), "s23_m": s23, "theta_m1_deg": round(math.degrees(theta_m1), 2), "d4_m": d4,
         # arc_end_depth: positive = arc dips into slot entrance (OK); negative = stays in aisle.
         "arc_end_depth_m": round(y0_depth + R, 4),
         "arc_in_aisle": (y0_depth + R) <= 0.01,
@@ -214,7 +253,7 @@ def _analytical_plan(start_x: float, start_y: float,
     return PlannedPath(
         result=PlanResult(
             success=True, practical_success=ok, strict_success=ok,
-            reason="analytical_success", planner="analytical_v4",
+            reason="analytical_success", planner="analytical_v5",
             case_name=case_name, primitive_seq=primitives,
             path=path, metrics=metrics, score=0.0),
         motions=motions)

@@ -197,21 +197,30 @@ private:
             gear, speed_mps, steer_deg, duration, dist_m_raw, (int)act_hold);
 
         // ── Straight move condition ────────────────────────────
-        bool steer_ok  = std::fabs(steer_deg) <= steer_thresh_;
-        bool speed_ok  = speed_mps > 0.0f;
-        bool gear_ok   = gear != 0;
-        bool dur_ok    = duration > 0.01f || dist_m_raw > 0.001f;
+        bool speed_ok = speed_mps > 0.0f;
+        bool gear_ok  = gear != 0;
+        bool dist_ok  = dist_m_raw > 0.001f;   // explicit target distance required
+        bool steer_ok = std::fabs(steer_deg) <= steer_thresh_;
 
-        if (!steer_ok || !speed_ok || !gear_ok || !dur_ok) {
+        // Intercept rule:
+        //   Forward (gear>0): encoder handles ALL moves by distance,
+        //     including Move1 curved setup (steer≈-23°). IMU NOT used for Move1.
+        //   Reverse (gear<0): only |steer|≤thresh (straight reverses, i.e. Move3).
+        //     Move2 arc (steer=+30°) is excluded here → IMU stops it. ✓
+        bool intercept = speed_ok && gear_ok && dist_ok &&
+                         (gear > 0 || steer_ok);
+
+        if (!intercept) {
             RCLCPP_INFO(get_logger(),
-                "  → Not straight (steer_ok=%d speed_ok=%d "
-                "gear_ok=%d dur_ok=%d) — serial_bridge handles",
-                (int)steer_ok, (int)speed_ok, (int)gear_ok, (int)dur_ok);
-            if (drive_thread_.joinable()) {
-                driver_->abort();
-                drive_thread_.join();
-                set_busy(false);
-            }
+                "  → %s (gear=%+d speed_ok=%d dist_ok=%d steer_ok=%d) — serial_bridge handles",
+                (gear < 0 && !steer_ok) ? "Arc reverse — IMU handles"
+                                        : "No target dist or zero speed",
+                gear, (int)speed_ok, (int)dist_ok, (int)steer_ok);
+            // FIX: do NOT abort running drive when rejecting a command.
+            // Previously: any rejected CMD (e.g. IMU correction steer=3°, dist=-1)
+            // would abort the encoder drive mid-move → Move3 stopped at 0.98m/1.29m.
+            // Rejected cmds go to serial_bridge (steer servo update etc.) — safe to ignore
+            // here while encoder is running. Abort only on explicit stop/disarm.
             return;
         }
 
