@@ -62,6 +62,17 @@ class AutoparkMaster(Node):
             ("imu_arc_min_steer_deg",          8.0),
             ("imu_arc_stop_factor",            0.83),
             ("imu_arc_wait_before_check_s",    0.3),
+            # ── Dynamic IMU arc stop factor for stuck/boosted arc speed ──────
+            # When encoder_bridge boosts session_arc above threshold (passengers),
+            # _wait_stop() switches to this smaller factor so the arc stops a bit
+            # earlier — compensates for higher-speed overshoot.
+            # NO-LOAD effect: NONE.
+            #   session_arc stays at enc_rev_speed=0.040 < threshold(0.060)
+            #   → imu_arc_stop_factor always used (unchanged).
+            # PASSENGER effect: session_arc boosted to 0.10–0.15 > 0.060
+            #   → imu_arc_stop_factor_stuck used instead.
+            ("imu_arc_stop_factor_stuck",      0.78),   # slightly < imu_arc_stop_factor
+            ("arc_stuck_speed_threshold_mps",  0.06),   # enc_rev_speed × 1.5 = 0.06
             ("flow_straight_stop_enabled",     False),
             ("flow_straight_stop_factor",      0.90),
             ("flow_straight_wait_before_check_s", 0.3),
@@ -82,6 +93,32 @@ class AutoparkMaster(Node):
             ("stuck_kick_duration_s",          0.5),
             ("stuck_retry_pause_s",            0.2),
             ("stuck_max_retries",              1),
+            # ── Steer stuck kick — passengers increase steering friction ─────
+            # When _wait_steer_ready() times out, overshoot the target angle to
+            # break static friction, then return.  Repeats up to kick_retries times.
+            ("steer_stuck_kick_enabled",       True),
+            ("steer_stuck_kick_overshoot",     2.0),   # factor: 2.0 = 200 % of target angle
+            ("steer_stuck_kick_hold_s",        0.4),   # seconds per kick phase
+            ("steer_stuck_kick_retries",       2),     # max kick attempts before proceeding
+            # kick_limit_deg: allows the kick to exceed max_command_steer_deg so
+            # the ESP32 P-controller produces higher PWM (overcomes friction) even
+            # when target is already at the hardware limit (e.g. 30°).
+            # Set ≥ max_command_steer_deg * kick_overshoot (e.g. 30*2.0 = 60 → use 60).
+            ("steer_stuck_kick_limit_deg",     60.0),
+            # kick_drive_speed_mps: briefly drive the car at this speed during the
+            # kick phases.  Rolling wheels reduce tire-ground friction and let the
+            # steer servo reach target (dry-steering with passengers requires much
+            # more torque than steering while moving).
+            # encoder_bridge does NOT intercept these kick CMDs (no dist_m field).
+            # Total motion per kick = 2 × kick_hold_s × kick_drive_speed_mps
+            # (e.g. 2 × 0.4 × 0.08 = 6.4 cm per kick retry).
+            ("steer_stuck_kick_drive_speed_mps", 0.08),
+            # kick_timeout_s: per-retry timeout for Phase 3 (static wait after kick).
+            # MUCH shorter than steer_ready_timeout_s (10s) — if the kick + motion
+            # didn't get the steer there in 3s, it won't in 10s either.
+            # Total worst-case kick time = retries × (2×hold_s + kick_timeout_s)
+            # e.g. 3 × (0.8 + 3.0) = 11.4s  vs  3 × (0.8 + 10) = 32.4s before.
+            ("steer_stuck_kick_timeout_s",        3.0),
             ("flow_valid_required",            False),
             ("send_arm_command_on_start",      False),
             ("disable_ultrasonic_block",       True),
@@ -139,6 +176,8 @@ class AutoparkMaster(Node):
         self.imu_arc_min_steer_deg         = float(gp("imu_arc_min_steer_deg"))
         self.imu_arc_stop_factor           = float(gp("imu_arc_stop_factor"))
         self.imu_arc_wait_before_check_s   = float(gp("imu_arc_wait_before_check_s"))
+        self.imu_arc_stop_factor_stuck     = float(gp("imu_arc_stop_factor_stuck"))
+        self.arc_stuck_speed_threshold     = float(gp("arc_stuck_speed_threshold_mps"))
         self.flow_straight_stop_enabled    = bool(gp("flow_straight_stop_enabled"))
         self.flow_straight_stop_factor     = float(gp("flow_straight_stop_factor"))
         self.flow_straight_wait_before_check_s = float(gp("flow_straight_wait_before_check_s"))
@@ -158,6 +197,13 @@ class AutoparkMaster(Node):
         self.stuck_kick_duration_s         = float(gp("stuck_kick_duration_s"))
         self.stuck_retry_pause_s           = float(gp("stuck_retry_pause_s"))
         self.stuck_max_retries             = int(gp("stuck_max_retries"))
+        self.steer_stuck_kick_enabled      = bool(gp("steer_stuck_kick_enabled"))
+        self.steer_stuck_kick_overshoot    = float(gp("steer_stuck_kick_overshoot"))
+        self.steer_stuck_kick_hold_s       = float(gp("steer_stuck_kick_hold_s"))
+        self.steer_stuck_kick_retries      = int(gp("steer_stuck_kick_retries"))
+        self.steer_stuck_kick_limit_deg    = float(gp("steer_stuck_kick_limit_deg"))
+        self.steer_stuck_kick_drive_speed  = float(gp("steer_stuck_kick_drive_speed_mps"))
+        self.steer_stuck_kick_timeout_s    = float(gp("steer_stuck_kick_timeout_s"))
         self.flow_valid_required           = bool(gp("flow_valid_required"))
         self.send_arm_command_on_start     = bool(gp("send_arm_command_on_start"))
         self.disable_ultrasonic_block      = bool(gp("disable_ultrasonic_block"))
@@ -194,6 +240,10 @@ class AutoparkMaster(Node):
         # Encoder closed-loop result event — set when /enc_result arrives
         self.enc_result_event = threading.Event()
 
+        # session_arc_rev_speed_ from encoder_bridge — updated by /enc_status
+        # Used to detect when stuck boost has fired (for dynamic arc stop factor).
+        self.session_arc_speed: float = 0.0
+
         # Subscriptions
         self.create_subscription(Bool,              gp("cam_check_request_topic"), self.on_cam_check_request, 10)
         self.create_subscription(Bool,              gp("start_switch_topic"),      self.on_start_switch,       10)
@@ -206,6 +256,8 @@ class AutoparkMaster(Node):
         self.create_subscription(Bool,              gp("esp32_steer_ready_topic"), self.on_esp32_steer_ready,  20)
         # v_next6: encoder_bridge publishes /enc_result when closed-loop straight move done
         self.create_subscription(String, "/enc_result", self.on_enc_result, 10)
+        # Track encoder_bridge session_arc speed for dynamic arc stop factor
+        self.create_subscription(String, "/enc_status", self.on_enc_status, 20)
         # Rear camera metrics for Move3 pre-measure
         self.create_subscription(Float32MultiArray, gp("rear_cam_topic"),
                                  self.on_rear_cam_metrics, 10)
@@ -328,6 +380,21 @@ class AutoparkMaster(Node):
         """encoder_bridge finished a closed-loop straight move — signal _wait_stop."""
         self.enc_result_event.set()
         self.get_logger().info(f"ENC_RESULT received: {msg.data}")
+
+    def on_enc_status(self, msg: String):
+        """
+        Track encoder_bridge session_arc_rev_speed_ for dynamic arc stop factor.
+        enc_status JSON: {"rc":..., "rd":..., "rrpm":..., "rspd":...,
+                          "sess_fwd":..., "sess_rev":..., "sess_arc":...}
+        Called ~10 Hz from encoder_bridge timer.
+        """
+        try:
+            obj = json.loads(msg.data)
+            arc = obj.get('sess_arc')
+            if arc is not None:
+                self.session_arc_speed = float(arc)
+        except Exception:
+            pass
 
     def on_rear_cam_metrics(self, msg: Float32MultiArray):
         """
@@ -580,6 +647,13 @@ class AutoparkMaster(Node):
                        "steer_active_hold": steer_active_hold})
             if not self._wait_steer_ready():
                 self.get_logger().warning("  steer_ready timeout")
+                # Steer stuck: kick overshoot to overcome passenger-weight friction.
+                if self.steer_stuck_kick_enabled and abs(cmd["steer_deg"]) > 0.5:
+                    settled = self._steer_stuck_kick(
+                        cmd["steer_deg"], steer_gear, steer_active_hold, settle_extra)
+                    if not settled:
+                        self.get_logger().warning(
+                            "  steer stuck: all kick retries failed — proceeding anyway")
             if self.steer_settle_pause_s > 0:
                 self._sleep(self.steer_settle_pause_s)
 
@@ -637,6 +711,9 @@ class AutoparkMaster(Node):
             Rv = 1.335
             arc_trig = math.degrees((dist_m * self.imu_arc_stop_factor) / Rv)
 
+        # Track whether we've already switched to the stuck-speed arc stop factor.
+        arc_stuck_factor_applied: bool = False
+
         flow_trig: Optional[float] = None
         if not is_turning and self.flow_straight_stop_enabled and flow_start is not None:
             flow_trig = dist_m * self.flow_straight_stop_factor
@@ -668,7 +745,27 @@ class AutoparkMaster(Node):
                 if self.get_ultrasonic_min_m() < self.ultrasonic_stop_m:
                     return (f"ultrasonic_emergency_seg_{seg}", elapsed, retries)
 
-            # IMU arc
+            # IMU arc — dynamic stop factor when stuck boost is active
+            # (encoder_bridge boosted session_arc above threshold → higher speed
+            #  → switch to smaller factor so arc stops earlier / avoids overshoot).
+            # Only fires once per arc move; NO effect on no-load autopark
+            # (session_arc stays at enc_rev_speed=0.04 < threshold=0.06).
+            if (arc_trig is not None
+                    and not arc_stuck_factor_applied
+                    and self.imu_arc_stop_factor_stuck < self.imu_arc_stop_factor
+                    and self.session_arc_speed >= self.arc_stuck_speed_threshold):
+                Rv_dyn = 1.335
+                old_trig  = arc_trig
+                arc_trig  = math.degrees(
+                    (dist_m * self.imu_arc_stop_factor_stuck) / Rv_dyn)
+                arc_stuck_factor_applied = True
+                self.get_logger().info(
+                    f"  ARC stuck-speed boost detected "
+                    f"(sess_arc={self.session_arc_speed:.3f} m/s"
+                    f" >= {self.arc_stuck_speed_threshold:.3f} m/s) "
+                    f"→ arc_trig {old_trig:.1f}° → {arc_trig:.1f}° "
+                    f"(factor {self.imu_arc_stop_factor:.2f}"
+                    f" → {self.imu_arc_stop_factor_stuck:.2f})")
             if arc_trig and elapsed >= self.imu_arc_wait_before_check_s:
                 cur_arc = abs(self._adelta(imu_start, self.imu_yaw_deg))
                 if cur_arc >= arc_trig:
@@ -777,14 +874,18 @@ class AutoparkMaster(Node):
         self.get_logger().info(f"LED → {color}")
 
     # ── Steer ready ───────────────────────────────────────────────────────
-    def _wait_steer_ready(self) -> bool:
-        deadline = time.monotonic() + self.steer_ready_timeout_s
+    def _wait_steer_ready(self, timeout_s: float = None) -> bool:
+        t = self.steer_ready_timeout_s if timeout_s is None else timeout_s
+        deadline = time.monotonic() + t
         self.esp32_steer_ready      = False
         self.esp32_steer_ready_seen = False  # ensure fresh wait for THIS move's steer_ready
         while rclpy.ok() and time.monotonic() < deadline:
             if self.esp32_steer_ready: return True
+            # Fallback: if ESP32 never acknowledged at all, stop early.
+            # Only applies when fallback_s < t (i.e. normal full-timeout calls).
             if (not self.esp32_steer_ready_seen
-                    and time.monotonic() > deadline - self.steer_ready_timeout_s + self.steer_wait_fallback_s):
+                    and self.steer_wait_fallback_s < t
+                    and time.monotonic() > deadline - t + self.steer_wait_fallback_s):
                 return False
             time.sleep(0.04)
         return False
@@ -806,6 +907,86 @@ class AutoparkMaster(Node):
         self.get_logger().info(
             f"  Motor start: fixed delay {delay:.2f}s (set motor_start_delay_s in YAML)")
         return delay
+
+    # ── Steer stuck kick ──────────────────────────────────────────────────
+    def _steer_stuck_kick(self, target_deg: float, gear: int,
+                          active_hold: bool, settle_extra: float) -> bool:
+        """
+        Called when _wait_steer_ready() times out (steer not reaching target).
+
+        Root cause: passengers increase tire-ground friction ("dry steering").
+        Two mechanisms work together:
+          1. OVERSHOOT angle (2× target) → high steer PWM
+          2. SLOW MOTION during kick → rolling wheels reduce tire friction
+
+        Sequence per retry:
+          Phase 1 — overshoot + motion:    kick_hold_s sec (breaks friction)
+          Phase 2 — target   + motion:     kick_hold_s sec — polls steer_ready
+                                           EXITS IMMEDIATELY when steer fires
+          Phase 3 — target   + speed=0:    kick_timeout_s sec (short, NOT 10s)
+
+        Worst-case time per retry = 2×kick_hold_s + kick_timeout_s
+          e.g. 2×0.4 + 3.0 = 3.8s   vs.  previous 10s per retry
+
+        Returns True if steer_ready fires at any point during any retry.
+        """
+        settle_dur = (self.steer_ready_timeout_s
+                      + self.steer_settle_pause_s
+                      + settle_extra)
+        drv     = self.steer_stuck_kick_drive_speed
+        k_tout  = self.steer_stuck_kick_timeout_s   # short per-retry timeout
+
+        for attempt in range(self.steer_stuck_kick_retries):
+            kick_deg = self.clamp(
+                target_deg * self.steer_stuck_kick_overshoot,
+                -self.steer_stuck_kick_limit_deg,
+                self.steer_stuck_kick_limit_deg)
+
+            self.get_logger().info(
+                f"  steer stuck kick {attempt + 1}/{self.steer_stuck_kick_retries}: "
+                f"overshoot {kick_deg:+.1f}° + drive {drv:.3f} m/s "
+                f"(target={target_deg:+.1f}°)")
+
+            # ── Phase 1: overshoot + motion — breaks static friction ───────
+            self._cmd({"type": "drive", "gear": gear, "speed_mps": drv,
+                       "steer_deg": kick_deg,
+                       "duration": settle_dur, "steer_active_hold": active_hold})
+            self._sleep(self.steer_stuck_kick_hold_s)
+
+            # ── Phase 2: return to target + motion — POLL for steer_ready ──
+            # Exit immediately when steer fires (no need to wait full timeout).
+            self.esp32_steer_ready = False
+            self.esp32_steer_ready_seen = False
+            self._cmd({"type": "drive", "gear": gear, "speed_mps": drv,
+                       "steer_deg": target_deg,
+                       "duration": settle_dur, "steer_active_hold": active_hold})
+            t_end = time.monotonic() + self.steer_stuck_kick_hold_s
+            while rclpy.ok() and time.monotonic() < t_end:
+                if self.esp32_steer_ready:
+                    self.get_logger().info(
+                        f"  steer stuck kick {attempt + 1}: "
+                        f"reached target while moving ✓")
+                    return True
+                time.sleep(0.02)
+
+            # ── Phase 3: stop motion, hold at target, short wait ───────────
+            # Use kick_timeout_s (e.g. 3 s) instead of steer_ready_timeout_s (10 s).
+            # If kick + motion didn't do it in 3 s at rest, retry.
+            self.esp32_steer_ready = False
+            self.esp32_steer_ready_seen = False
+            self._cmd({"type": "drive", "gear": gear, "speed_mps": 0.0,
+                       "steer_deg": target_deg,
+                       "duration": settle_dur, "steer_active_hold": active_hold})
+            if self._wait_steer_ready(k_tout):
+                self.get_logger().info(
+                    f"  steer stuck kick {attempt + 1}: "
+                    f"reached target at rest ✓")
+                return True
+            self.get_logger().warning(
+                f"  steer stuck kick {attempt + 1}: "
+                f"steer_ready not fired (waited {k_tout:.1f}s)")
+
+        return False  # all retries exhausted
 
     # ── Motion command ────────────────────────────────────────────────────
     def _motion_to_cmd(self, motion) -> Dict[str, Any]:

@@ -109,6 +109,18 @@ public:
         declare_parameter("stuck_boost_mps",      0.010);
         declare_parameter("stuck_max_speed_mps",  0.150);
         declare_parameter("stuck_check_s",        3.0);
+        // [v7] When the car has NOT moved at all (zero encoder displacement),
+        // multiply the first boost by this factor for a more aggressive start.
+        // Helps when passengers add enough load that even the first boost
+        // (stuck_boost_mps) is insufficient.  1.0 = same as before.
+        declare_parameter("stuck_zero_boost_factor", 2.0);
+        // [v7] Minimum encoder movement per stuck_check_s to NOT be considered stuck.
+        // Old default 0.005m (5 mm/3 s = 1.7 mm/s) was too low: a car carrying
+        // passengers can move at 28 mm/s (below expected speed) without triggering
+        // stuck detection — it plods to target in 50+ seconds.
+        // Raise to 0.050m (50 mm/3 s = 16.7 mm/s) so a car slower than ~17 mm/s
+        // is boosted.  Tune down if boost fires too early on empty car.
+        declare_parameter("stuck_min_move_m", 0.050);
 
         enc_port_         = get_parameter("enc_port").as_string();
         drive_port_       = get_parameter("drive_port").as_string();
@@ -120,7 +132,8 @@ public:
         stuck_boost_mps_    = (float)get_parameter("stuck_boost_mps").as_double();
         stuck_max_speed_    = (float)get_parameter("stuck_max_speed_mps").as_double();
         stuck_check_s_      = (float)get_parameter("stuck_check_s").as_double();
-        stuck_min_move_m_   = 0.005f;
+        stuck_zero_boost_   = (float)get_parameter("stuck_zero_boost_factor").as_double();
+        stuck_min_move_m_   = (float)get_parameter("stuck_min_move_m").as_double();
 
         // Session speeds — start at calibrated values, never reset within a round.
         session_fwd_speed_  = enc_fwd_speed_;
@@ -130,11 +143,13 @@ public:
         RCLCPP_INFO(get_logger(),
             "enc=%s  drive=%s  thresh=%.1f°  speed_scale=%.4f"
             "  fwd_spd=%.3f  rev_spd=%.3f"
-            "  stuck_boost=%.3f  stuck_max=%.3f  stuck_check=%.1fs",
+            "  stuck_boost=%.3f  stuck_max=%.3f  stuck_check=%.1fs"
+            "  stuck_min_move=%.3fm  stuck_zero_boost_factor=%.1f",
             enc_port_.c_str(), drive_port_.c_str(),
             steer_thresh_, speed_scale_,
             enc_fwd_speed_, enc_rev_speed_,
-            stuck_boost_mps_, stuck_max_speed_, stuck_check_s_);
+            stuck_boost_mps_, stuck_max_speed_, stuck_check_s_,
+            stuck_min_move_m_, stuck_zero_boost_);
 
         try {
             drive_ = std::make_unique<DriveSerial>(drive_port_.c_str());
@@ -282,8 +297,14 @@ private:
                 // Initialise session_arc_rev_speed_ from the command the first
                 // time we see an arc command (or if command is faster than
                 // current session — e.g. after a reset).
-                if (speed_mps > session_arc_rev_speed_)
-                    session_arc_rev_speed_ = speed_mps;
+                // [v7] Clamp up to enc_rev_speed_: the cmd speed_mps is the
+                // serial_bridge protocol speed (= speed_scale = 0.01 m/s).
+                // Using that as the arc monitor start speed means the first
+                // driveWithSteer() boost fires at 0.01→0.02 m/s — far too slow.
+                // Start at enc_rev_speed_ (0.04 m/s) so the arc moves immediately.
+                float arc_init = std::max(speed_mps, enc_rev_speed_);
+                if (arc_init > session_arc_rev_speed_)
+                    session_arc_rev_speed_ = arc_init;
 
                 startArcMonitor(gear, steer_deg);
             }
@@ -372,8 +393,12 @@ private:
                             float moved = dist - stuckRefDist;
                             if (moved < stuck_min_move_m_) {
                                 float oldSpeed = session_fwd_speed_;
+                                // [v7] Zero-movement boost: if car hasn't moved at ALL
+                                // (passengers stalling from rest), use a larger first boost
+                                // to overcome starting torque.
+                                float boost_mult = (dist < 0.001f) ? stuck_zero_boost_ : 1.0f;
                                 session_fwd_speed_ = std::min(
-                                    session_fwd_speed_ + stuck_boost_mps_,
+                                    session_fwd_speed_ + stuck_boost_mps_ * boost_mult,
                                     stuck_max_speed_);
                                 float remaining   = std::max(0.001f, target_m - dist);
                                 float rem_timeout = std::max(5.0f, safety_s - elapsed + 5.0f);
@@ -381,9 +406,11 @@ private:
                                 RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
                                     "Fwd Monitor STUCK (moved=%.5fm in %.1fs)"
                                     " → boost session_fwd %.4f→%.4f m/s"
+                                    " (x%.1f zero-boost)"
                                     " → Drive mode, remaining=%.4fm",
                                     moved, elapsed,
-                                    oldSpeed, session_fwd_speed_, remaining);
+                                    oldSpeed, session_fwd_speed_,
+                                    boost_mult, remaining);
 
                                 set_busy(true);
                                 in_drive_mode = true;
@@ -564,8 +591,10 @@ private:
                         if (moved < stuck_min_move_m_) {
                             if (session_arc_rev_speed_ < stuck_max_speed_) {
                                 float old = session_arc_rev_speed_;
+                                // [v7] Zero-movement boost for passengers stalling arc from rest
+                                float boost_mult = (dist < 0.001f) ? stuck_zero_boost_ : 1.0f;
                                 session_arc_rev_speed_ = std::min(
-                                    session_arc_rev_speed_ + stuck_boost_mps_,
+                                    session_arc_rev_speed_ + stuck_boost_mps_ * boost_mult,
                                     stuck_max_speed_);
                                 boostCount++;
 
@@ -575,10 +604,11 @@ private:
                                 }
 
                                 RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
-                                    "[v6] Arc STUCK #%d (moved=%.5fm in %.1fs)"
-                                    " → boost %.4f→%.4f m/s  steer=%.1f°",
+                                    "[v7] Arc STUCK #%d (moved=%.5fm in %.1fs)"
+                                    " → boost %.4f→%.4f m/s (x%.1f zero-boost)  steer=%.1f°",
                                     boostCount, moved, stuck_check_s_,
-                                    old, session_arc_rev_speed_, steer_deg);
+                                    old, session_arc_rev_speed_,
+                                    boost_mult, steer_deg);
                             } else {
                                 RCLCPP_WARN(rclcpp::get_logger("encoder_bridge"),
                                     "[v6] Arc STUCK at max speed %.4f (moved=%.5fm)"
@@ -655,6 +685,7 @@ private:
     float stuck_max_speed_;
     float stuck_check_s_;
     float stuck_min_move_m_;
+    float stuck_zero_boost_;    // [v7] multiplier when car hasn't moved at all
 
     std::unique_ptr<DriveSerial>      drive_;
     std::unique_ptr<EncSerialReader>  enc_;

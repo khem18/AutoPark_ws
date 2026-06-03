@@ -154,8 +154,8 @@ def generate_launch_description():
             executable='encoder_bridge',
             name='encoder_bridge',
             parameters=[{
-                'enc_port':            '/dev/ttyUSB0',
-                'drive_port':          '/dev/ttyUSB2',
+                'enc_port':            '/dev/ttyUSB1',
+                'drive_port':          '/dev/ttyUSB0',
                 'speed_scale':         0.01,
                 # Calibrated driving speeds from closed_loop_demo.cpp (unloaded car):
                 # Move 1 forward  0.50 m real at 0.06 m/s -> enc_fwd_speed_mps = 0.06
@@ -172,9 +172,18 @@ def generate_launch_description():
                 # Tune: if car still stalls -> lower stuck_check_s or raise
                 #       stuck_boost_mps. If steering accuracy suffers at
                 #       high speed -> lower stuck_max_speed_mps.
-                'stuck_boost_mps':      0.010,   # +10 mm/s per stuck event
+                'stuck_boost_mps':      0.020,   # +10 mm/s per stuck event
                 'stuck_max_speed_mps':  0.150,   # hard cap (150 mm/s)
                 'stuck_check_s':        3.0,     # seconds before declaring stuck
+                # [v7] Larger boost multiplier when car has moved 0m at first stuck check.
+                # Passengers stall the car from rest; 2x boost gets it moving sooner.
+                # Set to 1.0 to disable (same behaviour as v6).
+                'stuck_zero_boost_factor': 3.0,  # x2 boost if dist==0 at first stuck check
+                # [v7] Min encoder movement per stuck_check_s interval to NOT be stuck.
+                # Raised from 0.005m (5mm) to 0.050m (50mm) so a car carrying passengers
+                # that is moving slowly (e.g. 28mm/s → 84mm/3s) is still boosted.
+                # Tune down (e.g. 0.020) if empty-car boost fires too early.
+                'stuck_min_move_m':     0.080,
             }]
         ),
     ])

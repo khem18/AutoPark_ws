@@ -14,11 +14,11 @@ autopark_master:
     flow_distance_topic:     "/autopark/flow_distance"
     imu_topic:               "/imu/data_raw"
     esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
-    rear_cam_topic:          "/rear_parking_metrics"  # ← rear camera tracker output
+    rear_cam_topic:          "/rear_parking_metrics"  # <- rear camera tracker output
 
-    # Start pose — car must be ≥1.28m before slot entrance (in aisle)
+    # Start pose -- car must be >=1.28m before slot entrance (in aisle)
     use_default_pose_when_missing: true  # FIX: use default pose when camera not running
-    default_start_x:       -1.28    # must be ≤ -R=-1.335m (measured arc radius)
+    default_start_x:       -1.28    # must be <= -R=-1.335m (measured arc radius)
     default_start_y:        0.70
     default_start_yaw_deg: 180.0
 
@@ -35,19 +35,19 @@ autopark_master:
     steer_ready_timeout_s:  10.0    # max wait for ESP32 steer_ready signal
     steer_settle_pause_s:   0.5     # physical overshoot damp time AFTER steer_ready fires.
     # steer_ready is an electrical signal (servo controller within threshold) but the
-    # physical servo still has momentum and oscillates ≈0.3–0.5s after firing.
+    # physical servo still has momentum and oscillates ~0.3-0.5s after firing.
     # 0.5s lets the overshoot damp before the drive CMD is sent.
     # Set to 0.0 only if your servo has no overshoot (e.g. very slow or geared servo).
     steer_wait_fallback_s:  6.0
     pause_between_commands: 5.0     # longer pause to fully stop before next move
     # Time from drive command sent to motor physically spinning.
     # Fallback when optical flow is not available.
-    # Tune: (d_expected - d_actual) / speed = (1.98 - 1.43) / 0.481 = 1.14s → use 1.2
+    # Tune: (d_expected - d_actual) / speed = (1.98 - 1.43) / 0.481 = 1.14s -> use 1.2
     motor_start_delay_s:    1.8
     # Arc time budget when IMU is not available.
-    # User confirmed: arc takes ~10s to complete 90°.
+    # User confirmed: arc takes ~10s to complete 90deg.
     # Set slightly above 10s so time_stop fires after full arc.
-    # Tune: if car overshoots → lower; if undershoots → raise.
+    # Tune: if car overshoots -> lower; if undershoots -> raise.
     arc_fallback_time_s:    12.0
 
     # Calibrated speeds (time fallback)
@@ -57,11 +57,11 @@ autopark_master:
     reverse_straight_speed_mps:   0.040    # FIX: must match enc_rev_speed_mps so drive_time_s covers full encoder run
     straight_steer_threshold_deg: 3.0
 
-    # Timing ← FIXED
+    # Timing <- FIXED
     max_segment_dist_m: 2.5
     min_chunk_dist_m:   0.10
     drive_time_min_s:   1.0
-    drive_time_max_s:   120.0    # ← was 60, MUST be ≥104s for arc to complete
+    drive_time_max_s:   120.0    # <- was 60, MUST be >=104s for arc to complete
 
     # IMU arc stop (arc move)
     imu_arc_stop_enabled:         true
@@ -69,8 +69,27 @@ autopark_master:
     imu_arc_stop_factor:          0.51
     imu_arc_wait_before_check_s:  0.3
     imu_arc_reversal_enabled:    true
-    imu_arc_reversal_min_deg:    10.0   # only trigger after arc reaches 10°
-    imu_arc_reversal_drop_deg:    3.0   # stop if arc drops 3° from its peak
+    imu_arc_reversal_min_deg:    10.0   # only trigger after arc reaches 10deg
+    imu_arc_reversal_drop_deg:    3.0   # stop if arc drops 3deg from its peak
+
+    # -- Dynamic IMU arc stop factor for passenger / stuck-speed arc ---------
+    # When encoder_bridge boosts session_arc_rev_speed_ above threshold (due to
+    # passengers stalling the motor), _wait_stop() automatically switches to
+    # this smaller factor -> arc stops a bit earlier -> prevents overshoot at
+    # boosted speed.
+    #
+    # NO-LOAD effect: ZERO.
+    #   session_arc = enc_rev_speed = 0.040 m/s < threshold (0.060 m/s)
+    #   -> imu_arc_stop_factor (0.51) always used, this param ignored.
+    #
+    # PASSENGER effect (stuck boost fires):
+    #   session_arc boosted to 0.10-0.15 m/s > threshold (0.060 m/s)
+    #   -> imu_arc_stop_factor_stuck (0.48) used instead.
+    #
+    # Tune: raise toward imu_arc_stop_factor if arc undershoots parking slot.
+    #       lower further if arc still overshoots at boosted speed.
+    imu_arc_stop_factor_stuck:      0.48   # < imu_arc_stop_factor (0.51)
+    arc_stuck_speed_threshold_mps:  0.06   # enc_rev_speed(0.04) x 1.5 = 0.06 m/s
 
     # IMU straight heading correction (move 1 fwd_setup and move 3 d4)
     imu_straight_correct_enabled:    true
@@ -83,11 +102,11 @@ autopark_master:
     flow_straight_stop_factor:          0.90
     flow_straight_wait_before_check_s:  0.3
 
-    # Rear US stop — d4 move PRIMARY stop
+    # Rear US stop -- d4 move PRIMARY stop
     # Sensor 6 (index 5) stops at 40mm
     # Sensors 7,8 (indices 6,7) are emergency at 25mm
     rear_ultrasonic_stop_m:  0.200
-    rear_us_indices: [6]               # ← 6 = ultrasonic x7
+    rear_us_indices: [6]               # <- 6 = ultrasonic x7
     d4_speed_mps:            0.003
 
     # All-sensor emergency stop
@@ -104,21 +123,49 @@ autopark_master:
     stuck_retry_pause_s:      0.2
     stuck_max_retries:        1
 
+    # -- Steer stuck kick -- passengers add steering friction ------------------
+    # When _wait_steer_ready() times out, two mechanisms work together:
+    #  1. Overshoot angle (2.5x target) -> high steer PWM
+    #  2. Brief slow drive motion during kick -> rolling wheels reduce tire friction
+    # kick_limit_deg MUST be >= max_command_steer_deg * kick_overshoot.
+    # Example: 30deg x 2.5 = 75deg -> set limit 75deg.
+    #
+    # HOW IT WORKS:
+    #   Phase 1 (1.0s): steer->75deg + drive slow -> wheels reach hardware max (30deg)
+    #   Phase 2 (1.0s): steer->30deg + drive slow -> wheels ALREADY at 30deg
+    #                   -> steer_ready fires immediately -> exits in <0.1s OK
+    #   Phase 3 (3.0s): drive stops -> static hold -> short wait
+    #
+    # Total motion per kick = 2 x kick_hold_s x kick_drive_speed_mps
+    #   e.g. 2 x 1.0 x 0.08 = 16 cm per retry  (3 retries = 48 cm total)
+    #
+    # WARNING: drive_speed_mps: 10.0 -> ESP32 clamps to max PWM (0.7 m/s)
+    #   -> 0.7 x 0.4 = 28 cm PER PHASE, 1.7 m total!  Too much.
+    #   Keep drive_speed_mps at 0.08 (actual ~3 cm per 1-second phase).
+    steer_stuck_kick_enabled:           true
+    steer_stuck_kick_overshoot:         2.5   # factor: 2.5 -> 75deg for 30deg target
+    steer_stuck_kick_limit_deg:         75.0  # allow kick beyond max_command_steer_deg
+    steer_stuck_kick_hold_s:            1.0   # seconds per phase -- servo needs ~1s to travel
+    steer_stuck_kick_retries:           3     # attempts before giving up
+    steer_stuck_kick_drive_speed_mps:   0.08  # ~3 cm per 1-second phase -- controlled motion
+    # Per-retry Phase 3 timeout -- MUCH shorter than steer_ready_timeout_s (10s).
+    steer_stuck_kick_timeout_s:         3.0
+
     flow_valid_required:        false
     send_arm_command_on_start:  false
     disable_ultrasonic_block:   true
     min_clearance_m:            0.12
     us_safety_start_delay_s:    0.50
 
-    # ── Rear-camera Move3 correction ────────────────────────────────────────
+    # -- Rear-camera Move3 correction ----------------------------------------
     # Set rear_cam_enabled: false to fall back to planner d4 (old behaviour).
     rear_cam_enabled:          true
     # rear_cam_stop_m: distance (m) from rear camera lens to the target stop point.
-    #   = camera-to-bumper offset (≈0.175 m) + desired bumper-to-wall gap (0.200 m)
-    #   Tune: if car stops too close to wall → increase; too far → decrease.
+    #   = camera-to-bumper offset (~0.175 m) + desired bumper-to-wall gap (0.200 m)
+    #   Tune: if car stops too close to wall -> increase; too far -> decrease.
     rear_cam_stop_m:           0.375
     # Number of consecutive valid rear-cam frames required before trusting the reading.
-    # At ~25 fps camera, 5 frames ≈ 0.2 s. Increase if readings are noisy.
+    # At ~25 fps camera, 5 frames ~ 0.2 s. Increase if readings are noisy.
     rear_cam_stable_samples:   5
     # Maximum seconds to wait for stable rear-cam frames. Falls back to planner d4 on timeout.
     # At the arc end position the back wall is typically ~167 cm away (camera max range).
@@ -128,11 +175,11 @@ autopark_master:
 
 serial_bridge:
   ros__parameters:
-    drive_port:              "/dev/ttyUSB2"
-    # FIX: encoder_bridge handles straight (|steer|≤5°) moves; skip forwarding them
+    drive_port:              "/dev/ttyUSB0"
+    # FIX: encoder_bridge handles straight (|steer|<=5deg) moves; skip forwarding them
     enc_handles_straight:    true
     enc_straight_thresh_deg: 5.0
-    us_all_port:             "/dev/ttyUSB1"
+    us_all_port:             "/dev/ttyUSB2"
     us_front_port:           ""
     us_rear_port:            ""
     baud:                    115200
@@ -152,7 +199,7 @@ perception_bridge:
     default_start_yaw_deg:  180.0
     case_detection_mode:    "fixed"
     fixed_case:             "right_only"
-    camera_metrics_timeout_s:  5.0    # ← NEW: pose only published when detection fresh
+    camera_metrics_timeout_s:  5.0    # <- NEW: pose only published when detection fresh
     camera_x_scale:   -0.01    # was -0.01 (sign was also wrong for pose.x)
     camera_y_scale:   0.01
     camera_x_offset_m: 0.0
@@ -160,7 +207,7 @@ perception_bridge:
 
 motion_executor:
   ros__parameters:
-    plan_topic: "/autopark/plan_result_disabled"   # DISABLED — autopark_master executes directly
+    plan_topic: "/autopark/plan_result_disabled"   # DISABLED -- autopark_master executes directly
 
 vins_pose_bridge:
   ros__parameters:
@@ -174,5 +221,5 @@ vins_pose_bridge:
 rear_cam_tracker:
   ros__parameters:
     # Set debug_view: true to show the "Rear Cam Tracker Debug" cv2 window.
-    # Keep false on the car — cv2.imshow causes an extra window on every launch.
+    # Keep false on the car -- cv2.imshow causes an extra window on every launch.
     debug_view: false

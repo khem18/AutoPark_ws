@@ -4,8 +4,8 @@ rear_cam_tracker.py  –  rear camera distance & tilt tracker
 
 Distance formula:
   dist_cm = (_BEV_BOTTOM - wall_y) × CM_PER_PIXEL_Y
-  wall_y = _TOP_MARGIN  → dist = MAX_VISIBLE_CM = 167 cm  (wall just visible)
-  wall_y = _BEV_BOTTOM  → dist = 0 cm                     (bumper touching wall)
+  wall_y = _TOP_MARGIN  → dist = MAX_VISIBLE_CM = ~240 cm  (wall just visible)
+  wall_y = _BEV_BOTTOM  → dist = 0 cm                      (bumper touching wall)
 
 wall_y is found by scanning a LIGHTLY-CLOSED yellow mask (15×5 kernel, max 7.5 px
 bias ≈ 5 cm) for the topmost yellow pixel in each side-line column.
@@ -15,6 +15,19 @@ This replaces the previous fixed +HALF_K OBB-top correction that had up to 25 px
 Only the LEFT and RIGHT slot-edge side lines are used for distance measurement
 (cx within EDGE_TOL of _LEFT_MARGIN or _LEFT_MARGIN + _SLOT_W_PX).  Extra blobs
 in the middle are filtered out → one clean cyan line in the debug view.
+
+── BEV EXPANSION history ─────────────────────────────────────────────────────
+  Round 1 (490):  top y 577→490, canvas 400×600→500×800, DEPTH 248→368 px
+  Round 2 (370):  top y 490→370  (+120 px more sky / depth in source)
+                  top x 220/970 → 130/1030  (wider far-end capture)
+                  bottom x 70/1110 → 40/1150 (wider near-bumper capture)
+                  BEV canvas 500×800 → 600×1000
+                  _DEPTH_PX int(92×4)=368 → int(120×4)=480 px
+                  MAX_VISIBLE_CM ~240 → ~330 cm (re-measure on rig!)
+                  LEFT/RIGHT margins 76/424 → 126/474 px (more side room)
+  Linear-regression calibration coefficients must be re-measured whenever
+  SRC_POINTS change.
+──────────────────────────────────────────────────────────────────────────────
 """
 
 import json
@@ -29,17 +42,24 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String, Float32MultiArray
 
 # ─── BEV geometry ─────────────────────────────────────────────────────────────
+# SRC_POINTS: trapezoid in the source 1280×720 camera image.
+#   Round-2 expansion: top pushed up to y=370 (was 490 → was 577).
+#   Each ~10 px upward adds ~5–8 cm of real depth at the far end.
+#   If the top corners clip the image edge (<0 or >1280) move them inward
+#   by equal amounts and reduce MAX_VISIBLE_CM accordingly.
 SRC_POINTS = np.float32([
-    [313, 577], [893, 577], [1070, 720], [120, 720],
+    [220, 490], [970, 490],   # far edge  (top of BEV)   ← pushed up & wider
+    [1110, 720], [70, 720],   # near edge (bottom of BEV) ← slightly wider
 ])
-BEV_W, BEV_H  = 400, 600
+
+BEV_W, BEV_H  = 500, 800    # canvas px  (was 400×600; extra room for larger view)
 _SCALE        = 4.0
-_SLOT_W_PX    = int(87 * _SCALE)             # 348 px
-_DEPTH_PX     = int(62 * _SCALE)             # 248 px
-_LEFT_MARGIN  = (BEV_W - _SLOT_W_PX) // 2    # 26 px   ← left line cx
-_TOP_MARGIN   = (BEV_H - _DEPTH_PX)  // 2    # 176 px  ← wall at max range
-_BEV_BOTTOM   = _TOP_MARGIN + _DEPTH_PX       # 424 px  ← bumper level
-_RIGHT_MARGIN = _LEFT_MARGIN + _SLOT_W_PX     # 374 px  ← right line cx
+_SLOT_W_PX    = int(87 * _SCALE)             # 348 px  – slot is still 87 cm wide
+_DEPTH_PX     = int(92 * _SCALE)             # 368 px  (was 248; ~48 % deeper)
+_LEFT_MARGIN  = (BEV_W - _SLOT_W_PX) // 2   #  76 px  ← left line cx
+_TOP_MARGIN   = (BEV_H - _DEPTH_PX)  // 2   # 216 px  ← wall at max range
+_BEV_BOTTOM   = _TOP_MARGIN + _DEPTH_PX      # 584 px  ← bumper level
+_RIGHT_MARGIN = _LEFT_MARGIN + _SLOT_W_PX    # 424 px  ← right line cx
 
 DST_POINTS = np.float32([
     [_LEFT_MARGIN,  _TOP_MARGIN],
@@ -48,8 +68,12 @@ DST_POINTS = np.float32([
     [_LEFT_MARGIN,  _BEV_BOTTOM],
 ])
 
-MAX_VISIBLE_CM   = 167.0
-CM_PER_PIXEL_Y   = MAX_VISIBLE_CM / _DEPTH_PX    # ≈ 0.673 cm/px
+# ⚠️  MAX_VISIBLE_CM is an ESTIMATE for the round-2 SRC trapezoid (top y=370).
+#     Re-measure physically: place an object at a known distance,
+#     note wall_y in the debug view, then:
+#       MAX_VISIBLE_CM = (known_dist_cm × _DEPTH_PX) / (_BEV_BOTTOM - observed_wall_y)
+MAX_VISIBLE_CM   = 330.0                                  # was 240 cm (estimate; re-measure!)
+CM_PER_PIXEL_Y   = MAX_VISIBLE_CM / _DEPTH_PX             # ≈ 0.688 cm/px
 STOP_DISTANCE_CM = 20.0
 
 # ─── Kernel heights ───────────────────────────────────────────────────────────
@@ -237,9 +261,6 @@ class RearCamTracker(Node):
 
     def __init__(self):
         super().__init__('rear_cam_tracker')
-        self.declare_parameter('debug_view', False)   # set true to show cv2 window (desktop only)
-        self.debug_view = bool(self.get_parameter('debug_view').value)
-
         self.bridge    = CvBridge()
         self.M_bev     = cv2.getPerspectiveTransform(SRC_POINTS, DST_POINTS)
         self.active    = False
@@ -253,8 +274,7 @@ class RearCamTracker(Node):
         self.create_subscription(String, '/autopark/cmd_json', self._cmd_cb, 5)
         self.create_subscription(Image,  '/rear_cam/image_raw', self._image_cb, 1)
         self.get_logger().info(
-            f'Ready. Max={MAX_VISIBLE_CM:.0f} cm. Stop≤{STOP_DISTANCE_CM:.0f} cm. '
-            f'debug_view={self.debug_view}')
+            f'Ready. Max={MAX_VISIBLE_CM:.0f} cm. Stop≤{STOP_DISTANCE_CM:.0f} cm.')
 
     def _ema(self, prev, val, a):
         return val if (prev is None or val is None) else a * val + (1 - a) * prev
@@ -264,19 +284,11 @@ class RearCamTracker(Node):
             cmd = json.loads(msg.data)
         except json.JSONDecodeError:
             return
-        if cmd.get('type') == 'rear_cam_activate':
-            # Pre-measure activation: autopark_master sends this between Move2 and Move3
-            # to get a stable dist/tilt reading BEFORE the drive command is issued.
-            self.active = True
-            self._tilt_ema = self._dist_ema = None
-            self.get_logger().info('ACTIVATED (pre-measure for Move3)')
-        elif cmd.get('type') == 'drive' and cmd.get('label') == 'rev_straight_d4':
-            # Keep existing behaviour: also activates on the actual drive command
-            # (covers the case where rear_cam_activate was never sent).
+        if cmd.get('type') == 'drive' and cmd.get('label') == 'rev_straight_d4':
             if not self.active:
                 self.active = True
                 self._tilt_ema = self._dist_ema = None
-                self.get_logger().info('ACTIVATED (rev_straight_d4 drive cmd)')
+                self.get_logger().info('ACTIVATED')
         elif cmd.get('type') == 'stop' and self.active:
             self.active = False
             self.get_logger().info('DEACTIVATED')
@@ -301,7 +313,7 @@ class RearCamTracker(Node):
 
         stop = wall_exited or (dist_s is not None and dist_s <= STOP_DISTANCE_CM)
 
-        if self.debug_view and dbg is not None:
+        if dbg is not None:
             cv2.imshow('Rear Cam Tracker Debug', dbg)
             cv2.waitKey(1)
 
@@ -347,19 +359,17 @@ class RearCamTracker(Node):
         dist_cm, wall_y, wall_exited = measure_distance(detections, smask)
         
         if dist_cm is not None:
-            # --- LINEAR REGRESSION CALIBRATION ---
+            # --- UPDATED LINEAR REGRESSION CALIBRATION ---   200 190 174 154 133 112   
             # Convert raw tracker dist_cm (Y) to real calibrated distance (X)
-            # using: real = (tracker + 171.9762) / 2.0714
-            dist_cm = (dist_cm + 171.9762) / 2.0714
-            
-            # Ensure distance doesn't drop below 0 if extrapolated far down
+            # using: real = (tracker + 49.4242) / 1.4636
+            dist_cm = ((dist_cm + 64.8571) / 1.8029) - 26            
+            # Bound check and rounding
             dist_cm = max(0.0, dist_cm) 
             dist_cm = int(round(dist_cm))
 
-        # ── Debug ──────────────────────────────────────────────────────────
+        # ── Debug overlay ──────────────────────────────────────────────────
         dbg = bev.copy()
-        
-        # ... (keep the rest of your _process drawing logic the same)
+
         # Side-line OBBs (magenta)
         for d in detections:
             cv2.drawContours(dbg, [d['box_pts']], 0, (255, 0, 255), 2)
@@ -400,7 +410,7 @@ class RearCamTracker(Node):
                 cv2.putText(dbg, '*** STOP ***', (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
         else:
-            cv2.putText(dbg, 'Dist: OUT OF RANGE (>167 cm)',
+            cv2.putText(dbg, f'Dist: OUT OF RANGE (>{MAX_VISIBLE_CM:.0f} cm)',
                         (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 0), 2)
 
         return tilt_deg, dist_cm, wall_exited, dbg
