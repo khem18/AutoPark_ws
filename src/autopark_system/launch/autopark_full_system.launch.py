@@ -89,6 +89,20 @@ def generate_launch_description():
             condition=IfCondition(use_camera_imu),
         ),
 
+        # ── Rear camera tracker — dist & tilt for Move3 correction ──────────
+        # Publishes /rear_parking_metrics ([tilt_deg, dist_cm]).
+        # autopark_master subscribes and uses it to override Move3 steer/dist
+        # via the rear-cam formula (page-101 diagram).
+        # Requires /rear_cam/image_raw → gated by use_camera_imu.
+        Node(
+            package='autopark_logic',
+            executable='rearcam_tracker',      # matches entry_points in autopark_logic/setup.py
+            name='rear_cam_tracker',
+            output='screen',
+            parameters=[params],
+            condition=IfCondition(use_camera_imu),
+        ),
+
         # ── MPU6050 IMU — runs always (independent of camera) ───────────────
         # Publishes /imu/data_raw for imu_arc_stop in autopark_master.
         # Previously gated by use_camera_imu (wrong — IMU has no camera dependency).

@@ -135,11 +135,20 @@ public:
     //  forward    : true = forward, false = reverse
     //  speedMps   : target speed [m/s]
     //  timeoutS   : safety timeout [s]
+    //  steerDeg   : steer angle to hold throughout the drive [degrees, default 0]
+    //               Pass the rear-camera-computed angle so the ESP32 holds it
+    //               instead of being reset to 0 by every loop tick.
+    //  skipArm    : skip the arm() call when the motor is already active (e.g.
+    //               settle CMD is still holding the ESP32 in a drive state).
+    //               Calling arm() while the settle CMD is active resets the
+    //               ESP32 motor/steer state → car briefly starts then ENC_FAIL.
     //
     StraightResult driveStraight(float targetM,
                                   bool  forward,
                                   float speedMps,
-                                  float timeoutS = 15.0f)
+                                  float timeoutS = 15.0f,
+                                  float steerDeg = 0.0f,
+                                  bool  skipArm  = false)
     {
         abort_      = false;
         lastDistM_  = 0.0f;
@@ -151,10 +160,14 @@ public:
             return StraightResult::ENC_FAIL;
         }
 
-        // Arm + wait
-        drive_.arm();
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds((int)cfg_.arm_wait_ms));
+        // Arm + wait — SKIP when motor is already active (settle CMD still running).
+        // Calling arm() while ESP32 is holding the settle steer angle resets its
+        // motor controller → causes the brief start-then-instant-stop (ENC_FAIL).
+        if (!skipArm) {
+            drive_.arm();
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds((int)cfg_.arm_wait_ms));
+        }
 
         // Record start position (right encoder only)
         EncSnapshot start = enc_.getSnapshot();
@@ -233,8 +246,11 @@ public:
             currentSpeed = std::max(cfg_.min_speed_mps,
                            std::min(speedMps, targetSpeed + adj));
 
-            // ── Send drive — steer_deg=0 → equal wheel PWM ────
-            drive_.driveStraight(currentSpeed, gear, cfg_.cmd_duration);
+            // ── Send drive — hold commanded steer angle each tick ─
+            // Previously called driveStraight() which hardcoded steer=0,
+            // overwriting the settle CMD angle every 20 ms.
+            // Now uses driveWithSteer() so rear-cam computed steer is preserved.
+            drive_.driveWithSteer(currentSpeed, gear, steerDeg, cfg_.cmd_duration);
 
             // ── Debug every 200 ms ─────────────────────────────
             static uint64_t dbg = 0;

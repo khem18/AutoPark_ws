@@ -237,6 +237,9 @@ class RearCamTracker(Node):
 
     def __init__(self):
         super().__init__('rear_cam_tracker')
+        self.declare_parameter('debug_view', False)   # set true to show cv2 window (desktop only)
+        self.debug_view = bool(self.get_parameter('debug_view').value)
+
         self.bridge    = CvBridge()
         self.M_bev     = cv2.getPerspectiveTransform(SRC_POINTS, DST_POINTS)
         self.active    = False
@@ -250,7 +253,8 @@ class RearCamTracker(Node):
         self.create_subscription(String, '/autopark/cmd_json', self._cmd_cb, 5)
         self.create_subscription(Image,  '/rear_cam/image_raw', self._image_cb, 1)
         self.get_logger().info(
-            f'Ready. Max={MAX_VISIBLE_CM:.0f} cm. Stop≤{STOP_DISTANCE_CM:.0f} cm.')
+            f'Ready. Max={MAX_VISIBLE_CM:.0f} cm. Stop≤{STOP_DISTANCE_CM:.0f} cm. '
+            f'debug_view={self.debug_view}')
 
     def _ema(self, prev, val, a):
         return val if (prev is None or val is None) else a * val + (1 - a) * prev
@@ -260,11 +264,19 @@ class RearCamTracker(Node):
             cmd = json.loads(msg.data)
         except json.JSONDecodeError:
             return
-        if cmd.get('type') == 'drive' and cmd.get('label') == 'rev_straight_d4':
+        if cmd.get('type') == 'rear_cam_activate':
+            # Pre-measure activation: autopark_master sends this between Move2 and Move3
+            # to get a stable dist/tilt reading BEFORE the drive command is issued.
+            self.active = True
+            self._tilt_ema = self._dist_ema = None
+            self.get_logger().info('ACTIVATED (pre-measure for Move3)')
+        elif cmd.get('type') == 'drive' and cmd.get('label') == 'rev_straight_d4':
+            # Keep existing behaviour: also activates on the actual drive command
+            # (covers the case where rear_cam_activate was never sent).
             if not self.active:
                 self.active = True
                 self._tilt_ema = self._dist_ema = None
-                self.get_logger().info('ACTIVATED')
+                self.get_logger().info('ACTIVATED (rev_straight_d4 drive cmd)')
         elif cmd.get('type') == 'stop' and self.active:
             self.active = False
             self.get_logger().info('DEACTIVATED')
@@ -289,7 +301,7 @@ class RearCamTracker(Node):
 
         stop = wall_exited or (dist_s is not None and dist_s <= STOP_DISTANCE_CM)
 
-        if dbg is not None:
+        if self.debug_view and dbg is not None:
             cv2.imshow('Rear Cam Tracker Debug', dbg)
             cv2.waitKey(1)
 

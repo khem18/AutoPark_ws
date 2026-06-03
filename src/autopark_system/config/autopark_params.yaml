@@ -14,6 +14,7 @@ autopark_master:
     flow_distance_topic:     "/autopark/flow_distance"
     imu_topic:               "/imu/data_raw"
     esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
+    rear_cam_topic:          "/rear_parking_metrics"  # ← rear camera tracker output
 
     # Start pose — car must be ≥1.28m before slot entrance (in aisle)
     use_default_pose_when_missing: true  # FIX: use default pose when camera not running
@@ -31,12 +32,12 @@ autopark_master:
     max_command_steer_deg: 30.0
 
     # Steer settle
-    steer_ready_timeout_s:  10.0    # arc settle may take longer at higher PWM
-    steer_settle_pause_s:   9.0     # Servo speed ≈7°/s vs spring from +30°.
-    # Worst case Move1 steer=-19°: 49°/7°/s=7.0s travel + 2.0s margin = 9.0s.
-    # encoder_bridge does NOT wait for steer_ready — settle happens here in Python.
-    # 9.0s = 7.0s travel + 2.0s margin (steer_ready fires at 0.12s, not physical arrival).
-    # Move3 steer=0°: 30°/7°/s=4.3s, settled with 4.7s to spare.
+    steer_ready_timeout_s:  10.0    # max wait for ESP32 steer_ready signal
+    steer_settle_pause_s:   0.5     # physical overshoot damp time AFTER steer_ready fires.
+    # steer_ready is an electrical signal (servo controller within threshold) but the
+    # physical servo still has momentum and oscillates ≈0.3–0.5s after firing.
+    # 0.5s lets the overshoot damp before the drive CMD is sent.
+    # Set to 0.0 only if your servo has no overshoot (e.g. very slow or geared servo).
     steer_wait_fallback_s:  6.0
     pause_between_commands: 5.0     # longer pause to fully stop before next move
     # Time from drive command sent to motor physically spinning.
@@ -65,7 +66,7 @@ autopark_master:
     # IMU arc stop (arc move)
     imu_arc_stop_enabled:         true
     imu_arc_min_steer_deg:        8.0
-    imu_arc_stop_factor:          0.63
+    imu_arc_stop_factor:          0.51
     imu_arc_wait_before_check_s:  0.3
     imu_arc_reversal_enabled:    true
     imu_arc_reversal_min_deg:    10.0   # only trigger after arc reaches 10°
@@ -108,6 +109,22 @@ autopark_master:
     disable_ultrasonic_block:   true
     min_clearance_m:            0.12
     us_safety_start_delay_s:    0.50
+
+    # ── Rear-camera Move3 correction ────────────────────────────────────────
+    # Set rear_cam_enabled: false to fall back to planner d4 (old behaviour).
+    rear_cam_enabled:          true
+    # rear_cam_stop_m: distance (m) from rear camera lens to the target stop point.
+    #   = camera-to-bumper offset (≈0.175 m) + desired bumper-to-wall gap (0.200 m)
+    #   Tune: if car stops too close to wall → increase; too far → decrease.
+    rear_cam_stop_m:           0.375
+    # Number of consecutive valid rear-cam frames required before trusting the reading.
+    # At ~25 fps camera, 5 frames ≈ 0.2 s. Increase if readings are noisy.
+    rear_cam_stable_samples:   5
+    # Maximum seconds to wait for stable rear-cam frames. Falls back to planner d4 on timeout.
+    # At the arc end position the back wall is typically ~167 cm away (camera max range).
+    # 15 s gives the EMA time to stabilise even if the first frames are noisy.
+    # If still timing out: check BEV calibration (SRC_POINTS) in rearcam_tracker.py.
+    rear_cam_timeout_s:        15.0
 
 serial_bridge:
   ros__parameters:
@@ -153,3 +170,9 @@ vins_pose_bridge:
     y_offset:          0.0
     yaw_offset_deg:    0.0   # tune if VINS world frame doesn't match planner frame
     publish_rate_hz:   10.0
+
+rear_cam_tracker:
+  ros__parameters:
+    # Set debug_view: true to show the "Rear Cam Tracker Debug" cv2 window.
+    # Keep false on the car — cv2.imshow causes an extra window on every launch.
+    debug_view: false

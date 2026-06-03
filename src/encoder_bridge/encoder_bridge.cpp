@@ -216,28 +216,41 @@ private:
         bool dist_ok  = dist_m_raw > 0.001f;   // explicit target distance required
         bool steer_ok = std::fabs(steer_deg) <= steer_thresh_;
 
+        // use_encoder=true: autopark_master sets this on Move3 when the rear-camera
+        // computed steer may exceed steer_thresh_ (5°). Forces encoder handling even
+        // for non-straight reverse, so the encoder (not the time-fallback) stops the move.
+        // The steer angle is still held by the ESP32 via the long-duration settle CMD
+        // (steer_active_hold=true) — encoder_bridge only controls motor speed/distance.
+        bool enc_force = jsonBool(json, "use_encoder");
+
         // Intercept rule:
         //   Forward (gear>0): encoder handles ALL moves by distance,
         //     including Move1 curved setup (steer≈-23°). IMU NOT used for Move1.
-        //   Reverse (gear<0): only |steer|≤thresh (straight reverses, i.e. Move3).
-        //     Move2 arc (steer=+30°) is excluded here → IMU stops it. ✓
+        //   Reverse (gear<0): intercept when |steer|≤thresh (straight Move3)
+        //                     OR when use_encoder=true (rear-cam Move3, any steer).
+        //     Move2 arc (steer=+30°, use_encoder absent) → excluded → IMU stops it. ✓
         bool intercept = speed_ok && gear_ok && dist_ok &&
-                         (gear > 0 || steer_ok);
+                         (gear > 0 || steer_ok || enc_force);
 
         if (!intercept) {
             RCLCPP_INFO(get_logger(),
-                "  → %s (gear=%+d speed_ok=%d dist_ok=%d steer_ok=%d) — serial_bridge handles",
-                (gear < 0 && !steer_ok) ? "Arc reverse — IMU handles"
-                                        : "No target dist or zero speed",
-                gear, (int)speed_ok, (int)dist_ok, (int)steer_ok);
+                "  → %s (gear=%+d speed_ok=%d dist_ok=%d steer_ok=%d enc_force=%d)"
+                " — serial_bridge handles",
+                (gear < 0 && !steer_ok && !enc_force) ? "Arc reverse — IMU handles"
+                                                       : "No target dist or zero speed",
+                gear, (int)speed_ok, (int)dist_ok, (int)steer_ok, (int)enc_force);
             // FIX: do NOT abort running drive when rejecting a command.
-            // If this is a forward steer-settle CMD (speed=0, gear>0),
-            // reset steer_ready_flag HERE so the drive_thread_ (started on
-            // the NEXT drive CMD) waits for a fresh signal from this settle.
-            if (!speed_ok && gear > 0) {
+            // Any settle CMD (speed=0, any gear) means autopark_master is about to
+            // wait for a fresh steer_ready signal — reset the flag so a stale
+            // signal from the previous move cannot leak through.
+            // Previously only gear>0 was handled; gear<0 (Move3 reverse settle)
+            // was silently skipped → flag could carry over from Move1/Move2.
+            if (!speed_ok) {
                 steer_ready_flag_.store(false);
                 RCLCPP_INFO(get_logger(),
-                    "  → Fwd settle CMD: steer_ready_flag reset, awaiting servo");
+                    "  → Settle CMD (gear=%+d steer=%.1f°): "
+                    "steer_ready_flag reset, awaiting servo",
+                    gear, steer_deg);
             }
             return;
         }
@@ -420,15 +433,20 @@ private:
             "  Safety timeout=%.1fs  (%.3fm / 0.025 m/s + 30s buffer)",
             timeout, target_m);
         RCLCPP_INFO(get_logger(),
-            "  → Encoder drive: target=%.4fm  speed=%.3f m/s  gear=-1",
-            target_m, drive_speed);
+            "  → Encoder drive: target=%.4fm  speed=%.3f m/s  steer=%.1f°  gear=-1%s",
+            target_m, drive_speed, steer_deg,
+            enc_force ? "  (use_encoder forced — rear-cam steer)" : "");
 
         set_busy(true);
 
         drive_thread_ = std::thread(
-            [this, target_m, drive_speed, timeout]() {
+            [this, target_m, drive_speed, timeout, steer_deg]() {
+            // Pass steer_deg so the control loop calls driveWithSteer() each tick
+            // instead of hardcoding 0 — preserves the rear-cam computed angle.
+            // skipArm=true: settle CMD already armed the motor; arm() would reset
+            // the ESP32 steer/motor state and cause ENC_FAIL (brief start, instant stop).
             StraightResult result = driver_->driveStraight(
-                target_m, false, drive_speed, timeout);
+                target_m, false, drive_speed, timeout, steer_deg, /*skipArm=*/true);
 
             RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
                 "Straight done: %s  dist=%.4fm  target=%.4fm",

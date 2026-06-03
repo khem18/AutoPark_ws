@@ -92,6 +92,18 @@ class AutoparkMaster(Node):
             ("arc_fallback_time_s",            12.0),
             ("min_clearance_m",                0.12),
             ("us_safety_start_delay_s",        0.50),   # grace period before US checks fire
+            # ── Rear-camera Move3 correction ──────────────────────────────
+            # Set rear_cam_enabled=False to fall back to planner d4 (old behaviour).
+            ("rear_cam_enabled",          True),
+            # rear_cam_stop_m: distance (m) from rear camera lens to the desired
+            # stop point at the slot back wall.
+            # = rear-cam offset from bumper (≈0.175 m) + desired bumper-to-wall gap (0.20 m)
+            ("rear_cam_stop_m",           0.375),
+            # Consecutive valid rear-cam frames needed before trusting the reading.
+            ("rear_cam_stable_samples",   5),
+            # Maximum time (s) to wait for stable rear-cam frames before giving up.
+            ("rear_cam_timeout_s",        5.0),
+            ("rear_cam_topic",            "/rear_parking_metrics"),
         ]:
             self.declare_parameter(name, default)
 
@@ -154,6 +166,10 @@ class AutoparkMaster(Node):
         self.arc_fallback_time_s           = float(gp("arc_fallback_time_s"))
         self.min_clearance_m               = float(gp("min_clearance_m"))
         self.us_safety_start_delay_s       = float(gp("us_safety_start_delay_s"))
+        self.rear_cam_enabled        = bool(gp("rear_cam_enabled"))
+        self.rear_cam_stop_m         = float(gp("rear_cam_stop_m"))
+        self.rear_cam_stable_samples = int(gp("rear_cam_stable_samples"))
+        self.rear_cam_timeout_s      = float(gp("rear_cam_timeout_s"))
 
         # State
         self.latest_pose:       Optional[Pose2D] = None
@@ -169,6 +185,11 @@ class AutoparkMaster(Node):
         self.esp32_steer_ready_seen:  bool       = False
         self.busy = False
         self.lock = threading.Lock()
+        # Rear-camera state (Move3 pre-measure)
+        self.rear_cam_dist_m:   Optional[float] = None   # metres to slot back wall
+        self.rear_cam_tilt_deg: Optional[float] = None   # yaw_rear in degrees
+        self.rear_cam_fresh:    bool            = False
+        self._rear_cam_count:   int             = 0      # frames since last activate
 
         # Encoder closed-loop result event — set when /enc_result arrives
         self.enc_result_event = threading.Event()
@@ -185,6 +206,9 @@ class AutoparkMaster(Node):
         self.create_subscription(Bool,              gp("esp32_steer_ready_topic"), self.on_esp32_steer_ready,  20)
         # v_next6: encoder_bridge publishes /enc_result when closed-loop straight move done
         self.create_subscription(String, "/enc_result", self.on_enc_result, 10)
+        # Rear camera metrics for Move3 pre-measure
+        self.create_subscription(Float32MultiArray, gp("rear_cam_topic"),
+                                 self.on_rear_cam_metrics, 10)
 
         self.cmd_pub  = self.create_publisher(String, gp("command_topic"), 10)
         self.plan_pub = self.create_publisher(String, gp("plan_topic"),    10)
@@ -193,6 +217,8 @@ class AutoparkMaster(Node):
             "autopark_master v_next4\n"
             f"  camera_check_enabled={self.camera_check_enabled}\n"
             f"  rear_us_stop={self.rear_ultrasonic_stop_m*1000:.0f}mm\n"
+            f"  rear_cam_enabled={self.rear_cam_enabled}  "
+            f"rear_cam_stop_m={self.rear_cam_stop_m:.3f}\n"
             "  Flowchart: cam_check_request → yellow/red LED → 2nd press → park → green LED")
 
     # ── Camera check request callback ─────────────────────────────────────
@@ -303,6 +329,119 @@ class AutoparkMaster(Node):
         self.enc_result_event.set()
         self.get_logger().info(f"ENC_RESULT received: {msg.data}")
 
+    def on_rear_cam_metrics(self, msg: Float32MultiArray):
+        """
+        Receives [tilt_deg, dist_cm] from rearcam_tracker on /rear_parking_metrics.
+        tilt_deg = yaw_rear (angle between car axis and slot lines, degrees)
+        dist_cm  = distance from rear camera to the slot back wall (cm)
+        NaN values mean the camera hasn't detected the lines yet.
+        """
+        data = list(msg.data)
+        if len(data) < 2:
+            return
+        tilt   = float(data[0])
+        dist_c = float(data[1])
+        if math.isnan(tilt) or math.isnan(dist_c) or dist_c <= 0.0:
+            return  # not yet a valid reading
+        self.rear_cam_tilt_deg = tilt
+        self.rear_cam_dist_m   = dist_c / 100.0
+        self.rear_cam_fresh    = True
+        self._rear_cam_count  += 1
+
+    # ── Rear-camera Move3 helpers ─────────────────────────────────────────
+
+    def _activate_rear_cam(self):
+        """
+        Ask rearcam_tracker to start processing frames.
+        Resets frame counter so _wait_rear_cam_stable() counts from NOW.
+        """
+        self.rear_cam_fresh   = False
+        self._rear_cam_count  = 0
+        self._cmd({"type": "rear_cam_activate"})
+        self.get_logger().info("Rear cam activated — waiting for stable reading")
+
+    def _wait_rear_cam_stable(self) -> bool:
+        """
+        Block until rear_cam_stable_samples consecutive valid frames arrive,
+        or rear_cam_timeout_s elapses.
+        Returns True if a usable reading was obtained (even with fewer frames
+        than requested if we at least got one valid frame before timeout).
+        """
+        deadline = time.monotonic() + self.rear_cam_timeout_s
+        while rclpy.ok() and time.monotonic() < deadline:
+            if self.rear_cam_fresh and self._rear_cam_count >= self.rear_cam_stable_samples:
+                self.get_logger().info(
+                    f"Rear cam stable: dist={self.rear_cam_dist_m:.3f}m "
+                    f"tilt={self.rear_cam_tilt_deg:+.1f}°  "
+                    f"(frames={self._rear_cam_count})")
+                return True
+            time.sleep(0.05)
+        # Timeout — return True anyway if we have at least 1 valid frame
+        if self.rear_cam_fresh:
+            self.get_logger().warning(
+                f"Rear cam: timeout but have 1 reading "
+                f"dist={self.rear_cam_dist_m:.3f}m tilt={self.rear_cam_tilt_deg:+.1f}° "
+                f"— using it")
+            return True
+        self.get_logger().warning("Rear cam: timeout with NO valid reading")
+        return False
+
+    def _compute_move3_from_rear_cam(self, motion: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Override Move3 steer_deg and dist_m using the rear camera reading.
+
+        Coordinate conventions (from diagram, page 101):
+          y_rear     = distance from rear camera to slot back wall  (metres)
+          yaw_rear   = tilt angle between car axis and slot axis    (degrees)
+          a          = y_rear * cos(yaw_rear)  → depth component
+          x_rear     = y_rear * sin(yaw_rear)  → lateral component
+
+        Formulas:
+          steer_move3 = -yaw_rear           (steer corrects angular misalignment)
+          d3 = sqrt( (a − rear_cam_stop_m)² + x_rear² )
+                                            (Euclidean distance to target)
+
+        rear_cam_stop_m ≈ 0.375 m
+          = camera-to-bumper offset (≈0.175 m) + desired bumper-to-wall gap (0.20 m)
+
+        Falls back to the planner's original motion if data is missing.
+        """
+        if self.rear_cam_dist_m is None or self.rear_cam_tilt_deg is None:
+            self.get_logger().warning("Move3 rear_cam: no data — keeping planner d4")
+            return motion
+
+        y_rear    = self.rear_cam_dist_m
+        yaw_rad   = math.radians(self.rear_cam_tilt_deg)
+        a         = y_rear * math.cos(yaw_rad)          # depth component
+        x_rear    = y_rear * math.sin(yaw_rad)          # lateral component
+
+        remaining_depth = a - self.rear_cam_stop_m
+        d3 = math.sqrt(remaining_depth ** 2 + x_rear ** 2)
+
+        # Clamp steer; note: no_imu_correct=True keeps is_turning=False so
+        # the encoder (not IMU arc) still controls the stop regardless of steer.
+        steer_deg = self.clamp(
+            -self.rear_cam_tilt_deg,
+            -self.max_command_steer_deg,
+            self.max_command_steer_deg)
+
+        self.get_logger().info(
+            f"Move3 rear_cam override: y_rear={y_rear:.3f}m  yaw={self.rear_cam_tilt_deg:+.1f}°\n"
+            f"  a={a:.3f}m  x_rear={x_rear:.3f}m  "
+            f"remaining_depth={remaining_depth:.3f}m\n"
+            f"  → d3={d3:.3f}m  steer={steer_deg:+.1f}°")
+
+        if d3 < 0.02:
+            self.get_logger().warning(
+                f"Move3: computed d3={d3:.4f}m is very small "
+                f"(car may already be near target) — clamping to 0.05 m")
+            d3 = 0.05
+
+        updated = dict(motion)
+        updated["dist_m"]    = round(d3, 4)
+        updated["steer_deg"] = round(steer_deg, 2)
+        return updated
+
     # ── Parking thread ────────────────────────────────────────────────────
     def _autopark_thread(self):
         try:
@@ -375,6 +514,32 @@ class AutoparkMaster(Node):
             seg   = i + 1
             label = str(motion.get("label", f"seg{seg}"))
             use_rear_us = bool(motion.get("use_rear_us", False))
+
+            # ── Rear camera detection + steer/dist calculation (Move 3) ───
+            # Flow (per page-101 diagram):
+            #   1. Activate rear cam
+            #   2. Block until back wall detected (camera within range)
+            #   3. Compute steer = -yaw_rear  and  d3 from formula
+            #   4. Steer settle (below) uses the computed steer_deg
+            #   5. _wait_steer_ready() → steer_ready fires when servo at target
+            #   6. Drive CMD sent → encoder_bridge drives d3 and publishes enc_result
+            # If camera times out: fall back to planner steer=0 / d4.
+            # During the actual drive, _wait_stop() also monitors real-time camera
+            # distance as an additional stop guard.
+            if motion.get("use_rear_cam", False) and self.rear_cam_enabled:
+                self.get_logger().info(
+                    f"Move3: activating rear cam — waiting for back-wall detection "
+                    f"(timeout={self.rear_cam_timeout_s:.0f}s, "
+                    f"need={self.rear_cam_stable_samples} frames)")
+                self._activate_rear_cam()
+                if self._wait_rear_cam_stable():
+                    motion = self._compute_move3_from_rear_cam(motion)
+                else:
+                    self.get_logger().warning(
+                        "Move3: rear cam timeout — using planner steer=0° / d4. "
+                        "Tip: check BEV calibration (SRC_POINTS) or increase "
+                        "rear_cam_timeout_s in YAML if wall is barely in range.")
+
             cmd   = self._motion_to_cmd(motion)
             dist  = float(cmd["target_dist_m"])
             dt    = float(cmd.get("master_duration", cmd["duration"]))  # pure travel time
@@ -386,7 +551,7 @@ class AutoparkMaster(Node):
             # check, causing Move1 to skip it and drive instantly without steering.
             no_imu_correct = bool(motion.get("no_imu_correct", False))
             if no_imu_correct:
-                is_turning = False   # Move1: encoder stops it, not IMU arc
+                is_turning = False   # encoder stops it, not IMU arc (Move1 & Move3)
 
             self.get_logger().info(
                 f"MOVE {seg}/{total} [{label}]  "
@@ -437,7 +602,8 @@ class AutoparkMaster(Node):
 
             stop, elapsed, retries = self._wait_stop(
                 dt, dist, cmd["steer_deg"], is_turning, use_rear_us,
-                imu_start, flow_start, seg, no_imu_correct=no_imu_correct)
+                imu_start, flow_start, seg, no_imu_correct=no_imu_correct,
+                use_rear_cam=bool(motion.get("use_rear_cam", False) and self.rear_cam_enabled))
 
             imu_d = self._adelta(imu_start, self.imu_yaw_deg)
             self.get_logger().info(
@@ -461,7 +627,8 @@ class AutoparkMaster(Node):
     # ── Wait / sensor stop ────────────────────────────────────────────────
     def _wait_stop(self, drive_time_s, dist_m, steer_deg, is_turning,
                    use_rear_us, imu_start, flow_start, seg,
-                   no_imu_correct: bool = False) -> Tuple[str,float,int]:
+                   no_imu_correct: bool = False,
+                   use_rear_cam:   bool = False) -> Tuple[str,float,int]:
         start_t = time.monotonic(); last_log = 0.0; retries = 0; stuck_done = False
         self._arc_peak = 0.0  # reset arc peak for reversal detection
 
@@ -530,6 +697,18 @@ class AutoparkMaster(Node):
             if not is_turning and self.enc_result_event.is_set():
                 return (f"enc_result_stop_seg_{seg}", elapsed, retries)
 
+            # Rear camera distance stop (Move3) — triggers when back wall enters
+            # camera range and dist ≤ rear_cam_stop_m (default 37.5 cm from lens).
+            # Fires BEFORE enc_result if the wall is reached sooner than planner d4.
+            # Grace period = us_safety_start_delay_s avoids false trigger at start.
+            if (use_rear_cam and elapsed >= self.us_safety_start_delay_s
+                    and self.rear_cam_fresh and self.rear_cam_dist_m is not None):
+                if self.rear_cam_dist_m <= self.rear_cam_stop_m:
+                    self.get_logger().info(
+                        f"  REAR_CAM_STOP: dist={self.rear_cam_dist_m*100:.1f}cm "
+                        f"≤ {self.rear_cam_stop_m*100:.0f}cm target")
+                    return (f"rear_cam_stop_seg_{seg}", elapsed, retries)
+
             # IMU straight heading correction
             # Uses the original gear from the motion command (positive = forward, negative = reverse).
             if imu_straight_correct and elapsed >= 0.3:
@@ -575,11 +754,13 @@ class AutoparkMaster(Node):
             # Log
             if now - last_log >= 0.5:
                 ru = f" rear_us={self.get_rear_us_m()*1000:.0f}mm" if use_rear_us else ""
+                rc = (f" rcam={self.rear_cam_dist_m*100:.0f}cm"
+                      if use_rear_cam and self.rear_cam_dist_m is not None else "")
                 ar = ""
                 if arc_trig:
                     ar = f" arc={abs(self._adelta(imu_start, self.imu_yaw_deg)):.1f}/{arc_trig:.1f}°"
                 self.get_logger().info(
-                    f"  DRIVE {elapsed:.2f}/{drive_time_s:.2f}s{ar}{ru}")
+                    f"  DRIVE {elapsed:.2f}/{drive_time_s:.2f}s{ar}{ru}{rc}")
                 last_log = now
 
             # Time fallback
@@ -700,10 +881,15 @@ class AutoparkMaster(Node):
             esp32_duration = dt + self.motor_start_delay_s
         else:
             esp32_duration = dt
+        # use_encoder=True: tells encoder_bridge to intercept this reverse move even when
+        # |steer_deg| exceeds straight_steer_thresh (5°). Required for rear-cam Move3
+        # which can have steer_deg = -yaw_rear (potentially > 5°).
+        use_encoder = bool(motion.get("use_encoder", False))
         return {"type":"drive","gear":gear,"speed_mps":cmd_speed,
                 "steer_deg":steer,"target_dist_m":dist,"duration":esp32_duration,
                 "master_duration": dt,          # pure travel time for _wait_stop
-                "steer_active_hold": steer_active_hold}
+                "steer_active_hold": steer_active_hold,
+                "use_encoder": use_encoder}
 
     # ── Sensors ───────────────────────────────────────────────────────────
     def get_ultrasonic_min_m(self) -> float:

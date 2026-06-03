@@ -117,21 +117,31 @@ class SerialBridge(Node):
             self.get_logger().error('drive serial NOT open')
             return
 
-        # v7 filter logic (replaces v6 steer-deg filter):
-        # Only skip forwarding while encoder_bridge is ACTIVELY DRIVING (enc_busy=True).
-        # When enc_busy=False (encoder not yet started or not valid), forward everything
-        # so the motor always gets a command even if encoder fallback is needed.
+        # v8 filter fix: only block REVERSE (gear<0) drive CMDs when enc_busy.
         #
-        # Why v6 filter was wrong: it blocked straight commands by steer_deg BEFORE
-        # encoder_bridge could confirm it was ready. If encoder isValid()=False,
-        # encoder_bridge would also skip the command → motor gets NOTHING.
+        # v7 was wrong: it blocked ALL speed>0 drive CMDs when enc_busy=True.
+        # For Monitor mode (Move1, gear=+1), encoder_bridge intercepts the CMD and
+        # publishes enc_busy=True. Due to DDS timing, that enc_busy=True notification
+        # can arrive at serial_bridge BEFORE serial_bridge processes its own copy of
+        # the same cmd_json message → serial_bridge blocks the CMD → car never drives
+        # → encoder sees 0m → 89s TIMEOUT.
+        #
+        # Correct behaviour by gear:
+        #   gear=+1 (forward, Monitor mode): encoder_bridge MONITORS only, does NOT
+        #     send motor commands via DriveSerial. serial_bridge MUST forward the CMD.
+        #     → NEVER block forward CMDs on enc_busy.
+        #   gear=-1 (reverse, Drive mode):  encoder_bridge drives via DriveSerial.
+        #     serial_bridge must stay silent to avoid port conflicts.
+        #     → Block reverse CMDs when enc_busy=True.
         if self.enc_busy:
             try:
                 obj = json.loads(msg.data)
-                if obj.get('type') == 'drive' and float(obj.get('speed_mps', 0)) > 0:
+                if (obj.get('type') == 'drive'
+                        and float(obj.get('speed_mps', 0)) > 0
+                        and int(obj.get('gear', 1)) < 0):        # reverse only
                     if self.debug_serial:
                         self.get_logger().info(
-                            f'SKIP (enc_busy=True): {msg.data.strip()[:80]}')
+                            f'SKIP (enc_busy=True, rev): {msg.data.strip()[:80]}')
                     return
             except Exception:
                 pass

@@ -154,7 +154,7 @@ def _analytical_plan(start_x: float, start_y: float,
     theta_0    = yaw_rad - math.pi           # yaw deviation from π (ideal = 0)
     theta_1    = theta_m1 - theta_0         # yaw change needed in Move1
 
-    d1_geo     = x0_lateral + R + 0.18            # original lateral formula (baseline)
+    d1_geo     = x0_lateral + R + 0.15            # original lateral formula (baseline)
 
     if abs(theta_1) < math.radians(1.0):
         # Nearly straight ahead — keep original formula, steer = 0
@@ -212,12 +212,28 @@ def _analytical_plan(start_x: float, start_y: float,
             # drive starts within 8° of -30°, continues within 20°
         },
         {
+            # ── Move 3: rear-camera-guided reverse into slot ───────────────
+            # steer_deg and dist_m below are PLANNER ESTIMATES used as fallbacks
+            # only if the rear camera times out. At runtime autopark_master
+            # overrides both values using the rear camera reading taken between
+            # Move 2 and Move 3 (see autopark_master._compute_move3_from_rear_cam):
+            #
+            #   y_rear   = dist from rear cam to slot back wall (m)
+            #   yaw_rear = tilt angle car vs slot axis (deg)
+            #   a        = y_rear · cos(yaw_rear)           # depth component
+            #   x_rear   = y_rear · sin(yaw_rear)           # lateral component
+            #   d3       = sqrt((a − 0.375)² + x_rear²)     # Euclidean drive dist
+            #   steer    = −yaw_rear                         # correct misalignment
+            #
+            # no_imu_correct=True keeps is_turning=False even when steer≠0,
+            # so the encoder (not IMU arc) remains the stop condition.
             "gear": -1, "steer_deg": 0.0, "dist_m": round(d4, 4),
             "label": "rev_straight_d4",
-            "use_rear_us": False,
-            "speed_override": "slow",
-            "steer_active_hold": True,    # motor holds 0° against spring
-            "no_imu_correct": True,       # Move3: encoder stops, NO IMU corrections
+            "use_rear_cam": True,          # triggers rear-cam pre-measure in autopark_master
+            "use_encoder":  True,          # forces encoder intercept even when steer≠0
+            "use_rear_us": False,          # encoder stop — rear US not used
+            "steer_active_hold": True,     # motor holds steer against spring return
+            "no_imu_correct": True,        # Move3: steer_ready then drive, encoder stops
         },
     ]
 
@@ -239,10 +255,12 @@ def _analytical_plan(start_x: float, start_y: float,
         "x_f": x_f, "y_f": y_f,
         "R_m": R,
         "d1_m": d1, "steer1_deg": round(steer1_deg, 2), "theta1_deg": round(math.degrees(theta_1), 2), "s23_m": s23, "theta_m1_deg": round(math.degrees(theta_m1), 2), "d4_m": d4,
+        "d4_fallback_m": round(d4, 4),   # planner estimate; overridden at runtime by rear cam
         # arc_end_depth: positive = arc dips into slot entrance (OK); negative = stays in aisle.
         "arc_end_depth_m": round(y0_depth + R, 4),
         "arc_in_aisle": (y0_depth + R) <= 0.01,
         "arc_steer_note": "+30° (RIGHT steer + reverse = CCW = correct direction)",
+        "move3_rear_cam": True,   # Move3 steer/dist overridden by rear camera at runtime
     }
 
     ok = (metrics["rear_clear"] >= 0.015
