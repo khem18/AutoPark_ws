@@ -164,26 +164,14 @@ def generate_launch_description():
                 'enc_rev_speed_mps':   0.04,
                 'straight_steer_thresh': 5.0,
                 # ── [v5] Passenger / heavy-load stuck detection ──────────────
-                # When the car carries passengers and stalls at the calibrated
-                # speed, the encoder detects no movement after stuck_check_s
-                # seconds and boosts the session speed by stuck_boost_mps.
-                # The boost repeats if still stuck, up to stuck_max_speed_mps.
-                # Session speed persists for the whole parking round.
-                # Tune: if car still stalls -> lower stuck_check_s or raise
-                #       stuck_boost_mps. If steering accuracy suffers at
-                #       high speed -> lower stuck_max_speed_mps.
-                'stuck_boost_mps':      0.020,   # +10 mm/s per stuck event
-                'stuck_max_speed_mps':  0.150,   # hard cap (150 mm/s)
-                'stuck_check_s':        3.0,     # seconds before declaring stuck
-                # [v7] Larger boost multiplier when car has moved 0m at first stuck check.
-                # Passengers stall the car from rest; 2x boost gets it moving sooner.
-                # Set to 1.0 to disable (same behaviour as v6).
-                'stuck_zero_boost_factor': 3.0,  # x2 boost if dist==0 at first stuck check
-                # [v7] Min encoder movement per stuck_check_s interval to NOT be stuck.
-                # Raised from 0.005m (5mm) to 0.050m (50mm) so a car carrying passengers
-                # that is moving slowly (e.g. 28mm/s → 84mm/3s) is still boosted.
-                # Tune down (e.g. 0.020) if empty-car boost fires too early.
-                'stuck_min_move_m':     0.080,
+                # Set stuck_boost_mps to 0.0 to disable all speed boosting and
+                # the Monitor→Drive mode transition (which can crash on thread
+                # teardown). The car always drives at the calibrated base speed.
+                'stuck_boost_mps':      0.0,     # 0 = no boost, no Drive-mode takeover
+                'stuck_max_speed_mps':  0.060,   # same as enc_fwd_speed_mps (cap = base)
+                'stuck_check_s':        3.0,
+                'stuck_zero_boost_factor': 1.0,  # disabled (boost=0 anyway)
+                'stuck_min_move_m':     0.001,   # 1 mm — any movement = not stuck
             }]
         ),
     ])

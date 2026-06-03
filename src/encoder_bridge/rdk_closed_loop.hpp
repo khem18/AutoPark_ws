@@ -148,6 +148,14 @@ public:
                    Config           cfg = Config{})
         : enc_(enc), drive_(drive), cfg_(cfg), abort_(false) {}
 
+    // ── Live steer update ──────────────────────────────────────
+    // Called while driveStraight() is running (from another thread).
+    // autopark_master sends a "steer_update" cmd when IMU detects drift
+    // during Move3 — encoder_bridge relays it here so the drive loop
+    // sends the corrected angle to ESP32 on the next 20 ms tick.
+    void setLiveSteer(float deg) { live_steer_.store(deg); }
+    float getLiveSteer()   const { return live_steer_.load(); }
+
     // ── driveStraight ──────────────────────────────────────────
     //  targetM    : distance [m] (positive always)
     //  forward    : true = forward, false = reverse
@@ -170,6 +178,7 @@ public:
         lastDistM_     = 0.0f;
         lastRightM_    = 0.0f;
         speedIntegral_ = 0.0f;
+        live_steer_.store(steerDeg);   // initialise; may be updated live by setLiveSteer()
 
         if (!enc_.isValid()) {
             printf("[CL] No encoder data\n");
@@ -284,7 +293,11 @@ public:
                            std::min(speedMps, targetSpeed + adj));
 
             // ── Send drive — hold commanded steer angle each tick ─
-            drive_.driveWithSteer(currentSpeed, gear, steerDeg, cfg_.cmd_duration);
+            // ── Send drive — hold live steer angle each tick ──────────────
+            // live_steer_ starts at steerDeg but can be updated mid-drive by
+            // autopark_master via "steer_update" → encoder_bridge.setLiveSteer()
+            // → corrects IMU drift while encoder controls distance.
+            drive_.driveWithSteer(currentSpeed, gear, live_steer_.load(), cfg_.cmd_duration);
 
             // ── Debug every 200 ms ─────────────────────────────
             static uint64_t dbg = 0;
@@ -323,7 +336,8 @@ private:
     EncSerialReader&  enc_;
     DriveSerial&      drive_;
     Config            cfg_;
-    std::atomic<bool> abort_;
+    std::atomic<bool>  abort_;
+    std::atomic<float> live_steer_{0.0f};  // updated by setLiveSteer() for IMU correction
     float             lastDistM_   = 0.0f;
     float             lastRightM_  = 0.0f;
     float             speedIntegral_ = 0.0f;

@@ -488,7 +488,7 @@ class AutoparkMaster(Node):
         # Clamp steer; note: no_imu_correct=True keeps is_turning=False so
         # the encoder (not IMU arc) still controls the stop regardless of steer.
         steer_deg = self.clamp(
-            -self.rear_cam_tilt_deg,
+            +self.rear_cam_tilt_deg,                  # +yaw_rear (corrected sign)
             -self.max_command_steer_deg,
             self.max_command_steer_deg)
 
@@ -721,13 +721,16 @@ class AutoparkMaster(Node):
         # IMU straight heading correction — only for straight moves (d1, d4).
         # If yaw drifts beyond imu_straight_correct_thresh_deg, send a corrective
         # steer command to nudge the car back on heading.
-        # no_imu_correct=True: Move1 drives straight after steer_ready with no IMU correction.
-        # Same as Move3 before IMU correction was added. Encoder stops the move.
+        # Move1 (gear=+1): sends type="drive" — passes serial_bridge (gear>0 not blocked).
+        # Move3 (gear=-1, use_rear_cam): IMU correction disabled — the encoder_bridge
+        #   drives with the rear-cam-computed steer_deg, and the car's wheel asymmetry
+        #   is a hardware issue that the IMU correction cannot reliably fix without
+        #   causing runaway drift accumulation. Use hardware calibration instead.
+        # no_imu_correct only disables the IMU ARC stop — straight correction is separate.
         imu_straight_correct = (
             not is_turning
             and self.imu_straight_correct_enabled
-            and abs(steer_deg) < 0.5   # only for nominally straight moves
-            and not no_imu_correct     # Move1 flag disables IMU correction
+            and not use_rear_cam   # Move3: encoder_bridge handles steer; IMU disabled
         )
         last_correction_t: float = 0.0
         current_correction_deg: float = 0.0
@@ -807,12 +810,10 @@ class AutoparkMaster(Node):
                     return (f"rear_cam_stop_seg_{seg}", elapsed, retries)
 
             # IMU straight heading correction
-            # Uses the original gear from the motion command (positive = forward, negative = reverse).
             if imu_straight_correct and elapsed >= 0.3:
                 drift = self._adelta(imu_start, self.imu_yaw_deg)
                 cmd_gear = 1 if seg == 1 else -1  # seg1=fwd_setup(+1), seg3=d4(-1)
                 if abs(drift) >= self.imu_straight_correct_thresh_deg:
-                    # P-controller: steer opposite to drift direction, clamped
                     new_corr = self.clamp(
                         -drift * self.imu_straight_correct_gain,
                         -self.imu_straight_correct_max_deg,
@@ -821,22 +822,33 @@ class AutoparkMaster(Node):
                             or now - last_correction_t >= 0.5):
                         current_correction_deg = new_corr
                         last_correction_t = now
-                        self._cmd({"type": "drive", "gear": cmd_gear,
-                                   "speed_mps": self.speed_scale,
-                                   "steer_deg": round(current_correction_deg, 1),
-                                   "duration": drive_time_s,
-                                   "steer_active_hold": True})
+                        if use_rear_cam and cmd_gear < 0:
+                            # Move3: encoder_bridge drives directly; serial_bridge
+                            # blocks gear<0 speed>0 CMDs.  Use steer_update so
+                            # encoder_bridge.setLiveSteer() corrects the angle
+                            # without aborting the running driveStraight().
+                            self._cmd({"type": "steer_update",
+                                       "steer_deg": round(current_correction_deg, 1)})
+                        else:
+                            # Move1: serial_bridge forwards gear>0 CMDs normally.
+                            self._cmd({"type": "drive", "gear": cmd_gear,
+                                       "speed_mps": self.speed_scale,
+                                       "steer_deg": round(current_correction_deg, 1),
+                                       "duration": drive_time_s,
+                                       "steer_active_hold": True})
                         self.get_logger().info(
                             f"  IMU_CORR drift={drift:.1f}° -> steer={current_correction_deg:.1f}°")
                 elif abs(drift) < self.imu_straight_correct_thresh_deg * 0.3 and current_correction_deg != 0.0:
-                    # Heading recovered — restore straight steer
                     current_correction_deg = 0.0
                     last_correction_t = now
-                    self._cmd({"type": "drive", "gear": cmd_gear,
-                               "speed_mps": self.speed_scale,
-                               "steer_deg": 0.0,
-                               "duration": drive_time_s,
-                               "steer_active_hold": True})
+                    if use_rear_cam and cmd_gear < 0:
+                        self._cmd({"type": "steer_update", "steer_deg": 0.0})
+                    else:
+                        self._cmd({"type": "drive", "gear": cmd_gear,
+                                   "speed_mps": self.speed_scale,
+                                   "steer_deg": 0.0,
+                                   "duration": drive_time_s,
+                                   "steer_active_hold": True})
                     self.get_logger().info("  IMU_CORR heading recovered -> steer=0°")
 
             # Stuck

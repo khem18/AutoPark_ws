@@ -215,6 +215,18 @@ private:
     void handle_command(const std::string& json) {
         std::string type = jsonStr(json, "type", "");
 
+        // ── steer_update: live steer correction from autopark_master ──
+        // Sent by the IMU straight-correction loop during Move3 encoder drive.
+        // Updates StraightDriver's live_steer_ atomic so the next DriveSerial
+        // tick uses the corrected angle.  Does NOT abort the running drive.
+        if (type == "steer_update") {
+            float new_steer = jsonFloat(json, "steer_deg", 0.0f);
+            driver_->setLiveSteer(new_steer);
+            RCLCPP_INFO(get_logger(),
+                "Live steer update: %.1f° (IMU drift correction)", new_steer);
+            return;
+        }
+
         // ── Non-drive: abort everything ───────────────────────
         if (type != "drive") {
             if (type == "stop" || type == "disarm" || type == "manual") {

@@ -120,18 +120,23 @@ private:
         s.timestampUs = nowUs();
         s.valid = true;
 
-        // Simple field extraction — no external JSON library needed
+        // Simple field extraction — no external JSON library needed.
+        // try-catch is essential: a truncated or corrupted serial packet from the
+        // encoder ESP32 (e.g. {"rd":  without a value) makes stof/stol throw
+        // std::invalid_argument, which kills the reader thread via std::terminate.
         auto getFloat = [&](const char* key) -> float {
             std::string k = std::string("\"") + key + "\":";
             auto pos = line.find(k);
             if (pos == std::string::npos) return 0.0f;
-            return std::stof(line.substr(pos + k.size()));
+            try   { return std::stof(line.substr(pos + k.size())); }
+            catch (...) { return 0.0f; }
         };
         auto getLong = [&](const char* key) -> long {
             std::string k = std::string("\"") + key + "\":";
             auto pos = line.find(k);
             if (pos == std::string::npos) return 0L;
-            return std::stol(line.substr(pos + k.size()));
+            try   { return std::stol(line.substr(pos + k.size())); }
+            catch (...) { return 0L; }
         };
 
         s.leftCount  = getLong("lc");
