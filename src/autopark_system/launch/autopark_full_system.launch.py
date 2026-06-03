@@ -157,12 +157,24 @@ def generate_launch_description():
                 'enc_port':            '/dev/ttyUSB0',
                 'drive_port':          '/dev/ttyUSB2',
                 'speed_scale':         0.01,
-                # Calibrated driving speeds from closed_loop_demo.cpp (pic 2):
-                # Move 1 forward  0.50 m real at 0.06 m/s → enc_fwd_speed_mps = 0.06
-                # Move 3 reverse  0.30 m real at 0.04 m/s → enc_rev_speed_mps = 0.04
+                # Calibrated driving speeds from closed_loop_demo.cpp (unloaded car):
+                # Move 1 forward  0.50 m real at 0.06 m/s -> enc_fwd_speed_mps = 0.06
+                # Move 3 reverse  0.30 m real at 0.04 m/s -> enc_rev_speed_mps = 0.04
                 'enc_fwd_speed_mps':   0.06,
                 'enc_rev_speed_mps':   0.04,
                 'straight_steer_thresh': 5.0,
+                # ── [v5] Passenger / heavy-load stuck detection ──────────────
+                # When the car carries passengers and stalls at the calibrated
+                # speed, the encoder detects no movement after stuck_check_s
+                # seconds and boosts the session speed by stuck_boost_mps.
+                # The boost repeats if still stuck, up to stuck_max_speed_mps.
+                # Session speed persists for the whole parking round.
+                # Tune: if car still stalls -> lower stuck_check_s or raise
+                #       stuck_boost_mps. If steering accuracy suffers at
+                #       high speed -> lower stuck_max_speed_mps.
+                'stuck_boost_mps':      0.010,   # +10 mm/s per stuck event
+                'stuck_max_speed_mps':  0.150,   # hard cap (150 mm/s)
+                'stuck_check_s':        3.0,     # seconds before declaring stuck
             }]
         ),
     ])

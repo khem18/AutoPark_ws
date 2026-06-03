@@ -1,23 +1,30 @@
 // ============================================================
-//  encoder_bridge.cpp  —  ROS2 encoder closed-loop bridge  v4
+//  encoder_bridge.cpp  —  ROS2 encoder closed-loop bridge  v6
 //
-//  FIXES vs v4:
-//  1. Reads "target_dist_m" (autopark_master field) in addition
-//     to "dist_m", so the planner distance is always used.
-//  2. Uses ROS2 params enc_fwd_speed_mps / enc_rev_speed_mps
-//     (calibrated from closed_loop_demo) instead of the
-//     autopark speed_scale value (which is too slow).
-//  3. arm_wait_ms reduced 1500→300 ms: steer is already settled
-//     before the drive command arrives (autopark_master waits
-//     steer_settle_pause_s before sending drive cmd).  The old
-//     1500 ms caused the car to coast ~1.5s under serial_bridge's
-//     command before encoder-loop kicked in — untracked distance.
-//  4. Publishes /enc_busy (Bool) so serial_bridge can skip
-//     forwarding straight commands while encoder is driving.
-//  [v5] Fix jsonStr: Python json.dumps uses "key": "val" (space);
-//       v4 searched "key":"val" → type always "" → never intercepted.
-//  [v5] Guard: if encoder isValid()=False, don't intercept (fallback
-//       to serial_bridge time-based stop until encoder is ready).
+//  CHANGES vs v5:
+//  [v6] Arc-move stuck detection (Move2 reverse arc / any curved reverse).
+//       v5 handled straight reverse and forward monitor; arc reverse was left
+//       to serial_bridge + IMU stop with no speed-boost when passengers stall
+//       the motor mid-arc.
+//
+//       New: arc_monitor_thread_ watches encoder during non-intercepted
+//       reverse arc commands (gear=-1, |steer_deg|>steer_thresh_).
+//         • Monitors encoder distance every stuck_check_s seconds.
+//         • If car hasn't moved stuck_min_move_m → boosts session_arc_rev_speed_
+//           by stuck_boost_mps_, sets enc_busy=True, takes over ttyUSB2 with
+//           driveWithSteer() at the boosted speed.
+//         • Boost repeats up to stuck_max_speed_mps.
+//         • session_arc_rev_speed_ is initialised from the first arc command
+//           speed_mps and persists for the whole parking round.
+//         • When autopark_master sends stop (IMU arc done), handle_command
+//           aborts arc_monitor, releases enc_busy, motor stops normally.
+//
+//  Existing v5 behaviour:
+//  [v5] Straight reverse (Move3): session_rev_speed_ by ref → boost in driveStraight().
+//  [v5] Forward monitor (Move1, incl. curved): stuck → driveStraight() takeover.
+//  [v5] Deadlock fix: abort driver_ before joining monitor_thread_.
+//  [v5] JSON fix: skip optional space after colon in parsed values.
+//  [v5] Encoder guard: fallback to serial_bridge when encoder not yet valid.
 // ============================================================
 
 #include <rclcpp/rclcpp.hpp>
@@ -54,15 +61,12 @@ static int jsonInt(const std::string& s, const char* key, int def = 0) {
 
 static std::string jsonStr(const std::string& s, const char* key,
                             const std::string& def = "") {
-    // FIX v5: skip optional space after colon — Python json.dumps produces
-    // "key": "value" (with space) but v4 searched for "key":"value" (no space).
-    // This caused type="" for ALL commands → encoder_bridge returned immediately.
     std::string k = std::string("\"") + key + "\":";
     auto pos = s.find(k);
     if (pos == std::string::npos) return def;
     size_t vp = pos + k.size();
-    while (vp < s.size() && s[vp] == ' ') vp++;   // skip optional space
-    if (vp >= s.size() || s[vp] != '"') return def; // must be opening quote
+    while (vp < s.size() && s[vp] == ' ') vp++;
+    if (vp >= s.size() || s[vp] != '"') return def;
     auto start = vp + 1;
     auto end   = s.find('"', start);
     if (end == std::string::npos) return def;
@@ -78,6 +82,14 @@ static bool jsonBool(const std::string& s, const char* key) {
     return s.substr(vp, 4) == "true";
 }
 
+// ── Timestamp helper (ms) ─────────────────────────────────────
+static inline uint64_t nowMs_br() {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(
+        duration_cast<milliseconds>(
+            steady_clock::now().time_since_epoch()).count());
+}
+
 
 // ── EncoderBridgeNode ─────────────────────────────────────────
 class EncoderBridgeNode : public rclcpp::Node {
@@ -90,11 +102,13 @@ public:
         declare_parameter("drive_port",            "/dev/ttyUSB2");
         declare_parameter("straight_steer_thresh", 5.0);
         declare_parameter("speed_scale",           0.01);
-        // ── v4: calibrated driving speeds (from closed_loop_demo.cpp)
-        // Move 1 fwd_setup  → 0.06 m/s  (calibrated: real dist = 0.50m ✓)
-        // Move 3 rev_d4     → 0.04 m/s  (calibrated: real dist = 0.30m ✓)
         declare_parameter("enc_fwd_speed_mps",     0.06);
         declare_parameter("enc_rev_speed_mps",     0.04);
+
+        // ── [v5] Stuck detection / session speed boost params ──────────────
+        declare_parameter("stuck_boost_mps",      0.010);
+        declare_parameter("stuck_max_speed_mps",  0.150);
+        declare_parameter("stuck_check_s",        3.0);
 
         enc_port_         = get_parameter("enc_port").as_string();
         drive_port_       = get_parameter("drive_port").as_string();
@@ -103,12 +117,24 @@ public:
         enc_fwd_speed_    = (float)get_parameter("enc_fwd_speed_mps").as_double();
         enc_rev_speed_    = (float)get_parameter("enc_rev_speed_mps").as_double();
 
+        stuck_boost_mps_    = (float)get_parameter("stuck_boost_mps").as_double();
+        stuck_max_speed_    = (float)get_parameter("stuck_max_speed_mps").as_double();
+        stuck_check_s_      = (float)get_parameter("stuck_check_s").as_double();
+        stuck_min_move_m_   = 0.005f;
+
+        // Session speeds — start at calibrated values, never reset within a round.
+        session_fwd_speed_  = enc_fwd_speed_;
+        session_rev_speed_  = enc_rev_speed_;
+        session_arc_rev_speed_ = 0.0f;   // [v6] set from first arc command
+
         RCLCPP_INFO(get_logger(),
             "enc=%s  drive=%s  thresh=%.1f°  speed_scale=%.4f"
-            "  fwd_spd=%.3f  rev_spd=%.3f",
+            "  fwd_spd=%.3f  rev_spd=%.3f"
+            "  stuck_boost=%.3f  stuck_max=%.3f  stuck_check=%.1fs",
             enc_port_.c_str(), drive_port_.c_str(),
             steer_thresh_, speed_scale_,
-            enc_fwd_speed_, enc_rev_speed_);
+            enc_fwd_speed_, enc_rev_speed_,
+            stuck_boost_mps_, stuck_max_speed_, stuck_check_s_);
 
         try {
             drive_ = std::make_unique<DriveSerial>(drive_port_.c_str());
@@ -119,16 +145,18 @@ public:
         }
 
         StraightDriveConfig cfg;
-        cfg.slowdown_m    = 0.15f;   // start ramp-down 15 cm before target
+        cfg.slowdown_m    = 0.15f;
         cfg.stop_thresh_m = 0.02f;
         cfg.min_speed_mps = 0.025f;
         cfg.speed_kp      = 0.4f;
         cfg.speed_ki      = 0.08f;
-        cfg.enc_check_s   = 4.0f;
-        cfg.enc_check_m   = 0.005f;
-        // v4: 300 ms — steer is already at target before drive cmd arrives.
-        // The old 1500 ms caused ~1.5 s of untracked motion from serial_bridge.
+        cfg.enc_check_s   = stuck_check_s_;
+        cfg.enc_check_m   = stuck_min_move_m_;
         cfg.arm_wait_ms   = 300.0f;
+        cfg.stuck_boost_mps     = stuck_boost_mps_;
+        cfg.stuck_max_speed_mps = stuck_max_speed_;
+        cfg.stuck_check_s       = stuck_check_s_;
+        cfg.stuck_min_move_m    = stuck_min_move_m_;
 
         driver_ = std::make_unique<StraightDriver>(*enc_, *drive_, cfg);
 
@@ -140,11 +168,8 @@ public:
 
         pub_status_ = create_publisher<std_msgs::msg::String>("/enc_status", 10);
         pub_result_ = create_publisher<std_msgs::msg::String>("/enc_result", 10);
-        // v4: publish busy flag so serial_bridge can skip forwarding straight cmds
         pub_busy_   = create_publisher<std_msgs::msg::Bool>("/enc_busy", 10);
 
-        // Subscribe to steer_ready: used by monitor thread to confirm
-        // steer servo has physically settled AFTER the drive CMD arrives.
         create_subscription<std_msgs::msg::Bool>(
             "/autopark/esp32_steer_ready", 20,
             [this](const std_msgs::msg::Bool::SharedPtr msg) {
@@ -155,13 +180,14 @@ public:
             std::chrono::milliseconds(100),
             [this]() { publish_status(); });
 
-        // Reset encoder boot counts
         {
             int fd = ::open(enc_port_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
             if (fd >= 0) { ::write(fd, "r\n", 2); ::close(fd); }
         }
 
-        RCLCPP_INFO(get_logger(), "Encoder bridge ready");
+        RCLCPP_INFO(get_logger(), "Encoder bridge v6 ready"
+            "  session_fwd=%.3f  session_rev=%.3f  session_arc=%.3f",
+            session_fwd_speed_, session_rev_speed_, session_arc_rev_speed_);
     }
 
 private:
@@ -174,9 +200,19 @@ private:
     void handle_command(const std::string& json) {
         std::string type = jsonStr(json, "type", "");
 
-        // ── Non-drive: abort drive, let serial_bridge handle ───
+        // ── Non-drive: abort everything ───────────────────────
         if (type != "drive") {
             if (type == "stop" || type == "disarm" || type == "manual") {
+                // [v5] abort driver_ BEFORE joining threads (deadlock fix)
+                driver_->abort();
+
+                // [v6] Abort arc monitor first
+                if (arc_monitor_thread_.joinable()) {
+                    arc_monitor_abort_.store(true);
+                    arc_monitor_thread_.join();
+                    arc_monitor_abort_.store(false);
+                }
+
                 if (monitor_thread_.joinable()) {
                     monitor_abort_.store(true);
                     monitor_thread_.join();
@@ -198,7 +234,6 @@ private:
         float steer_deg  = jsonFloat(json, "steer_deg", 0.0f);
         float duration   = jsonFloat(json, "duration", 0.0f);
 
-        // v4: read both "dist_m" (standalone) and "target_dist_m" (autopark_master)
         float dist_m_raw = jsonFloat(json, "dist_m", -1.0f);
         if (dist_m_raw < 0.001f)
             dist_m_raw = jsonFloat(json, "target_dist_m", -1.0f);
@@ -207,28 +242,18 @@ private:
 
         RCLCPP_INFO(get_logger(),
             "CMD  gear=%+d speed=%.4f steer=%.1f° dur=%.2f "
-            "dist_m=%.4f active_hold=%d",
-            gear, speed_mps, steer_deg, duration, dist_m_raw, (int)act_hold);
+            "dist_m=%.4f active_hold=%d"
+            "  sess_fwd=%.4f  sess_rev=%.4f  sess_arc=%.4f",
+            gear, speed_mps, steer_deg, duration, dist_m_raw, (int)act_hold,
+            session_fwd_speed_, session_rev_speed_, session_arc_rev_speed_);
 
-        // ── Straight move condition ────────────────────────────
-        bool speed_ok = speed_mps > 0.0f;
-        bool gear_ok  = gear != 0;
-        bool dist_ok  = dist_m_raw > 0.001f;   // explicit target distance required
-        bool steer_ok = std::fabs(steer_deg) <= steer_thresh_;
-
-        // use_encoder=true: autopark_master sets this on Move3 when the rear-camera
-        // computed steer may exceed steer_thresh_ (5°). Forces encoder handling even
-        // for non-straight reverse, so the encoder (not the time-fallback) stops the move.
-        // The steer angle is still held by the ESP32 via the long-duration settle CMD
-        // (steer_active_hold=true) — encoder_bridge only controls motor speed/distance.
+        // ── Straight/encoder intercept condition ───────────────
+        bool speed_ok  = speed_mps > 0.0f;
+        bool gear_ok   = gear != 0;
+        bool dist_ok   = dist_m_raw > 0.001f;
+        bool steer_ok  = std::fabs(steer_deg) <= steer_thresh_;
         bool enc_force = jsonBool(json, "use_encoder");
 
-        // Intercept rule:
-        //   Forward (gear>0): encoder handles ALL moves by distance,
-        //     including Move1 curved setup (steer≈-23°). IMU NOT used for Move1.
-        //   Reverse (gear<0): intercept when |steer|≤thresh (straight Move3)
-        //                     OR when use_encoder=true (rear-cam Move3, any steer).
-        //     Move2 arc (steer=+30°, use_encoder absent) → excluded → IMU stops it. ✓
         bool intercept = speed_ok && gear_ok && dist_ok &&
                          (gear > 0 || steer_ok || enc_force);
 
@@ -239,12 +264,7 @@ private:
                 (gear < 0 && !steer_ok && !enc_force) ? "Arc reverse — IMU handles"
                                                        : "No target dist or zero speed",
                 gear, (int)speed_ok, (int)dist_ok, (int)steer_ok, (int)enc_force);
-            // FIX: do NOT abort running drive when rejecting a command.
-            // Any settle CMD (speed=0, any gear) means autopark_master is about to
-            // wait for a fresh steer_ready signal — reset the flag so a stale
-            // signal from the previous move cannot leak through.
-            // Previously only gear>0 was handled; gear<0 (Move3 reverse settle)
-            // was silently skipped → flag could carry over from Move1/Move2.
+
             if (!speed_ok) {
                 steer_ready_flag_.store(false);
                 RCLCPP_INFO(get_logger(),
@@ -252,25 +272,36 @@ private:
                     "steer_ready_flag reset, awaiting servo",
                     gear, steer_deg);
             }
+
+            // ── [v6] Arc reverse stuck monitor ─────────────────
+            // serial_bridge + IMU handle the arc stop, but if the car
+            // stalls due to passenger weight we need to boost the speed.
+            // Start arc_monitor_thread_ to watch encoder and take over
+            // with driveWithSteer() at a boosted speed if stuck.
+            if (speed_ok && gear_ok && gear < 0 && dist_ok) {
+                // Initialise session_arc_rev_speed_ from the command the first
+                // time we see an arc command (or if command is faster than
+                // current session — e.g. after a reset).
+                if (speed_mps > session_arc_rev_speed_)
+                    session_arc_rev_speed_ = speed_mps;
+
+                startArcMonitor(gear, steer_deg);
+            }
+
             return;
         }
 
         // ── Compute target distance ────────────────────────────
         float target_m;
-
         if (dist_m_raw > 0.001f) {
-            // Priority 1: planner value (target_dist_m or dist_m)
             target_m = dist_m_raw;
             RCLCPP_INFO(get_logger(),
                 "  → Straight (dist from cmd): target=%.4fm", target_m);
-
         } else {
-            // Priority 2: speed × duration, corrected for speed_scale
             float base_speed = (speed_scale_ > 0.0001f)
                                 ? speed_mps / speed_scale_
                                 : speed_mps;
             target_m = base_speed * duration;
-
             RCLCPP_INFO(get_logger(),
                 "  → Straight: speed=%.4f/scale%.4f=%.4f × dur%.2f"
                 " = target=%.4fm",
@@ -284,11 +315,6 @@ private:
             return;
         }
 
-        // ── Guard: encoder must have valid data ────────────────
-        // If the encoder ESP32 hasn't sent data yet (isValid=False),
-        // don't intercept — return and let serial_bridge handle with
-        // time-based stop as fallback.  This also logs the pktCount
-        // so you can see if data is arriving at all.
         if (!enc_ || !enc_->isValid()) {
             RCLCPP_WARN(get_logger(),
                 "  → Encoder NOT valid (pkts=%u) — serial_bridge handles (time-based fallback)",
@@ -298,54 +324,14 @@ private:
 
         bool forward = (gear > 0);
 
-        // ── MONITOR MODE: gear=+1 (Move1 forward curved) ─────────────────
-        // serial_bridge + ESP32 control speed & steer. encoder_bridge only
-        // monitors wheel distance and publishes enc_result when target reached.
-        // enc_busy stays FALSE so serial_bridge does NOT filter drive cmds,
-        // ensuring ESP32 keeps receiving the correct steer angle (-14.5°).
+        // ── FORWARD (gear=+1): Monitor mode with v5 stuck detection ──────
         if (forward) {
-            // ── DRIVE MODE for forward/curved Move1 ──────────────────────
-            // Same as Move3 Drive mode:
-            //   enc_busy=True → serial_bridge BLOCKS the drive CMD
-            //   → ESP32 NEVER receives the drive CMD
-            //   → ESP32 steer stays from the settle CMD (no transition!)
-            //   → DriveSerial sends speed + CORRECT steer angle
-            //
-            // Root cause of old Monitor mode failure:
-            //   Monitor mode left enc_busy=False → serial_bridge forwarded
-            //   the drive CMD to ESP32 → ESP32 transitioned steer → brief
-            //   steer deviation at drive start → partial curve in Move1.
-            //
-            // Fix: block the drive CMD (enc_busy=True) and use driveWithSteer()
-            //   which passes the actual steer angle from the motion (-14.5°).
-            //   Settle CMD (still active, 12s duration) keeps steer on ESP32.
-            //   No transition, no steer deviation. Exactly like Move3. ✓
-            if (monitor_thread_.joinable()) {
-                monitor_abort_.store(true);
-                monitor_thread_.join();
-                monitor_abort_.store(false);
+            driver_->abort();
+            if (arc_monitor_thread_.joinable()) {   // [v6]
+                arc_monitor_abort_.store(true);
+                arc_monitor_thread_.join();
+                arc_monitor_abort_.store(false);
             }
-            if (drive_thread_.joinable()) {
-                driver_->abort();
-                drive_thread_.join();
-            }
-
-            float timeout    = target_m / 0.025f + 30.0f;
-            float drive_speed = enc_fwd_speed_;   // calibrated forward speed (0.06 m/s)
-
-            RCLCPP_INFO(get_logger(),
-                "  Safety timeout=%.1fs  (%.3fm / 0.025 m/s + 30s buffer)",
-                timeout, target_m);
-            RCLCPP_INFO(get_logger(),
-                "  → Encoder drive: target=%.4fm  speed=%.3f m/s  steer=%.1f°  gear=+1",
-                target_m, drive_speed, steer_deg);
-
-            // ── MONITOR MODE for Move1 (gear=+1, curved) ──────────────────
-            // enc_busy stays FALSE → serial_bridge forwards the drive CMD to ESP32
-            // using the SAME channel as the settle CMD.
-            // ESP32 transitions: speed 0→0.01, SAME steer → no servo re-init,
-            // no channel switch, no spring transient. ✓
-            // encoder_bridge just monitors encoder distance and publishes enc_result.
             if (monitor_thread_.joinable()) {
                 monitor_abort_.store(true);
                 monitor_thread_.join();
@@ -358,11 +344,12 @@ private:
 
             float safety_s = target_m / 0.025f + 30.0f;
             RCLCPP_INFO(get_logger(),
-                "  → Monitor mode (serial_bridge→ESP32): target=%.4fm  safety=%.1fs",
-                target_m, safety_s);
+                "  → Monitor mode (serial_bridge→ESP32): target=%.4fm"
+                "  safety=%.1fs  session_fwd=%.4f",
+                target_m, safety_s, session_fwd_speed_);
 
             monitor_thread_ = std::thread(
-                [this, target_m, safety_s]() {
+                [this, target_m, safety_s, steer_deg]() {
                 try {
                     for (int i = 0; i < 30 && !enc_->isValid(); i++)
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -370,11 +357,68 @@ private:
                     float start_dist = enc_->getSnapshot().rightDistM;
                     auto  t_start    = std::chrono::steady_clock::now();
 
+                    uint64_t stuckNextMs  = static_cast<uint64_t>(stuck_check_s_ * 1000.0f);
+                    float    stuckRefDist = 0.0f;
+                    bool     in_drive_mode = false;
+
                     while (!monitor_abort_.load()) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(20));
                         float dist    = std::fabs(enc_->getSnapshot().rightDistM - start_dist);
                         float elapsed = std::chrono::duration<float>(
                             std::chrono::steady_clock::now() - t_start).count();
+                        auto  elapsedMs = static_cast<uint64_t>(elapsed * 1000.0f);
+
+                        if (!in_drive_mode && elapsedMs >= stuckNextMs) {
+                            float moved = dist - stuckRefDist;
+                            if (moved < stuck_min_move_m_) {
+                                float oldSpeed = session_fwd_speed_;
+                                session_fwd_speed_ = std::min(
+                                    session_fwd_speed_ + stuck_boost_mps_,
+                                    stuck_max_speed_);
+                                float remaining   = std::max(0.001f, target_m - dist);
+                                float rem_timeout = std::max(5.0f, safety_s - elapsed + 5.0f);
+
+                                RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
+                                    "Fwd Monitor STUCK (moved=%.5fm in %.1fs)"
+                                    " → boost session_fwd %.4f→%.4f m/s"
+                                    " → Drive mode, remaining=%.4fm",
+                                    moved, elapsed,
+                                    oldSpeed, session_fwd_speed_, remaining);
+
+                                set_busy(true);
+                                in_drive_mode = true;
+
+                                StraightResult res = driver_->driveStraight(
+                                    remaining, true,
+                                    session_fwd_speed_,
+                                    rem_timeout,
+                                    steer_deg,
+                                    /*skipArm=*/true);
+
+                                set_busy(false);
+
+                                float total_dist = dist + driver_->lastDist();
+                                const char* res_str = straightResultName(res);
+
+                                RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
+                                    "Monitor→Drive done: %s"
+                                    "  total_dist=%.4fm  target=%.4fm"
+                                    "  session_fwd now=%.4f",
+                                    res_str, total_dist, target_m, session_fwd_speed_);
+
+                                auto msg = std_msgs::msg::String();
+                                char buf[256];
+                                snprintf(buf, sizeof(buf),
+                                    "{\"enc_result\":\"%s\","
+                                    "\"dist\":%.4f,\"target\":%.4f}",
+                                    res_str, total_dist, target_m);
+                                msg.data = buf;
+                                pub_result_->publish(msg);
+                                return;
+                            }
+                            stuckRefDist  = dist;
+                            stuckNextMs  += static_cast<uint64_t>(stuck_check_s_ * 1000.0f);
+                        }
 
                         if (dist < target_m && elapsed < safety_s) continue;
 
@@ -392,10 +436,11 @@ private:
                         pub_result_->publish(msg);
                         return;
                     }
-                } catch (const std::exception & e) {
+                } catch (const std::exception& e) {
                     RCLCPP_ERROR(rclcpp::get_logger("encoder_bridge"),
                         "Monitor thread exception: %s — publishing TIMEOUT", e.what());
                     try {
+                        set_busy(false);
                         auto msg = std_msgs::msg::String();
                         char buf[256];
                         snprintf(buf, sizeof(buf),
@@ -407,17 +452,22 @@ private:
                 } catch (...) {
                     RCLCPP_ERROR(rclcpp::get_logger("encoder_bridge"),
                         "Monitor thread unknown exception");
+                    set_busy(false);
                 }
             });
-            return;  // enc_busy stays FALSE — serial_bridge forwards drive CMD
+            return;
         }
 
-        // ── DRIVE MODE: gear=-1 (Move3 reverse straight) ─────────────────
-        // encoder_bridge controls speed+distance via driveStraight().
-        // enc_busy=True blocks serial_bridge from forwarding speed commands.
-        // Clean up monitor_thread_ from Move1 before starting drive thread.
+        // ── REVERSE straight (gear=-1): Drive mode ─────────────────────────
+        driver_->abort();
+        if (arc_monitor_thread_.joinable()) {   // [v6]
+            arc_monitor_abort_.store(true);
+            arc_monitor_thread_.join();
+            arc_monitor_abort_.store(false);
+        }
         if (monitor_thread_.joinable()) {
             monitor_abort_.store(true);
+            driver_->abort();
             monitor_thread_.join();
             monitor_abort_.store(false);
         }
@@ -426,31 +476,34 @@ private:
             drive_thread_.join();
         }
 
-        float timeout    = target_m / 0.025f + 30.0f;
-        float drive_speed = enc_rev_speed_;
+        float timeout = target_m / 0.025f + 30.0f;
 
         RCLCPP_INFO(get_logger(),
             "  Safety timeout=%.1fs  (%.3fm / 0.025 m/s + 30s buffer)",
             timeout, target_m);
         RCLCPP_INFO(get_logger(),
-            "  → Encoder drive: target=%.4fm  speed=%.3f m/s  steer=%.1f°  gear=-1%s",
-            target_m, drive_speed, steer_deg,
+            "  → Encoder drive (rev): target=%.4fm  session_rev_speed=%.4f m/s"
+            "  steer=%.1f°  gear=-1%s",
+            target_m, session_rev_speed_, steer_deg,
             enc_force ? "  (use_encoder forced — rear-cam steer)" : "");
 
         set_busy(true);
 
         drive_thread_ = std::thread(
-            [this, target_m, drive_speed, timeout, steer_deg]() {
-            // Pass steer_deg so the control loop calls driveWithSteer() each tick
-            // instead of hardcoding 0 — preserves the rear-cam computed angle.
-            // skipArm=true: settle CMD already armed the motor; arm() would reset
-            // the ESP32 steer/motor state and cause ENC_FAIL (brief start, instant stop).
+            [this, target_m, timeout, steer_deg]() {
             StraightResult result = driver_->driveStraight(
-                target_m, false, drive_speed, timeout, steer_deg, /*skipArm=*/true);
+                target_m,
+                false,
+                session_rev_speed_,
+                timeout,
+                steer_deg,
+                /*skipArm=*/true);
 
             RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
-                "Straight done: %s  dist=%.4fm  target=%.4fm",
-                straightResultName(result), driver_->lastDist(), target_m);
+                "Straight done: %s  dist=%.4fm  target=%.4fm"
+                "  session_rev now=%.4f",
+                straightResultName(result), driver_->lastDist(), target_m,
+                session_rev_speed_);
 
             set_busy(false);
 
@@ -464,22 +517,144 @@ private:
         });
     }
 
+    // ── [v6] Arc stuck monitor ─────────────────────────────────────────────
+    // Called for non-intercepted reverse arc commands (Move2, gear=-1, steer>thresh).
+    // serial_bridge + IMU still control arc stop.  This thread watches encoder
+    // distance; if the car stalls it takes over ttyUSB2 at a boosted speed.
+    // When autopark_master sends stop (IMU arc done), handle_command aborts it.
+    void startArcMonitor(int gear, float steer_deg) {
+        // Abort previous arc monitor if any
+        if (arc_monitor_thread_.joinable()) {
+            arc_monitor_abort_.store(true);
+            arc_monitor_thread_.join();
+            arc_monitor_abort_.store(false);
+        }
+
+        RCLCPP_INFO(get_logger(),
+            "[v6] Arc monitor start: gear=%d steer=%.1f° session_arc=%.4f m/s",
+            gear, steer_deg, session_arc_rev_speed_);
+
+        arc_monitor_thread_ = std::thread([this, gear, steer_deg]() {
+            try {
+                // Wait for encoder to be ready
+                for (int i = 0; i < 30 && !enc_->isValid(); i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+                if (!enc_->isValid()) {
+                    RCLCPP_WARN(rclcpp::get_logger("encoder_bridge"),
+                        "Arc monitor: encoder not valid — skipping");
+                    return;
+                }
+
+                float    startRight   = enc_->getSnapshot().rightDistM;
+                uint64_t stuckNextMs  = nowMs_br() +
+                    static_cast<uint64_t>(stuck_check_s_ * 1000.0f);
+                float    stuckRefDist = 0.0f;
+                int      boostCount   = 0;
+                bool     in_boost     = false;
+
+                while (!arc_monitor_abort_.load()) {
+                    uint64_t loopStart = nowMs_br();
+
+                    float dist = std::fabs(enc_->getSnapshot().rightDistM - startRight);
+
+                    // ── Stuck check every stuck_check_s ────────────────────
+                    if (nowMs_br() >= stuckNextMs) {
+                        float moved = dist - stuckRefDist;
+                        if (moved < stuck_min_move_m_) {
+                            if (session_arc_rev_speed_ < stuck_max_speed_) {
+                                float old = session_arc_rev_speed_;
+                                session_arc_rev_speed_ = std::min(
+                                    session_arc_rev_speed_ + stuck_boost_mps_,
+                                    stuck_max_speed_);
+                                boostCount++;
+
+                                if (!in_boost) {
+                                    set_busy(true);   // block serial_bridge arc cmd
+                                    in_boost = true;
+                                }
+
+                                RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
+                                    "[v6] Arc STUCK #%d (moved=%.5fm in %.1fs)"
+                                    " → boost %.4f→%.4f m/s  steer=%.1f°",
+                                    boostCount, moved, stuck_check_s_,
+                                    old, session_arc_rev_speed_, steer_deg);
+                            } else {
+                                RCLCPP_WARN(rclcpp::get_logger("encoder_bridge"),
+                                    "[v6] Arc STUCK at max speed %.4f (moved=%.5fm)"
+                                    " — waiting for IMU arc stop",
+                                    session_arc_rev_speed_, moved);
+                            }
+                        }
+                        stuckRefDist = dist;
+                        stuckNextMs += static_cast<uint64_t>(stuck_check_s_ * 1000.0f);
+                    }
+
+                    // ── Drive at boosted speed every loop tick ─────────────
+                    if (in_boost) {
+                        drive_->driveWithSteer(session_arc_rev_speed_, gear,
+                                               steer_deg, 0.3f);
+                    }
+
+                    // ── Sleep remainder of 20 ms loop ──────────────────────
+                    uint64_t elapsed = nowMs_br() - loopStart;
+                    if (elapsed < 20)
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(20 - elapsed));
+                }
+
+                // ── Clean exit ─────────────────────────────────────────────
+                if (in_boost) {
+                    drive_->stop("arc_boost_done");
+                    set_busy(false);
+                }
+
+                RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
+                    "[v6] Arc monitor done: boosts=%d  session_arc=%.4f m/s",
+                    boostCount, session_arc_rev_speed_);
+
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(rclcpp::get_logger("encoder_bridge"),
+                    "[v6] Arc monitor exception: %s", e.what());
+                set_busy(false);
+            } catch (...) {
+                RCLCPP_ERROR(rclcpp::get_logger("encoder_bridge"),
+                    "[v6] Arc monitor unknown exception");
+                set_busy(false);
+            }
+        });
+    }
+
     void publish_status() {
         if (!enc_ || !enc_->isValid()) return;
         auto snap = enc_->getSnapshot();
         char buf[256];
         snprintf(buf, sizeof(buf),
-            "{\"rc\":%ld,\"rd\":%.4f,\"rrpm\":%.2f,\"rspd\":%.3f}",
+            "{\"rc\":%ld,\"rd\":%.4f,\"rrpm\":%.2f,\"rspd\":%.3f"
+            ",\"sess_fwd\":%.4f,\"sess_rev\":%.4f,\"sess_arc\":%.4f}",
             snap.rightCount, snap.rightDistM,
-            snap.rightWRpm, snap.rightSpeedMs);
+            snap.rightWRpm,  snap.rightSpeedMs,
+            session_fwd_speed_, session_rev_speed_, session_arc_rev_speed_);
         auto msg = std_msgs::msg::String();
         msg.data = buf;
         pub_status_->publish(msg);
     }
 
+    // ── Members ──────────────────────────────────────────────────────────────
     std::string enc_port_, drive_port_;
     float       steer_thresh_, speed_scale_;
-    float       enc_fwd_speed_, enc_rev_speed_;  // v4
+    float       enc_fwd_speed_, enc_rev_speed_;
+
+    // Session speeds — persist for the whole parking round
+    float session_fwd_speed_;        // Move1 forward  (boosted by monitor thread)
+    float session_rev_speed_;        // Move3 reverse straight (boosted by driveStraight ref)
+    float session_arc_rev_speed_;    // [v6] Move2 arc reverse (boosted by arc monitor)
+
+    // Stuck detection parameters
+    float stuck_boost_mps_;
+    float stuck_max_speed_;
+    float stuck_check_s_;
+    float stuck_min_move_m_;
 
     std::unique_ptr<DriveSerial>      drive_;
     std::unique_ptr<EncSerialReader>  enc_;
@@ -492,9 +667,13 @@ private:
     rclcpp::TimerBase::SharedPtr                           timer_;
 
     std::thread drive_thread_;
-    std::thread monitor_thread_;        // forward move distance monitor
+    std::thread monitor_thread_;
     std::atomic<bool> monitor_abort_{false};
-    std::atomic<bool> steer_ready_flag_{false};  // set by /esp32_steer_ready
+    std::atomic<bool> steer_ready_flag_{false};
+
+    // [v6] Arc move stuck monitor
+    std::thread arc_monitor_thread_;
+    std::atomic<bool> arc_monitor_abort_{false};
 };
 
 

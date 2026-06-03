@@ -1,13 +1,19 @@
 #pragma once
 // ============================================================
-//  rdk_closed_loop.hpp  —  v4  Single-Encoder Straight Drive
+//  rdk_closed_loop.hpp  —  v5  Single-Encoder Straight Drive
+//
+//  CHANGES vs v4:
+//  [v5] Stuck-detection replaces ENC_FAIL for passenger/heavy-load support.
+//       When the car does not move after `stuck_check_s` seconds,
+//       driveStraight() BOOSTS speedMps by `stuck_boost_mps` instead of
+//       returning ENC_FAIL.  speedMps is passed by REFERENCE so the caller's
+//       "session speed" variable is updated in-place — all subsequent moves
+//       in the same parking round automatically use the higher speed.
+//       If the car gets stuck again the boost repeats up to `stuck_max_speed_mps`.
 //
 //  Uses RIGHT encoder only (PPR=11, CHANGE, ~1610 counts/rev).
 //  Both motors run at same PWM via steer_deg=0 → equal speed.
 //  Speed PID holds target RPM using encoder feedback.
-//
-//  Designed for Move 1 (forward) and Move 3 (reverse) which
-//  are both straight lines in the autopark sequence.
 // ============================================================
 
 #include "enc_serial_reader.hpp"
@@ -97,9 +103,21 @@ struct StraightDriveConfig {
     float cmd_duration  = 0.3f;    // Drive cmd duration field [s]
 
     // Safety
-    float enc_check_s   = 3.0f;    // Fail if no movement after this many seconds
-    float enc_check_m   = 0.005f;  // Minimum movement to pass encoder check [m]
+    float enc_check_s   = 3.0f;    // (kept for reference — now used as first stuck_check_s)
+    float enc_check_m   = 0.005f;  // (kept for reference — now used as stuck_min_move_m)
     float arm_wait_ms   = 500.0f;  // Wait after arm before driving [ms]
+
+    // ── [v5] Stuck detection / session speed boost ────────────────────────
+    // When the car carries passengers and the motor stalls at the calibrated
+    // speed, driveStraight() detects "stuck" (encoder distance doesn't increase)
+    // and adds stuck_boost_mps to the speed instead of returning ENC_FAIL.
+    // speedMps is passed by reference, so the caller's session variable updates
+    // in-place and all later moves in the same round use the higher speed.
+    // If still stuck, the boost repeats every stuck_check_s until the cap is hit.
+    float stuck_boost_mps     = 0.010f;  // Speed added per stuck event [m/s]
+    float stuck_max_speed_mps = 0.150f;  // Hard cap on session speed [m/s]
+    float stuck_check_s       = 3.0f;    // Seconds between stuck checks [s]
+    float stuck_min_move_m    = 0.005f;  // Min encoder distance per check to NOT be stuck [m]
 };
 
 
@@ -133,26 +151,24 @@ public:
     // ── driveStraight ──────────────────────────────────────────
     //  targetM    : distance [m] (positive always)
     //  forward    : true = forward, false = reverse
-    //  speedMps   : target speed [m/s]
+    //  speedMps   : [v5] REFERENCE to caller's session speed variable [m/s].
+    //               When the car is stuck, this value is INCREASED by
+    //               cfg_.stuck_boost_mps so the caller's session variable
+    //               reflects the boosted speed for subsequent moves.
     //  timeoutS   : safety timeout [s]
-    //  steerDeg   : steer angle to hold throughout the drive [degrees, default 0]
-    //               Pass the rear-camera-computed angle so the ESP32 holds it
-    //               instead of being reset to 0 by every loop tick.
-    //  skipArm    : skip the arm() call when the motor is already active (e.g.
-    //               settle CMD is still holding the ESP32 in a drive state).
-    //               Calling arm() while the settle CMD is active resets the
-    //               ESP32 motor/steer state → car briefly starts then ENC_FAIL.
+    //  steerDeg   : steer angle to hold throughout the drive [degrees]
+    //  skipArm    : skip the arm() call when the motor is already active
     //
-    StraightResult driveStraight(float targetM,
-                                  bool  forward,
-                                  float speedMps,
-                                  float timeoutS = 15.0f,
-                                  float steerDeg = 0.0f,
-                                  bool  skipArm  = false)
+    StraightResult driveStraight(float  targetM,
+                                  bool   forward,
+                                  float& speedMps,   // [v5] by reference — updates session speed
+                                  float  timeoutS = 15.0f,
+                                  float  steerDeg = 0.0f,
+                                  bool   skipArm  = false)
     {
-        abort_      = false;
-        lastDistM_  = 0.0f;
-        lastRightM_ = 0.0f;
+        abort_         = false;
+        lastDistM_     = 0.0f;
+        lastRightM_    = 0.0f;
         speedIntegral_ = 0.0f;
 
         if (!enc_.isValid()) {
@@ -161,8 +177,6 @@ public:
         }
 
         // Arm + wait — SKIP when motor is already active (settle CMD still running).
-        // Calling arm() while ESP32 is holding the settle steer angle resets its
-        // motor controller → causes the brief start-then-instant-stop (ENC_FAIL).
         if (!skipArm) {
             drive_.arm();
             std::this_thread::sleep_for(
@@ -173,10 +187,16 @@ public:
         EncSnapshot start = enc_.getSnapshot();
         float startR = start.rightDistM;
 
-        int   gear    = forward ? 1 : -1;
-        auto  tStart  = nowMs();
-        auto  tTimeout= static_cast<uint64_t>(timeoutS * 1000.0f);
-        bool  encOk   = false;
+        int   gear     = forward ? 1 : -1;
+        auto  tStart   = nowMs();
+        auto  tTimeout = static_cast<uint64_t>(timeoutS * 1000.0f);
+
+        // ── [v5] Stuck detection state ─────────────────────────────────────
+        // Check every stuck_check_s.  First check fires after stuck_check_s.
+        // If encoder hasn't moved stuck_min_move_m since last check → boost.
+        uint64_t stuckNextCheckMs = tStart + static_cast<uint64_t>(cfg_.stuck_check_s * 1000.0f);
+        float    stuckRefDist     = 0.0f;   // dist at last check (start = 0)
+        int      stuckBoostCount  = 0;      // how many boosts applied this drive
 
         printf("[CL] Straight %s  target=%.3fm  speed=%.3fm/s\n",
                forward ? "FORWARD" : "REVERSE", targetM, speedMps);
@@ -194,30 +214,49 @@ public:
             lastDistM_  = dist;
             lastRightM_ = s.rightDistM;
 
-            // ── Encoder check ──────────────────────────────────
-            float elapsedS = (nowMs() - tStart) / 1000.0f;
-            if (!encOk && elapsedS > cfg_.enc_check_s) {
-                if (dist < cfg_.enc_check_m) {
-                    printf("[CL] ENC_FAIL  no movement after %.1fs "
-                           "(dist=%.5fm)\n", elapsedS, dist);
-                    result = StraightResult::ENC_FAIL;
-                    break;
+            // ── [v5] Stuck detection — replaces ENC_FAIL ───────
+            // Every stuck_check_s seconds: if encoder hasn't moved
+            // stuck_min_move_m → boost speedMps (session speed ref) and continue.
+            // Repeats until stuck_max_speed_mps cap is reached.
+            if (nowMs() >= stuckNextCheckMs) {
+                float moved = dist - stuckRefDist;
+                if (moved < cfg_.stuck_min_move_m) {
+                    if (speedMps < cfg_.stuck_max_speed_mps) {
+                        float oldSpeed = speedMps;
+                        speedMps = std::min(speedMps + cfg_.stuck_boost_mps,
+                                            cfg_.stuck_max_speed_mps);
+                        currentSpeed   = speedMps;
+                        speedIntegral_ = 0.0f;   // reset PID integral on boost
+                        stuckBoostCount++;
+                        printf("[CL] STUCK #%d (moved=%.5fm in %.1fs)"
+                               " → boost %.4f→%.4f m/s (session updated)\n",
+                               stuckBoostCount, moved,
+                               cfg_.stuck_check_s, oldSpeed, speedMps);
+                    } else {
+                        // Already at max speed — still not moving; will TIMEOUT
+                        printf("[CL] STUCK at max speed %.4f m/s"
+                               " (moved=%.5fm) — will timeout\n",
+                               speedMps, moved);
+                    }
                 }
-                encOk = true;
+                stuckRefDist      = dist;
+                stuckNextCheckMs += static_cast<uint64_t>(cfg_.stuck_check_s * 1000.0f);
             }
 
             // ── Target reached ─────────────────────────────────
             if (dist > 0.001f && remaining <= cfg_.stop_thresh_m) {
-                printf("[CL] SUCCESS  dist=%.4fm  remaining=%.4fm\n",
-                       dist, remaining);
+                printf("[CL] SUCCESS  dist=%.4fm  remaining=%.4fm"
+                       "  boosts=%d  final_speed=%.4f\n",
+                       dist, remaining, stuckBoostCount, speedMps);
                 result = StraightResult::SUCCESS;
                 break;
             }
 
             // ── Timeout ────────────────────────────────────────
             if (nowMs() - tStart > tTimeout) {
-                printf("[CL] TIMEOUT  dist=%.4fm  remaining=%.4fm\n",
-                       dist, remaining);
+                printf("[CL] TIMEOUT  dist=%.4fm  remaining=%.4fm"
+                       "  boosts=%d  final_speed=%.4f\n",
+                       dist, remaining, stuckBoostCount, speedMps);
                 result = StraightResult::TIMEOUT;
                 break;
             }
@@ -231,9 +270,7 @@ public:
             }
 
             // ── Speed PID (right encoder feedback) ────────────
-            // Measures actual wheel RPM and adjusts commanded speed
-            // so both wheels maintain the same real-world speed.
-            float actualMs   = s.rightSpeedMs;   // m/s from right encoder
+            float actualMs   = s.rightSpeedMs;
             float speedErr   = targetSpeed - actualMs;
             speedIntegral_  += speedErr * (cfg_.loop_ms / 1000.0f);
             speedIntegral_   = std::max(-0.05f,
@@ -247,9 +284,6 @@ public:
                            std::min(speedMps, targetSpeed + adj));
 
             // ── Send drive — hold commanded steer angle each tick ─
-            // Previously called driveStraight() which hardcoded steer=0,
-            // overwriting the settle CMD angle every 20 ms.
-            // Now uses driveWithSteer() so rear-cam computed steer is preserved.
             drive_.driveWithSteer(currentSpeed, gear, steerDeg, cfg_.cmd_duration);
 
             // ── Debug every 200 ms ─────────────────────────────
