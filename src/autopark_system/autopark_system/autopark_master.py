@@ -95,10 +95,10 @@ class AutoparkMaster(Node):
             # ── IMU arc stopping (Move 2) ───────────────────────────────────
             ("imu_arc_stop_enabled",         True),
             # Fraction of full arc angle at which to send STOP.
-            ("imu_arc_stop_factor",          0.88),
+            ("imu_arc_stop_factor",          0.89),
             # When encoder_bridge boosts session_arc past threshold (passenger load),
             # use this smaller factor so the faster arc still stops in the slot.
-            ("imu_arc_stop_factor_stuck",    0.85),
+            ("imu_arc_stop_factor_stuck",    0.86),
             ("arc_stuck_speed_threshold_mps", 0.06),
             # Seconds to wait after arc starts before checking IMU delta.
             # Must exceed motor spin-up (~0.5-1 s).
@@ -117,6 +117,13 @@ class AutoparkMaster(Node):
             # ── Encoder result wait ─────────────────────────────────────────
             # Timeout for waiting on /enc_result after a Move 1 or 3 command:
             ("enc_result_timeout_s",         130.0),
+
+            # ── Forward clearance guard (applied before each gear=+1 move) ────
+            # If any sensor in us_fwd_indices reads below us_fwd_min_m,
+            # the forward move is skipped entirely (car is already at front wall).
+            ("us_fwd_guard_enable",          True),
+            ("us_fwd_indices",               [3]),     # x4 → index 3 (0-based)
+            ("us_fwd_min_m",                 0.15),    # skip forward if <15 cm clearance
 
             # ── Ultrasonic centering ────────────────────────────────────────
             ("us_center_enable",             True),
@@ -181,6 +188,10 @@ class AutoparkMaster(Node):
         self.imu_arc_enc_backup        = bool(gp("imu_arc_enc_backup_enabled"))
 
         self.enc_result_timeout_s      = float(gp("enc_result_timeout_s"))
+
+        self.us_fwd_guard_enable       = bool(gp("us_fwd_guard_enable"))
+        self.us_fwd_indices            = list(gp("us_fwd_indices"))
+        self.us_fwd_min_m              = float(gp("us_fwd_min_m"))
 
         self.us_center_enable          = bool(gp("us_center_enable"))
         self.us_left_idx               = int(gp("us_left_idx"))
@@ -472,6 +483,26 @@ class AutoparkMaster(Node):
                     f"  steer_active_hold={act_hold}  "
                     f"(straight={is_straight} keeps motor {'on' if act_hold else 'off'})")
 
+            # ── Forward clearance guard ───────────────────────────────
+            # Skip this move entirely if a front sensor is too close.
+            # Prevents stalling against the front wall during fwd_setup.
+            if gear > 0 and self.us_fwd_guard_enable and self.latest_us:
+                fwd_readings = [self.latest_us[idx]
+                                for idx in self.us_fwd_indices
+                                if idx < len(self.latest_us)]
+                if fwd_readings:
+                    fwd_min = min(fwd_readings)
+                    if fwd_min < self.us_fwd_min_m:
+                        self.get_logger().warning(
+                            f"FWD GUARD: skip MOVE {i+1}/{n} [{label}] — "
+                            f"front sensor {fwd_min*100:.1f}cm < "
+                            f"threshold {self.us_fwd_min_m*100:.0f}cm")
+                        continue
+                    else:
+                        self.get_logger().info(
+                            f"FWD GUARD: OK {fwd_min*100:.1f}cm >= "
+                            f"{self.us_fwd_min_m*100:.0f}cm — proceeding")
+
             # ── Pre-steer (wheels stopped) ────────────────────────────
             steer_cmd = {
                 "type": "drive", "gear": 0,
@@ -745,17 +776,17 @@ class AutoparkMaster(Node):
 
 
     def _run_kinetic_centering(self):
-        SPEED    = self.us_correction_speed_mps
-        DT       = 1.0 / max(self.us_kinetic_update_hz, 1.0)
-        MAX_FWD  = self.us_kinetic_fwd_max_m
-        MAX_REV  = self.us_kinetic_rev_max_m
-        SETTLE   = self.us_kinetic_settle_s
+        SPEED     = self.us_correction_speed_mps
+        DT        = 1.0 / max(self.us_kinetic_update_hz, 1.0)
+        MAX_FWD   = self.us_kinetic_fwd_max_m
+        MAX_REV   = self.us_kinetic_rev_max_m
+        SETTLE    = self.us_kinetic_settle_s
         KEEPALIVE = round(DT * 6, 2)
 
         time.sleep(0.50)
         self.get_logger().info("KINETIC CENTERING START")
 
-        # ── Phase A: lateral ─────────────────────────────────────────
+        # ── Phase A: lateral centering (forward creep with live steer) ────
         L   = self.latest_us[self.us_left_idx]
         R   = self.latest_us[self.us_right_idx]
         err = (L - R) / 2.0
@@ -771,7 +802,7 @@ class AutoparkMaster(Node):
         else:
             correction = max(-self.us_max_steer_deg,
                              min(self.us_max_steer_deg, err * self.us_steer_gain))
-            steer0 = -correction   # gear=+1: neg = left steer compensates right excess
+            steer0 = -correction   # gear=+1: neg steer compensates right excess
 
             self.cmd_pub.publish(String(data=json.dumps({
                 "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": steer0})))
@@ -805,45 +836,74 @@ class AutoparkMaster(Node):
             self.publish_stop("kinetic_fwd_done")
             time.sleep(SETTLE)
 
-        # ── Phase B: depth ────────────────────────────────────────────
-        rear   = self.latest_us[self.us_rear_idx]
-        target = self.us_rear_target_m
-        tol    = self.us_rear_tolerance_m
-        hi     = target + tol
+        # ── Phase B: depth correction (closed-loop, handles both directions) ──
+        # Runs a continuous seek loop: reverse if too far, forward if too close.
+        # Stops as soon as rear sensor lands in [target-tol, target+tol].
+        # Total travel budget: MAX_REV in reverse + MAX_FWD in forward.
+        target  = self.us_rear_target_m
+        tol     = self.us_rear_tolerance_m
+        lo      = target - tol
+        hi      = target + tol
 
+        rear = self.latest_us[self.us_rear_idx]
         self.get_logger().info(
-            f"KINETIC-B: rear={rear:.3f}m target={target:.2f}±{tol:.2f}m")
+            f"KINETIC-B: rear={rear:.3f}m target={target:.2f}±{tol:.2f}m "
+            f"window=[{lo:.2f}, {hi:.2f}]m")
 
         if rear > 2.0:
             self.get_logger().warning("KINETIC-B: rear sensor OOB — skip")
-        elif rear > hi:
+        elif lo <= rear <= hi:
+            self.get_logger().info("KINETIC-B: depth within window — skip")
+        else:
+            # Pre-steer straight before any depth movement
             self.cmd_pub.publish(String(data=json.dumps({
                 "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": 0.0})))
             time.sleep(self.us_steer_wait_s)
 
-            steps = max(1, int(MAX_REV / (SPEED * DT)))
-            for step in range(steps):
+            # Budget: allow up to MAX_REV reverse + MAX_FWD forward total steps
+            max_steps = max(1, int((MAX_REV + MAX_FWD) / (SPEED * DT)))
+            last_gear = 0
+
+            for step in range(max_steps):
                 rear = self.latest_us[self.us_rear_idx]
-                if rear <= hi:
+
+                if lo <= rear <= hi:
                     self.get_logger().info(
                         f"KINETIC-B: depth OK step={step} rear={rear*100:.1f}cm")
                     break
+
+                if rear > hi:
+                    # Too far from wall → reverse to close the gap
+                    gear = -1
+                elif rear < lo:
+                    # Too close to wall → creep forward
+                    gear = 1
+                else:
+                    break
+
+                # Re-steer to straight only on gear change (avoids repeated waits)
+                if gear != last_gear and last_gear != 0:
+                    self.publish_stop("kinetic_depth_dir_change")
+                    time.sleep(SETTLE)
+                    self.cmd_pub.publish(String(data=json.dumps({
+                        "type": "drive", "gear": 0,
+                        "speed_mps": 0.0, "steer_deg": 0.0})))
+                    time.sleep(self.us_steer_wait_s)
+                last_gear = gear
+
                 self.cmd_pub.publish(String(data=json.dumps({
-                    "type": "drive", "gear": -1, "speed_mps": SPEED,
+                    "type": "drive", "gear": gear, "speed_mps": SPEED,
                     "steer_deg": 0.0, "duration": KEEPALIVE})))
+
                 if step % 5 == 0:
+                    direction = "REV" if gear == -1 else "FWD"
                     self.get_logger().info(
-                        f"KINETIC-B [{step:02d}]: rear={rear:.3f}m")
+                        f"KINETIC-B [{step:02d}] {direction}: rear={rear*100:.1f}cm "
+                        f"target={target*100:.0f}±{tol*100:.0f}cm")
                 time.sleep(DT)
 
-            self.publish_stop("kinetic_rev_done")
+            self.publish_stop("kinetic_depth_done")
             time.sleep(SETTLE)
-
-        elif rear < target - tol:
-            creep = min(target - tol - rear + 0.02, self.us_depth_max_step_m)
-            self._send_correction_move(gear=1, steer_deg=0.0, dist_m=creep)
-        else:
-            self.get_logger().info("KINETIC-B: depth within window — skip")
 
         L    = self.latest_us[self.us_left_idx]
         R    = self.latest_us[self.us_right_idx]
