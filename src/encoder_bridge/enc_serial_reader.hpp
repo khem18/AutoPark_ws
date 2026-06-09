@@ -31,6 +31,7 @@ struct EncSnapshot {
     float rightWRpm   = 0.0f;
     float leftMRpm    = 0.0f;
     float rightMRpm   = 0.0f;
+    float leftSpeedMs = 0.0f;
     float rightSpeedMs= 0.0f;
     bool  valid       = false;    // true once first packet received
     uint64_t timestampUs = 0;
@@ -147,6 +148,7 @@ private:
         s.rightWRpm  = getFloat("rrpm");
         s.leftMRpm   = getFloat("lmrpm");
         s.rightMRpm  = getFloat("rmrpm");
+        s.leftSpeedMs = s.leftWRpm  / 60.0f * 0.5586f;
         s.rightSpeedMs= s.rightWRpm / 60.0f * 0.5586f;
 
         {

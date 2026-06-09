@@ -1,19 +1,22 @@
 #pragma once
 // ============================================================
-//  rdk_closed_loop.hpp  —  v5  Single-Encoder Straight Drive
+//  rdk_closed_loop.hpp  —  v6  Dual-Encoder Straight Drive
 //
-//  CHANGES vs v4:
-//  [v5] Stuck-detection replaces ENC_FAIL for passenger/heavy-load support.
-//       When the car does not move after `stuck_check_s` seconds,
-//       driveStraight() BOOSTS speedMps by `stuck_boost_mps` instead of
-//       returning ENC_FAIL.  speedMps is passed by REFERENCE so the caller's
-//       "session speed" variable is updated in-place — all subsequent moves
-//       in the same parking round automatically use the higher speed.
-//       If the car gets stuck again the boost repeats up to `stuck_max_speed_mps`.
+//  CHANGES vs v5:
+//  [v6] Dual-encoder distance tracking.
+//       Uses AVERAGE of left + right encoder distances for target tracking
+//       instead of right-only.  Accurate even when wheels turn at different
+//       speeds (motor imbalance).  Speed PID still uses rightSpeedMs.
+//       A lr_delta diagnostic is printed every 200 ms so imbalance magnitude
+//       can be read from logs and fed into left_pwm_boost tuning in firmware.
 //
-//  Uses RIGHT encoder only (PPR=11, CHANGE, ~1610 counts/rev).
-//  Both motors run at same PWM via steer_deg=0 → equal speed.
-//  Speed PID holds target RPM using encoder feedback.
+//  [v5] Stuck-detection: boost speedMps instead of ENC_FAIL under heavy load.
+//       speedMps is passed by REFERENCE → session variable updates in-place.
+//
+//  Left/right motor imbalance note:
+//       The primary fix is left_pwm_boost in esp32_drive_controller.ino.
+//       Dual-encoder averaging here ensures distance measurement is accurate
+//       regardless of wheel balance.
 // ============================================================
 
 #include "enc_serial_reader.hpp"
@@ -192,9 +195,13 @@ public:
                 std::chrono::milliseconds((int)cfg_.arm_wait_ms));
         }
 
-        // Record start position (right encoder only)
+        // [v6] Record start position for BOTH encoders.
+        // Average left+right distance is used for target tracking so that
+        // a motor imbalance (left slower than right) does not cause the car
+        // to stop short or overshoot depending on which side runs faster.
         EncSnapshot start = enc_.getSnapshot();
         float startR = start.rightDistM;
+        float startL = start.leftDistM;   // [v6] dual-encoder start
 
         int   gear     = forward ? 1 : -1;
         auto  tStart   = nowMs();
@@ -216,9 +223,17 @@ public:
         while (!abort_) {
             auto loopStart = nowMs();
 
-            // ── Distance (right encoder only) ─────────────────
-            EncSnapshot s = enc_.getSnapshot();
-            float dist      = std::fabs(s.rightDistM - startR);
+            EncSnapshot s = enc_.getSnapshot();   // [v6] read snapshot once per tick
+
+            // [v6] Dual-encoder distance: average left + right.
+            // If the left encoder is not yet valid (lc==0), fall back to right-only
+            // so the system still works if one encoder is missing or noisy.
+            float distR = std::fabs(s.rightDistM - startR);
+            float distL = std::fabs(s.leftDistM  - startL);
+            bool  leftValid = (std::fabs(s.leftDistM) > 0.0001f ||
+                               std::fabs(startL)      > 0.0001f ||
+                               s.leftCount != 0);
+            float dist      = leftValid ? (distR + distL) / 2.0f : distR;
             float remaining = targetM - dist;
             lastDistM_  = dist;
             lastRightM_ = s.rightDistM;
@@ -303,10 +318,17 @@ public:
             static uint64_t dbg = 0;
             if (nowMs() - dbg > 200) {
                 dbg = nowMs();
+                // [v6] lr_delta: speed difference between wheels.
+                // If lr_delta > 0.010 m/s consistently, the left motor is
+                // significantly slower and left_pwm_boost in the ESP32
+                // firmware should be increased.
+                float lr_delta = s.rightSpeedMs - s.leftSpeedMs;
                 printf("[CL] dist=%.4f  rem=%.4f  "
-                       "cmd=%.3f  actual=%.3f  rRPM=%.2f\n",
+                       "cmd=%.3f  actual=%.3f  rRPM=%.2f  "
+                       "lr_delta=%+.3f m/s  leftValid=%d\n",
                        dist, remaining,
-                       currentSpeed, actualMs, s.rightWRpm);
+                       currentSpeed, s.rightSpeedMs, s.rightWRpm,
+                       lr_delta, (int)leftValid);
             }
 
             // ── Wait remainder of loop ─────────────────────────

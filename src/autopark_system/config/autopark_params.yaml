@@ -41,11 +41,16 @@ autopark_master:
     speed_scale:           0.03     # ← 0.03 m/s (was 0.01); arc move uses this directly
     max_command_steer_deg: 30.0
 
-    # Left-wheel slower compensation.  +ve = right bias.
-    # gear=+1 straight: steer += +bias  (corrects leftward fwd drift)
-    # gear=-1 straight: steer += -bias  (corrects rightward rev drift)
-    # Tune: start 0.0 → increase in 0.5° steps until straight.
-    steer_straight_bias_deg: 0.0
+    # Left-wheel slower compensation.
+    # This car: left motor physically slower → right motor faster → car veers RIGHT.
+    # PRIMARY FIX: increase left_pwm_boost in esp32_drive_controller.ino.
+    # SOFTWARE WORKAROUND (use while tuning firmware):
+    #   NEGATIVE value steers LEFT during forward → counteracts rightward drift.
+    #   gear=+1 straight: steer += bias   (negative → steer left → fight right drift)
+    #   gear=-1 straight: steer += -bias  (positive → steer right → fight left rev drift)
+    # Tune: start at -2.0, test straight drive, adjust in 0.5° steps.
+    # Set to 0.0 once left_pwm_boost is dialled in and car goes straight.
+    steer_straight_bias_deg: -3.0   # ← START HERE; tune toward 0 as firmware improves
     steer_bias_apply_thresh_deg: 2.0
 
     # ── IMU arc stopping (Move 2) ─────────────────────────────────

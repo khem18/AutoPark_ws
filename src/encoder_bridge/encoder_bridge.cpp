@@ -669,12 +669,23 @@ private:
     void publish_status() {
         if (!enc_ || !enc_->isValid()) return;
         auto snap = enc_->getSnapshot();
-        char buf[256];
+        char buf[320];
+        // [v6] Publish BOTH left and right encoder data.
+        // lr_spd_delta = right - left speed (positive → right faster → left slower → car drifts right).
+        // Use this value to tune left_pwm_boost in esp32_drive_controller.ino:
+        //   lr_spd_delta ~ 0.010 m/s  →  try left_pwm_boost = 10
+        //   lr_spd_delta ~ 0.020 m/s  →  try left_pwm_boost = 15–20
+        float lr_delta = snap.rightSpeedMs - snap.leftSpeedMs;
         snprintf(buf, sizeof(buf),
             "{\"rc\":%ld,\"rd\":%.4f,\"rrpm\":%.2f,\"rspd\":%.3f"
+            ",\"lc\":%ld,\"ld\":%.4f,\"lrpm\":%.2f,\"lspd\":%.3f"
+            ",\"lr_delta\":%.3f"
             ",\"sess_fwd\":%.4f,\"sess_rev\":%.4f,\"sess_arc\":%.4f}",
             snap.rightCount, snap.rightDistM,
             snap.rightWRpm,  snap.rightSpeedMs,
+            snap.leftCount,  snap.leftDistM,
+            snap.leftWRpm,   snap.leftSpeedMs,
+            lr_delta,
             session_fwd_speed_, session_rev_speed_, session_arc_rev_speed_);
         auto msg = std_msgs::msg::String();
         msg.data = buf;

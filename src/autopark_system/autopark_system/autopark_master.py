@@ -891,9 +891,18 @@ class AutoparkMaster(Node):
                     time.sleep(self.us_steer_wait_s)
                 last_gear = gear
 
+                # [FIX] Apply steer_straight_bias_deg during depth moves.
+                # Without bias, left motor slower → car drifts right even
+                # during Phase-B reverse/forward → lateral error accumulates
+                # while depth is being corrected.
+                depth_steer = (
+                    +self.steer_straight_bias_deg if gear > 0
+                    else -self.steer_straight_bias_deg
+                )
+
                 self.cmd_pub.publish(String(data=json.dumps({
                     "type": "drive", "gear": gear, "speed_mps": SPEED,
-                    "steer_deg": 0.0, "duration": KEEPALIVE})))
+                    "steer_deg": depth_steer, "duration": KEEPALIVE})))
 
                 if step % 5 == 0:
                     direction = "REV" if gear == -1 else "FWD"
