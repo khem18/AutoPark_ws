@@ -9,12 +9,12 @@ class AutoCalibrator(Node):
     def __init__(self):
         super().__init__('auto_calibrate')
         # Change to your camera topic if needed (e.g., /image_raw)
-        self.subscription = self.create_subscription(Image, 'rear_cam/image_raw', self.process_frame, 10)
+        self.subscription = self.create_subscription(Image, 'side_cam/image_raw', self.process_frame, 10)
         self.bridge = CvBridge()
         
         # Checkerboard setup
-        self.board_size = (8, 6)
-        self.square_size_cm = 2.5 
+        self.board_size = (8, 8)
+        self.square_size_cm = 2.4 
         
         self.get_logger().info("🏁 Auto-Calibrator Started! Hold the 8x6 checkerboard flat on the floor in front of the kart...")
         self.matrix_calculated = False
@@ -28,14 +28,14 @@ class AutoCalibrator(Node):
         self.frame_count += 1
         if self.frame_count % 15 != 0:
             raw_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-            frame = cv2.resize(raw_image, (640, 480))
+            frame = cv2.resize(raw_image, (1920, 1080))
             cv2.imshow("Auto-Calibrator", frame)
             cv2.waitKey(1)
             return
             
         # If it IS the 15th frame, do the heavy processing:
         raw_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-        frame = cv2.resize(raw_image, (640, 480))
+        frame = cv2.resize(raw_image, (1920, 1080))
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # 1. FIND THE CHECKERBOARD (With FAST_CHECK enabled)

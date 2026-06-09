@@ -157,21 +157,34 @@ def generate_launch_description():
                 'enc_port':            '/dev/ttyUSB1',
                 'drive_port':          '/dev/ttyUSB0',
                 'speed_scale':         0.01,
-                # Calibrated driving speeds from closed_loop_demo.cpp (unloaded car):
-                # Move 1 forward  0.50 m real at 0.06 m/s -> enc_fwd_speed_mps = 0.06
-                # Move 3 reverse  0.30 m real at 0.04 m/s -> enc_rev_speed_mps = 0.04
-                'enc_fwd_speed_mps':   0.06,
-                'enc_rev_speed_mps':   0.04,
+                # Calibrated driving speeds for 98 kg passenger load:
+                # Move 1 forward  calibrated at 0.08 m/s -> enc_fwd_speed_mps = 0.08
+                # Move 3/4        calibrated at 0.06 m/s -> enc_rev_speed_mps = 0.06
+                # (was 0.06 / 0.04 for unloaded car; increased for 98 kg load)
+                'enc_fwd_speed_mps':   0.08,
+                'enc_rev_speed_mps':   0.06,
                 'straight_steer_thresh': 5.0,
                 # ── [v5] Passenger / heavy-load stuck detection ──────────────
-                # Set stuck_boost_mps to 0.0 to disable all speed boosting and
-                # the Monitor→Drive mode transition (which can crash on thread
-                # teardown). The car always drives at the calibrated base speed.
-                'stuck_boost_mps':      0.0,     # 0 = no boost, no Drive-mode takeover
-                'stuck_max_speed_mps':  0.060,   # same as enc_fwd_speed_mps (cap = base)
-                'stuck_check_s':        3.0,
-                'stuck_zero_boost_factor': 1.0,  # disabled (boost=0 anyway)
-                'stuck_min_move_m':     0.001,   # 1 mm — any movement = not stuck
+                # stuck_speed_enabled: set True to activate the speed-boost feature.
+                # When enabled and the car stalls under 98 kg passenger load, the
+                # encoder detects no movement after stuck_check_s seconds and
+                # boosts the session speed by stuck_boost_mps, repeating until
+                # stuck_max_speed_mps. Session speed persists for the full round.
+                # Tune: if car still stalls -> lower stuck_check_s or raise
+                #       stuck_boost_mps. If steering accuracy suffers at
+                #       high speed -> lower stuck_max_speed_mps.
+                'stuck_speed_enabled':  True,    # ← ON: enable auto-boost for 98 kg load
+                'stuck_boost_mps':      0.020,   # +20 mm/s per stuck event
+                'stuck_max_speed_mps':  0.150,   # hard cap (150 mm/s)
+                'stuck_check_s':        3.0,     # seconds before declaring stuck
+                # [v7] Larger boost multiplier when car has moved 0m at first stuck check.
+                # 98 kg load stalls from rest; 3x boost gets it moving sooner.
+                # Set to 1.0 to disable (same behaviour as v6).
+                'stuck_zero_boost_factor': 3.0,  # x3 boost if dist==0 at first stuck check
+                # [v7] Min encoder movement per stuck_check_s interval to NOT be stuck.
+                # 80 mm in 3 s (26 mm/s) means car is barely moving → still boost.
+                # Tune down (e.g. 0.020) if empty-car boost fires too early.
+                'stuck_min_move_m':     0.080,
             }]
         ),
     ])

@@ -106,6 +106,10 @@ public:
         declare_parameter("enc_rev_speed_mps",     0.04);
 
         // ── [v5] Stuck detection / session speed boost params ──────────────
+        // stuck_speed_enabled: master switch for the entire stuck-boost feature.
+        // Set true in the launch file to enable auto-boost for 98 kg passenger load.
+        // Default false so an unloaded car is never accidentally boosted.
+        declare_parameter("stuck_speed_enabled",  false);
         declare_parameter("stuck_boost_mps",      0.010);
         declare_parameter("stuck_max_speed_mps",  0.150);
         declare_parameter("stuck_check_s",        3.0);
@@ -129,6 +133,7 @@ public:
         enc_fwd_speed_    = (float)get_parameter("enc_fwd_speed_mps").as_double();
         enc_rev_speed_    = (float)get_parameter("enc_rev_speed_mps").as_double();
 
+        stuck_speed_enabled_ = get_parameter("stuck_speed_enabled").as_bool();
         stuck_boost_mps_    = (float)get_parameter("stuck_boost_mps").as_double();
         stuck_max_speed_    = (float)get_parameter("stuck_max_speed_mps").as_double();
         stuck_check_s_      = (float)get_parameter("stuck_check_s").as_double();
@@ -143,11 +148,13 @@ public:
         RCLCPP_INFO(get_logger(),
             "enc=%s  drive=%s  thresh=%.1f°  speed_scale=%.4f"
             "  fwd_spd=%.3f  rev_spd=%.3f"
+            "  stuck_speed_enabled=%s"
             "  stuck_boost=%.3f  stuck_max=%.3f  stuck_check=%.1fs"
             "  stuck_min_move=%.3fm  stuck_zero_boost_factor=%.1f",
             enc_port_.c_str(), drive_port_.c_str(),
             steer_thresh_, speed_scale_,
             enc_fwd_speed_, enc_rev_speed_,
+            stuck_speed_enabled_ ? "ON" : "OFF",
             stuck_boost_mps_, stuck_max_speed_, stuck_check_s_,
             stuck_min_move_m_, stuck_zero_boost_);
 
@@ -214,18 +221,6 @@ private:
 
     void handle_command(const std::string& json) {
         std::string type = jsonStr(json, "type", "");
-
-        // ── steer_update: live steer correction from autopark_master ──
-        // Sent by the IMU straight-correction loop during Move3 encoder drive.
-        // Updates StraightDriver's live_steer_ atomic so the next DriveSerial
-        // tick uses the corrected angle.  Does NOT abort the running drive.
-        if (type == "steer_update") {
-            float new_steer = jsonFloat(json, "steer_deg", 0.0f);
-            driver_->setLiveSteer(new_steer);
-            RCLCPP_INFO(get_logger(),
-                "Live steer update: %.1f° (IMU drift correction)", new_steer);
-            return;
-        }
 
         // ── Non-drive: abort everything ───────────────────────
         if (type != "drive") {
@@ -403,7 +398,7 @@ private:
 
                         if (!in_drive_mode && elapsedMs >= stuckNextMs) {
                             float moved = dist - stuckRefDist;
-                            if (moved < stuck_min_move_m_) {
+                            if (stuck_speed_enabled_ && moved < stuck_min_move_m_) {
                                 float oldSpeed = session_fwd_speed_;
                                 // [v7] Zero-movement boost: if car hasn't moved at ALL
                                 // (passengers stalling from rest), use a larger first boost
@@ -600,7 +595,7 @@ private:
                     // ── Stuck check every stuck_check_s ────────────────────
                     if (nowMs_br() >= stuckNextMs) {
                         float moved = dist - stuckRefDist;
-                        if (moved < stuck_min_move_m_) {
+                        if (stuck_speed_enabled_ && moved < stuck_min_move_m_) {
                             if (session_arc_rev_speed_ < stuck_max_speed_) {
                                 float old = session_arc_rev_speed_;
                                 // [v7] Zero-movement boost for passengers stalling arc from rest
@@ -693,6 +688,7 @@ private:
     float session_arc_rev_speed_;    // [v6] Move2 arc reverse (boosted by arc monitor)
 
     // Stuck detection parameters
+    bool  stuck_speed_enabled_;  // master switch — set true for 98 kg passenger load
     float stuck_boost_mps_;
     float stuck_max_speed_;
     float stuck_check_s_;

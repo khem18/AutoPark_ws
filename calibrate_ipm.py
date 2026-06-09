@@ -35,7 +35,7 @@ class CornerPicker(Node):
 
         self.sub = self.create_subscription(
             Image,
-            '/rear_cam/image_raw',
+            '/side_cam/image_raw',
             self.image_callback,
             10
         )
@@ -82,12 +82,12 @@ class CornerPicker(Node):
             )
 
         # Rotate 180° if rear camera is mounted upside-down
-        frame = cv2.flip(frame, -1)
+        # frame = cv2.flip(frame, -1)
 
         # Calibration resolution
         frame = cv2.resize(
             frame,
-            (1280, 720),
+            (1920, 1080),
             interpolation=cv2.INTER_AREA
         )
         

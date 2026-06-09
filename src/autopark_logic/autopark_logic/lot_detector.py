@@ -7,385 +7,473 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import cv2
 import numpy as np
 import math
+import time
+from collections import deque
 
+
+# ================================================================
+#  EGO POSE ESTIMATOR  –  frame-to-frame differential odometry
+#
+#  Two modes:
+#    LOT VISIBLE   → direct gate fix + velocity = Δgate / Δt
+#    LOT HIDDEN    → optical flow on BEV + constant-velocity fallback
+#
+#  /ego_pose  →  [x_cm, y_cm, theta_deg, vx, vy, omega, confidence]
+# ================================================================
+class EgoPoseEstimator:
+
+    LOCK_N = 5     # consecutive visible frames to declare "locked"
+    DR_LIM = 3.0   # seconds before dead-reckoning is abandoned
+
+    def __init__(self):
+        self.x = self.y = self.theta = 0.0
+        self.vx = self.vy = self.omega = 0.0
+
+        self.prev_gx = self.prev_gy = self.prev_gt = None
+        self.prev_gate_t  = None
+        self.prev_cam_gray = None   # raw camera frame (sharp, for DR tracking)
+        self.last_t        = None
+
+        self.streak  = 0
+        self.locked  = False
+        self.traj_px = deque(maxlen=300)
+
+    # ----------------------------------------------------------
+    def update_visible(self, gx_cm, gy_cm, gtheta, t, cam_gray, gate_px=None):
+        """
+        Call every frame the lot IS visible.
+        Δpose from consecutive gate frames → velocity.  Direct absolute fix.
+        cam_gray: grayscale raw 1920×1080 frame (saved for DR optical flow).
+        """
+        if self.prev_gate_t is not None:
+            dt = max(t - self.prev_gate_t, 1e-4)
+            self.vx    = (gx_cm  - self.prev_gx) / dt
+            self.vy    = (gy_cm  - self.prev_gy) / dt
+            self.omega = (gtheta - self.prev_gt)  / dt
+
+        self.x, self.y, self.theta = gx_cm, gy_cm, gtheta
+        self.prev_gx, self.prev_gy, self.prev_gt = gx_cm, gy_cm, gtheta
+        self.prev_gate_t   = t
+        self.prev_cam_gray = cam_gray
+        self.last_t        = t
+
+        self.streak = min(self.streak + 1, self.LOCK_N + 2)
+        self.locked = (self.streak >= self.LOCK_N)
+        if gate_px:
+            self.traj_px.append(gate_px)
+        return self._pack('lot_fix', 1.0)
+
+    # ----------------------------------------------------------
+    def update_hidden(self, t, cam_gray, M_bev, cm_px_x, cm_px_y,
+                      floor_y_start=350):
+        """
+        Call every frame the lot is NOT visible.
+
+        Tracks floor features in the raw 1920×1080 camera frame (sharp,
+        full-resolution), projects the tracked points through the existing
+        BEV homography M_bev to get displacement in BEV pixels, then
+        multiplies by CM_PX to convert to real cm.
+
+        Why camera frame instead of BEV:
+          - No medianBlur(21) destroying texture
+          - 1920×1080 vs 640×480 → 9× more pixels to track
+          - M_bev already handles the perspective-to-scale conversion
+
+        floor_y_start: first camera row that is floor, not wall (~350 here).
+        """
+        self.streak = max(0, self.streak - 1)
+        self.locked = (self.streak >= self.LOCK_N)
+
+        if self.last_t is None or self.prev_gate_t is None:
+            self.prev_cam_gray = cam_gray
+            return None
+
+        dt     = max(t - self.last_t, 1e-4)
+        dr_age = t - self.prev_gate_t
+        if dr_age > self.DR_LIM:
+            return None
+
+        # ── 1. Constant-velocity prior ──────────────────────────
+        dx_cm  = self.vx    * dt
+        dy_cm  = self.vy    * dt
+        dtheta = self.omega * dt
+
+        # ── 2. Raw-camera optical flow → BEV space → cm ─────────
+        if self.prev_cam_gray is not None:
+            try:
+                h_cam = cam_gray.shape[0]
+                # Restrict feature detection to floor strip only
+                floor_prev = self.prev_cam_gray[floor_y_start:h_cam, :]
+                floor_curr = cam_gray[floor_y_start:h_cam, :]
+
+                pts = cv2.goodFeaturesToTrack(
+                    floor_prev, maxCorners=200,
+                    qualityLevel=0.01, minDistance=8, blockSize=7)
+
+                if pts is not None and len(pts) >= 10:
+                    # Restore full-frame y coordinates
+                    pts_full = pts + np.array([[[0.0, float(floor_y_start)]]])
+
+                    curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                        self.prev_cam_gray, cam_gray, pts_full, None,
+                        winSize=(21, 21), maxLevel=3,
+                        criteria=(cv2.TERM_CRITERIA_EPS |
+                                  cv2.TERM_CRITERIA_COUNT, 15, 0.03))
+
+                    good_prev = pts_full[status == 1]
+                    good_curr = curr_pts[status == 1]
+
+                    if len(good_prev) >= 8:
+                        # Project both sets through BEV homography
+                        def _to_bev(p2d):
+                            p = p2d.reshape(-1, 1, 2).astype(np.float32)
+                            return cv2.perspectiveTransform(p, M_bev).reshape(-1, 2)
+
+                        bev_p = _to_bev(good_prev)
+                        bev_c = _to_bev(good_curr)
+
+                        # Keep only points landing inside BEV canvas
+                        inside = ((bev_p[:, 0] > 0)   & (bev_p[:, 0] < 640) &
+                                  (bev_p[:, 1] > 0)   & (bev_p[:, 1] < 480) &
+                                  (bev_c[:, 0] > 0)   & (bev_c[:, 0] < 640) &
+                                  (bev_c[:, 1] > 0)   & (bev_c[:, 1] < 480))
+
+                        if inside.sum() >= 5:
+                            mflow  = np.median((bev_c - bev_p)[inside], axis=0)
+                            # Scene moves opposite to vehicle motion
+                            of_dx  = -float(mflow[0]) * cm_px_x
+                            of_dy  = -float(mflow[1]) * cm_px_y
+
+                            # Trust OF more as velocity estimate ages
+                            alpha  = min(0.7, 0.3 + 0.4 * (dr_age / self.DR_LIM))
+                            dx_cm  = (1 - alpha) * dx_cm + alpha * of_dx
+                            dy_cm  = (1 - alpha) * dy_cm + alpha * of_dy
+
+            except Exception:
+                pass   # keep constant-velocity if flow fails
+
+        # ── 3. Integrate ────────────────────────────────────────
+        self.x     += dx_cm
+        self.y     += dy_cm
+        self.theta += dtheta
+
+        self.prev_cam_gray = cam_gray
+        self.last_t        = t
+
+        conf = max(0.0, 1.0 - dr_age / self.DR_LIM)
+        return self._pack('cam_flow', conf)
+
+    # ----------------------------------------------------------
+    def _pack(self, mode, confidence):
+        return dict(
+            x=self.x, y=self.y, theta=self.theta,
+            vx=self.vx, vy=self.vy, omega=self.omega,
+            locked=self.locked, mode=mode, confidence=confidence,
+            streak=self.streak,
+        )
+
+
+# ================================================================
+#  LOT DETECTOR  –  original algorithm · 1920×1080 in · BEV 640×480
+# ================================================================
 class LotDetector(Node):
+
     def __init__(self):
         super().__init__('lot_detector')
-
-        # --- THE ANTI-LAG QoS PROFILE ---
         anti_lag_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1
-        )
-
+            history=HistoryPolicy.KEEP_LAST, depth=1)
         self.subscription = self.create_subscription(
-            Image,
-            '/side_cam/image_raw',
-            self.listener_callback,
-            anti_lag_qos
-        )
+            Image, '/side_cam/image_raw',
+            self.listener_callback, anti_lag_qos)
         self.bridge = CvBridge()
 
-        # --- PARKING METRICS PUBLISHER ---
-        self.metrics_pub = self.create_publisher(Float32MultiArray, '/parking_metrics', 10)
+        self.metrics_pub  = self.create_publisher(Float32MultiArray, '/parking_metrics', 10)
+        self.obstacle_pub = self.create_publisher(Bool,              '/lot_obstacle',    10)
+        self.pose_pub     = self.create_publisher(Float32MultiArray, '/ego_pose',        10)
 
-        # --- OBSTACLE ALERT PUBLISHER ---
-        self.obstacle_pub = self.create_publisher(Bool, '/lot_obstacle', 10)
+        self.gain_b = self.gain_g = self.gain_r = 1.0
+        self.estimator = EgoPoseEstimator()
+        self.frame_cnt = 0
+        self.get_logger().info(
+            "Lot Detector 1920×1080 → BEV 640×480 | /ego_pose (differential)")
 
-        # --- AWB MEMORY ---
-        self.gain_b = 1.0
-        self.gain_g = 1.0
-        self.gain_r = 1.0
-
-        self.get_logger().info("Lot Detector Started! Obstacle alert ON → /lot_obstacle")
-
+    # ================================================================
     def listener_callback(self, data):
-        # ==============================================================
-        # 1. READ AND RESIZE CAMERA FEED
-        # ==============================================================
-        raw_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-        frame = cv2.resize(raw_image, (640, 480))
+        self.frame_cnt += 1
+        t_now = time.monotonic()
 
-        # THE RDK X5 CAMERA FLIP HACK
+        # ── 1. READ  →  1920 × 1080 ────────────────────────────────
+        frame = self.bridge.imgmsg_to_cv2(data, 'bgr8')
+        if frame.shape[:2] != (480, 640):
+            frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
         frame = cv2.flip(frame, 1)
 
-        # --- HIGH-SPEED DYNAMIC AWB (SMOOTHED) ---
-        tiny_frame = cv2.resize(frame, (64, 48))
-        b_tiny, g_tiny, r_tiny = cv2.split(tiny_frame)
+        if self.frame_cnt == 30:
+            cv2.imwrite('/tmp/cal.png', frame)
+            self.get_logger().info('Calibration frame → /tmp/cal.png')
 
-        avg_b = np.mean(b_tiny)
-        avg_g = np.mean(g_tiny)
-        avg_r = np.mean(r_tiny)
-        avg_all = (avg_b + avg_g + avg_r) / 3.0
-
-        target_b = avg_all / avg_b if avg_b > 0 else 1.0
-        target_g = avg_all / avg_g if avg_g > 0 else 1.0
-        target_r = avg_all / avg_r if avg_r > 0 else 1.0
-
-        self.gain_b = (0.5 * self.gain_b) + (0.5 * target_b)
-        self.gain_g = (0.5 * self.gain_g) + (0.5 * target_g)
-        self.gain_r = (0.5 * self.gain_r) + (0.5 * target_r)
-
+        # ── DYNAMIC AWB ─────────────────────────────────────────────
+        tiny = cv2.resize(frame, (64, 48))
+        b_t, g_t, r_t = cv2.split(tiny)
+        avg_all = (np.mean(b_t) + np.mean(g_t) + np.mean(r_t)) / 3.0
+        def _g(ch):
+            m = np.mean(ch); return avg_all / m if m > 0 else 1.0
+        self.gain_b = 0.5*self.gain_b + 0.5*_g(b_t)
+        self.gain_g = 0.5*self.gain_g + 0.5*_g(g_t)
+        self.gain_r = 0.5*self.gain_r + 0.5*_g(r_t)
         b, g, r = cv2.split(frame)
-        b = cv2.convertScaleAbs(b, alpha=self.gain_b)
-        g = cv2.convertScaleAbs(g, alpha=self.gain_g)
-        r = cv2.convertScaleAbs(r, alpha=self.gain_r)
+        frame = cv2.merge([cv2.convertScaleAbs(b, alpha=self.gain_b),
+                           cv2.convertScaleAbs(g, alpha=self.gain_g),
+                           cv2.convertScaleAbs(r, alpha=self.gain_r)])
 
-        frame = cv2.merge([b, g, r])
-
-        # ==============================================================
-        # 2. BIRD'S EYE VIEW (IPM) TRANSFORM
-        # ==============================================================
-
-        # SOURCE POINTS: Tracing the yellow lines
+        # ── 2. BEV  (src 1920×1080 → dst 640×480) ──────────────────
+        # Calibrate: run once, open /tmp/cal.png in GIMP, read coords
+        # BL/BR = near parking line (larger y),  TL/TR = far line (smaller y, floor only)
+         # SOURCE POINTS: Tracing the yellow lines
         src_pts = np.float32([
-            [20.0,  380.0],   # Bottom-Left
-            [620.0, 380.0],   # Bottom-Right
-            [210.0, 210.0],   # Top-Left
-            [430.0, 210.0]    # Top-Right
+            [20.0, 380.0],   # Bottom-Left
+            [620.0, 380.0],  # Bottom-Right
+            [210.0, 210.0],  # Top-Left 
+            [430.0, 210.0]   # Top-Right 
         ])
 
         # DESTINATION POINTS: Force lines to be perfectly straight vertical
         dst_pts = np.float32([
-            [200.0, 480.0],
-            [440.0, 480.0],
-            [200.0, 0.0],
-            [440.0, 0.0]
+            [200.0, 480.0],  
+            [440.0, 480.0],  
+            [200.0, 0.0],    
+            [440.0, 0.0]     
         ])
 
-        matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        matrix    = cv2.getPerspectiveTransform(src_pts, dst_pts)
         bev_frame = cv2.warpPerspective(frame, matrix, (640, 480))
 
-        # CREATE THE "REAL FLOOR" COOKIE CUTTER MASK
-        white_canvas = np.ones((480, 640), dtype=np.uint8) * 255
-        floor_mask = cv2.warpPerspective(white_canvas, matrix, (640, 480))
-        kernel_shrink = np.ones((10, 10), np.uint8)
-        floor_mask = cv2.erode(floor_mask, kernel_shrink)
+        white_canvas = np.ones((480, 640), np.uint8) * 255
+        floor_mask   = cv2.warpPerspective(white_canvas, matrix, (640, 480))
+        floor_mask   = cv2.erode(floor_mask, np.ones((10, 10), np.uint8))
 
-        # ==============================================================
-        # 3. DETECT YELLOW LINES (ANTI-SKIN & FILL-FACTOR GEOMETRY)
-        # ==============================================================
-        blurred_bev = cv2.medianBlur(bev_frame, 21)
-        hsv = cv2.cvtColor(blurred_bev, cv2.COLOR_BGR2HSV)
+        # ── 3. YELLOW LINE DETECTION  (original) ───────────────────
+        blurred_bev  = cv2.medianBlur(bev_frame, 21)
+        # Grayscale of the raw camera frame — used for DR optical flow
+        # (sharp, 1920×1080, much better features than the blurred BEV)
+        cam_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv          = cv2.cvtColor(blurred_bev, cv2.COLOR_BGR2HSV)
+        h, s, v      = cv2.split(hsv)
+        clahe        = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        hsv_enh      = cv2.merge([h, s, clahe.apply(v)])
 
-        # --- NIGHT VISION (CLAHE) ---
-        h, s, v = cv2.split(hsv)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        v = clahe.apply(v)
-        hsv_enhanced = cv2.merge([h, s, v])
+        yellow_mask  = cv2.inRange(hsv_enh,
+                                   np.array([18, 40,  30]),
+                                   np.array([45, 255, 255]))
+        kernel_e     = np.ones((7, 7), np.uint8)
+        kernel_v     = np.ones((40, 5), np.uint8)
+        yellow_mask  = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN,  kernel_e)
+        yellow_mask  = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel_v)
+        yellow_mask  = cv2.bitwise_and(yellow_mask, floor_mask)
 
-        # ANTI-SKIN TONE & STATIC
-        lower_yellow = np.array([18, 40, 30])
-        upper_yellow = np.array([45, 255, 255])
-        yellow_mask = cv2.inRange(hsv_enhanced, lower_yellow, upper_yellow)
-
-        # ERASER & BAND-AID
-        kernel_eraser = np.ones((7, 7), np.uint8)
-        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel_eraser)
-
-        kernel_vertical = np.ones((40, 5), np.uint8)
-        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel_vertical)
-
-        # SLICE OFF THE OVERHANG
-        yellow_mask = cv2.bitwise_and(yellow_mask, floor_mask)
-
-        contours, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _  = cv2.findContours(
+            yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         valid_lines = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < 800:
                 continue
-
             rect = cv2.minAreaRect(cnt)
-            (cx, cy), (width, height), angle = rect
-
-            length = max(width, height)
-            thickness = min(width, height)
-
-            if thickness == 0:
+            (cx, cy), (w_, h_), _ = rect
+            length = max(w_, h_); thick = min(w_, h_)
+            if thick == 0:
                 continue
-
-            aspect_ratio = length / thickness
-            box_area = length * thickness
-            fill_factor = area / box_area if box_area > 0 else 0
-
-            if length > 80 and thickness < 70 and aspect_ratio > 3.0 and fill_factor > 0.65:
-                valid_lines.append({
-                    'cx': cx, 'cy': cy,
-                    'thickness': thickness, 'rect': rect
-                })
-
-                box = cv2.boxPoints(rect)
-                box = np.int32(box)
-                cv2.drawContours(bev_frame, [box], 0, (0, 0, 255), 2)
+            ar = length / thick
+            fill = area / (length * thick)
+            if length > 80 and thick < 70 and ar > 3.0 and fill > 0.65:
+                valid_lines.append(
+                    {'cx': cx, 'cy': cy, 'thickness': thick, 'rect': rect})
+                cv2.drawContours(bev_frame,
+                                 [np.int32(cv2.boxPoints(rect))], 0, (0,0,255), 2)
 
         valid_lines = sorted(valid_lines, key=lambda r: r['cx'])
-        overlay = bev_frame.copy()
+        overlay     = bev_frame.copy()
+        line1 = line2 = None
 
-        line1 = None
-        line2 = None
+        # ── 4. GAP + GATE  (original) ───────────────────────────────
+        cm_per_pixel_x = 0.1825
+        cm_per_pixel_y = 0.247
 
-        # ==============================================================
-        # 4. MEASURE THE TRUE PERPENDICULAR INNER GAP
-        # ==============================================================
         if len(valid_lines) >= 2:
             line1 = valid_lines[0]
-
             for l in valid_lines[1:]:
                 if l['cx'] > (line1['cx'] + 15):
                     line2 = l
                     break
 
-            if line2 is not None:
-                box1 = cv2.boxPoints(line1['rect'])
+        ego_state = None
+        gate_px   = None
+        got_gate  = False
 
-                d01 = np.linalg.norm(box1[0] - box1[1])
-                d12 = np.linalg.norm(box1[1] - box1[2])
+        if line1 and line2:
+            box1 = cv2.boxPoints(line1['rect'])
+            d01  = np.linalg.norm(box1[0]-box1[1])
+            d12  = np.linalg.norm(box1[1]-box1[2])
+            if d01 > d12:
+                vx = float(box1[1][0]-box1[0][0]); vy = float(box1[1][1]-box1[0][1])
+            else:
+                vx = float(box1[2][0]-box1[1][0]); vy = float(box1[2][1]-box1[1][1])
 
-                if d01 > d12:
-                    vx = box1[1][0] - box1[0][0]
-                    vy = box1[1][1] - box1[0][1]
-                else:
-                    vx = box1[2][0] - box1[1][0]
-                    vy = box1[2][1] - box1[1][1]
+            mag = math.sqrt(vx**2 + vy**2)
+            if mag > 0: vx, vy = vx/mag, vy/mag
+            else:       vx, vy = 0.0, 1.0
+            nx, ny = -vy, vx
+            if nx < 0: nx, ny = -nx, -ny
 
-                mag = np.sqrt(vx**2 + vy**2)
-                if mag > 0:
-                    vx, vy = vx / mag, vy / mag
-                else:
-                    vx, vy = 0, 1
+            dx, dy  = line2['cx']-line1['cx'], line2['cy']-line1['cy']
+            c_dist  = abs(dx*nx + dy*ny)
+            o1, o2  = line1['thickness']/2, line2['thickness']/2
+            px_gap  = c_dist - o1 - o2
+            real_width_cm = int(px_gap * cm_per_pixel_x)
 
-                nx, ny = -vy, vx
-                if nx < 0:
-                    nx, ny = -nx, -ny
+            if real_width_cm > 0:
+                sx = int(line1['cx']+nx*o1); sy = int(line1['cy']+ny*o1)
+                ex = int(sx+nx*px_gap);       ey = int(sy+ny*px_gap)
+                cv2.line(overlay, (sx,sy), (ex,ey), (0,255,255), 3)
 
-                dx = line2['cx'] - line1['cx']
-                dy = line2['cy'] - line1['cy']
+                tgt_x, tgt_y = (sx+ex)//2, (sy+ey)//2
 
-                center_distance = abs(dx * nx + dy * ny)
+                box2 = cv2.boxPoints(line2['rect'])
+                b1s  = sorted(box1, key=lambda p: p[1])
+                b2s  = sorted(box2, key=lambda p: p[1])
+                gate_x = int(((b1s[2][0]+b1s[3][0])+(b2s[2][0]+b2s[3][0]))/4)
+                gate_y = int(max((b1s[2][1]+b1s[3][1])/2, (b2s[2][1]+b2s[3][1])/2))
+                gate_px = (gate_x, gate_y)
 
-                offset1 = line1['thickness'] / 2
-                offset2 = line2['thickness'] / 2
-                pixel_gap = center_distance - offset1 - offset2
+                lvx, lvy = vx, vy
+                if lvy > 0: lvx, lvy = -lvx, -lvy
+                tilt_deg = math.degrees(math.atan2(lvx, -lvy))
 
-                # --- CALIBRATED SCALES ---
-                cm_per_pixel_x = 0.1825
-                cm_per_pixel_y = 0.247
+                cv2.circle(overlay, gate_px, 8, (0,0,255), -1)
+                cv2.line(overlay, (tgt_x,tgt_y), gate_px, (0,255,0), 1)
 
-                real_width_cm = int(pixel_gap * cm_per_pixel_x)
+                dist_out = (480 - gate_y) * cm_per_pixel_y
+                dist_lng = (320 - gate_x) * cm_per_pixel_x
+                k_y   = int(dist_lng  + (-4.0))
+                k_x   = int(0.5915 * (dist_out + 22.5) + 42.96)
+                k_tlt = int(tilt_deg)
 
-                if real_width_cm > 0:
-                    start_x = int(line1['cx'] + nx * offset1)
-                    start_y = int(line1['cy'] + ny * offset1)
+                # ── FRAME-TO-FRAME EGO UPDATE ───────────────────
+                ego_state = self.estimator.update_visible(
+                    k_x, k_y, float(k_tlt), t_now, cam_gray, gate_px)
+                got_gate = True
 
-                    end_x = int(start_x + nx * pixel_gap)
-                    end_y = int(start_y + ny * pixel_gap)
+                if 75 <= real_width_cm <= 95:
+                    msg = Float32MultiArray()
+                    msg.data = [0.0, 0.0, float(k_x), float(k_y), float(k_tlt)]
+                    self.metrics_pub.publish(msg)
 
-                    # DRAWING: Yellow measuring tape
-                    cv2.line(overlay, (start_x, start_y), (end_x, end_y), (0, 255, 255), 3)
+                cv2.putText(overlay, f"WIDTH: {real_width_cm} cm",
+                            (tgt_x-70, tgt_y-15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+                if 75 <= real_width_cm <= 95:
+                    cv2.putText(overlay, "PERFECT SPOT!",
+                                (tgt_x-70, tgt_y+30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                cv2.putText(overlay, f"WALL: X={k_x}cm  Y={k_y}cm",
+                            (20,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
+                cv2.putText(overlay, f"TILT: {k_tlt} DEG",
+                            (20,60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
 
-                    # 1. FIND THE "FRONT GATE"
-                    target_x = start_x + (end_x - start_x) // 2
-                    target_y = start_y + (end_y - start_y) // 2
+        # ── LOT HIDDEN → optical flow integration ───────────────────
+        if not got_gate:
+            ego_state = self.estimator.update_hidden(
+                t_now, cam_gray, matrix,
+                cm_per_pixel_x, cm_per_pixel_y,
+                floor_y_start=350)
 
-                    box2 = cv2.boxPoints(line2['rect'])
-                    box1_sorted = sorted(box1, key=lambda pt: pt[1])
-                    box2_sorted = sorted(box2, key=lambda pt: pt[1])
+        # ── 5. PUBLISH + DISPLAY EGO POSE ───────────────────────────
+        if ego_state:
+            pm = Float32MultiArray()
+            pm.data = [float(ego_state[k]) for k in
+                       ('x','y','theta','vx','vy','omega','confidence')]
+            self.pose_pub.publish(pm)
 
-                    l1_bottom_y = (box1_sorted[2][1] + box1_sorted[3][1]) / 2
-                    l2_bottom_y = (box2_sorted[2][1] + box2_sorted[3][1]) / 2
+            mode_tag = ego_state['mode']
+            lk_tag   = " ★LOCKED" if ego_state['locked'] \
+                       else f" ({ego_state['streak']}/{EgoPoseEstimator.LOCK_N})"
+            cv2.putText(overlay,
+                        f"EGO X:{ego_state['x']:+.1f} Y:{ego_state['y']:+.1f}"
+                        f" θ:{ego_state['theta']:+.1f}°  [{mode_tag}]{lk_tag}",
+                        (20,90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,180), 2)
+            cv2.putText(overlay,
+                        f"Vx:{ego_state['vx']:+.1f} Vy:{ego_state['vy']:+.1f}"
+                        f"cm/s  ω:{ego_state['omega']:+.1f}°/s"
+                        f"  conf:{ego_state['confidence']:.2f}",
+                        (20,115), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,180), 1)
 
-                    l1_bottom_x = (box1_sorted[2][0] + box1_sorted[3][0]) / 2
-                    l2_bottom_x = (box2_sorted[2][0] + box2_sorted[3][0]) / 2
-
-                    gate_x = int((l1_bottom_x + l2_bottom_x) / 2)
-                    gate_y = int(max(l1_bottom_y, l2_bottom_y))
-
-                    line_vx, line_vy = vx, vy
-                    if line_vy > 0:
-                        line_vx, line_vy = -line_vx, -line_vy
-
-                    screen_angle_rad = math.atan2(line_vx, -line_vy)
-                    tilt_degrees = math.degrees(screen_angle_rad)
-
-                    cv2.circle(overlay, (gate_x, gate_y), 8, (0, 0, 255), -1)
-                    cv2.line(overlay, (target_x, target_y), (gate_x, gate_y), (0, 255, 0), 1)
-
-                    # 2. CALCULATE KART DISTANCE TO FRONT GATE
-                    dist_outward_cm = (480 - gate_y) * cm_per_pixel_y
-                    dist_along_cm   = (320 - gate_x) * cm_per_pixel_x
-
-                    cam_offset_y = -4.0
-                    cam_offset_x = 22.5
-
-                    kart_y_fwd   = dist_along_cm + cam_offset_y
-                    kart_x_right = dist_outward_cm + cam_offset_x
-
-                    # --- LATERAL CALIBRATION CORRECTION ---
-                    # 5-point cal: (103,103),(92,98),(83,93),(74,88),(71,83) → R²=0.97
-                    k_y = int(kart_y_fwd)
-                    k_x = int(0.5915 * kart_x_right + 42.96)
-                    k_tlt = int(tilt_degrees)
-
-                    # ==============================================================
-                    # 3. PUBLISH THE DATA ARRAY
-                    # ==============================================================
-
-                    # ONLY publish if the spot is between 75cm and 95cm (Valid Spot)
-                    if 75 <= real_width_cm <= 95:
-                        metrics_msg = Float32MultiArray()
-
-                        car_start_x  = 0.0
-                        car_start_y  = 0.0
-                        end_target_x = float (k_x)        # Fixed parking lot depth (cm)
-                        end_target_y = float(k_y)   # Lateral offset: car center → front gate center
-                        kart_tilt    = float(k_tlt)
-
-                        metrics_msg.data = [
-                            car_start_x,
-                            car_start_y,
-                            end_target_x,
-                            end_target_y,
-                            kart_tilt
-                        ]
-
-                        self.metrics_pub.publish(metrics_msg)
-
-                    # ==============================================================
-                    # DISPLAY TEXT ON SCREEN
-                    # ==============================================================
-                    text_x = start_x + (end_x - start_x) // 2
-                    text_y = start_y + (end_y - start_y) // 2 - 15
-                    cv2.putText(overlay, f"WIDTH: {real_width_cm} cm", (text_x - 70, text_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-                    if 75 <= real_width_cm <= 95:
-                        cv2.putText(overlay, "PERFECT SPOT!", (text_x - 70, text_y + 45),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-                    cv2.putText(overlay, f"WALL: X={k_x}cm, Y={k_y}cm", (20, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-                    cv2.putText(overlay, f"TILT: {k_tlt} DEG", (20, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-        # ==============================================================
-        # 5. SPATIAL AWARENESS: "AVERAGE PIXEL" ANOMALY DETECTION
-        # ==============================================================
-        safe_floor_mask = cv2.bitwise_and(floor_mask, cv2.bitwise_not(yellow_mask))
-        avg_bgr = cv2.mean(blurred_bev, mask=safe_floor_mask)[:3]
-        avg_background = np.full(bev_frame.shape, avg_bgr, dtype=np.uint8)
-
-        diff = cv2.absdiff(blurred_bev, avg_background)
-        diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-
-        _, object_mask = cv2.threshold(diff_gray, 40, 255, cv2.THRESH_BINARY)
-
-        object_mask = cv2.bitwise_and(object_mask, safe_floor_mask)
-        object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_OPEN, kernel_eraser)
-
-        obj_contours, _ = cv2.findContours(object_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # ==============================================================
-        # 6. OBSTACLE SAFETY CHECK — publishes /lot_obstacle (Bool)
-        # ==============================================================
-        lot_blocked = False
-
-        if line1 is not None and line2 is not None:
-            left_boundary_x  = line1['cx']
-            right_boundary_x = line2['cx']
-
-            for ocnt in obj_contours:
-                if cv2.contourArea(ocnt) > 800:
-                    M = cv2.moments(ocnt)
-                    if M["m00"] > 0:
-                        obj_cx = int(M["m10"] / M["m00"])
-                        obj_cy = int(M["m01"] / M["m00"])
-
-                        inside_lot = (left_boundary_x <= obj_cx <= right_boundary_x)
-
-                        if inside_lot:
-                            # --- OBSTACLE IS INSIDE THE LOT ---
-                            lot_blocked = True
-                            zone_text = "!! OBSTACLE IN LOT !!"
-                            color = (0, 0, 255)  # Red
-
-                            # Bounding box + centre dot
-                            x, y, w, h = cv2.boundingRect(ocnt)
-                            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, 3)
-                            cv2.circle(overlay, (obj_cx, obj_cy), 6, color, -1)
-                            cv2.putText(overlay, zone_text, (x - 20, y - 12),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
-
-                            # Full-screen red flash banner
-                            cv2.rectangle(overlay, (0, 0), (640, 50), (0, 0, 200), -1)
-                            cv2.putText(overlay,
-                                        "DANGER: OBSTACLE INSIDE LOT — PARKING BLOCKED",
-                                        (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                        (255, 255, 255), 2)
-                        else:
-                            # Object outside lot — orange marker only
-                            zone_text = "OBJECT (outside lot)"
-                            color = (255, 140, 0)
-                            x, y, w, h = cv2.boundingRect(ocnt)
-                            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, 2)
-                            cv2.putText(overlay, zone_text, (x - 20, y - 12),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
-
-        # Publish obstacle alert every frame
-        self.obstacle_pub.publish(Bool(data=lot_blocked))
+        # Trajectory trail
+        traj = list(self.estimator.traj_px)
+        for i in range(1, len(traj)):
+            cv2.line(overlay, traj[i-1], traj[i], (255,100,0), 2)
+        if traj:
+            cv2.circle(overlay, traj[-1], 5, (0,150,255), -1)
 
         cv2.addWeighted(overlay, 0.4, bev_frame, 0.6, 0, bev_frame)
 
-        # 7. SHOW THE FEEDS
-        cv2.imshow("1. Normal img", frame)
-        cv2.imshow("2. BEV img", bev_frame)
-        cv2.imshow("3. Line Mask", yellow_mask)
-        cv2.imshow("4. Anomaly Mask", object_mask)
+        # ── 6. OBSTACLE DETECTION  (original) ───────────────────────
+        safe_mask   = cv2.bitwise_and(floor_mask, cv2.bitwise_not(yellow_mask))
+        avg_bgr     = cv2.mean(blurred_bev, mask=safe_mask)[:3]
+        avg_bg      = np.full(bev_frame.shape, avg_bgr, dtype=np.uint8)
+        diff_gray   = cv2.cvtColor(cv2.absdiff(blurred_bev, avg_bg), cv2.COLOR_BGR2GRAY)
+        _, obj_mask = cv2.threshold(diff_gray, 40, 255, cv2.THRESH_BINARY)
+        obj_mask    = cv2.bitwise_and(obj_mask, safe_mask)
+        obj_mask    = cv2.morphologyEx(obj_mask, cv2.MORPH_OPEN, kernel_e)
+        obj_cnts, _ = cv2.findContours(obj_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        lot_blocked = False
+        if line1 and line2:
+            for ocnt in obj_cnts:
+                if cv2.contourArea(ocnt) < 800:
+                    continue
+                M = cv2.moments(ocnt)
+                if M["m00"] == 0: continue
+                ocx = int(M["m10"]/M["m00"]); ocy = int(M["m01"]/M["m00"])
+                x, y, w, h = cv2.boundingRect(ocnt)
+                if line1['cx'] <= ocx <= line2['cx']:
+                    lot_blocked = True
+                    cv2.rectangle(bev_frame,(x,y),(x+w,y+h),(0,0,255),3)
+                    cv2.putText(bev_frame,"!! OBSTACLE IN LOT !!",(x-20,y-12),
+                                cv2.FONT_HERSHEY_SIMPLEX,0.65,(0,0,255),2)
+                    cv2.rectangle(bev_frame,(0,0),(640,50),(0,0,200),-1)
+                    cv2.putText(bev_frame,"DANGER: OBSTACLE INSIDE LOT — PARKING BLOCKED",
+                                (10,35),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+                else:
+                    cv2.rectangle(bev_frame,(x,y),(x+w,y+h),(255,140,0),2)
+                    cv2.putText(bev_frame,"OBJECT (outside lot)",(x-20,y-12),
+                                cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,140,0),1)
+
+        self.obstacle_pub.publish(Bool(data=lot_blocked))
+
+        # ── 7. TILED DISPLAY  2×2  480×360 ──────────────────────────
+        TILE_W, TILE_H = 480, 360
+        panels = [
+            (frame,                                        "1 CAMERA 1920x1080"),
+            (bev_frame,                                    "2 BEV 640x480"),
+            (cv2.cvtColor(yellow_mask, cv2.COLOR_GRAY2BGR), "3 YELLOW MASK"),
+            (cv2.cvtColor(obj_mask,    cv2.COLOR_GRAY2BGR), "4 OBSTACLE MASK"),
+        ]
+        tiles = []
+        for img, label in panels:
+            tile = cv2.resize(img, (TILE_W, TILE_H), interpolation=cv2.INTER_AREA)
+            cv2.rectangle(tile, (0,0), (TILE_W,26), (20,20,20), -1)
+            cv2.putText(tile, label, (6,18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,230,230), 1, cv2.LINE_AA)
+            tiles.append(tile)
+
+        grid = np.vstack([np.hstack(tiles[:2]), np.hstack(tiles[2:])])
+        cv2.imshow("LotDetector", grid)
         cv2.waitKey(1)
 
 
+# ================================================================
 def main(args=None):
     rclpy.init(args=args)
     node = LotDetector()
@@ -393,7 +481,6 @@ def main(args=None):
     node.destroy_node()
     cv2.destroyAllWindows()
     rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

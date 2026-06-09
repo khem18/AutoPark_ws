@@ -47,13 +47,8 @@ from std_msgs.msg import String, Float32MultiArray
 #   Each ~10 px upward adds ~5–8 cm of real depth at the far end.
 #   If the top corners clip the image edge (<0 or >1280) move them inward
 #   by equal amounts and reduce MAX_VISIBLE_CM accordingly.
-#
-#   FIX: top was accidentally left at y=490 (the old value) even though
-#   MAX_VISIBLE_CM was updated to 330 cm.  y=490 only captures the close
-#   region of the slot; the back wall at ~165 cm was completely outside the
-#   warped frame → detection always failed.  Corrected to y=370 as intended.
 SRC_POINTS = np.float32([
-    [220, 370], [970, 370],   # far edge  (top of BEV)   ← y=370 (was 490)
+    [220, 490], [970, 490],   # far edge  (top of BEV)   ← pushed up & wider
     [1110, 720], [70, 720],   # near edge (bottom of BEV) ← slightly wider
 ])
 
@@ -266,15 +261,11 @@ class RearCamTracker(Node):
 
     def __init__(self):
         super().__init__('rear_cam_tracker')
-        self.declare_parameter('debug_view', False)
-        self.debug_view = bool(self.get_parameter('debug_view').value)
-
         self.bridge    = CvBridge()
         self.M_bev     = cv2.getPerspectiveTransform(SRC_POINTS, DST_POINTS)
         self.active    = False
         self._tilt_ema = None
         self._dist_ema = None
-        self._frame_count = 0   # diagnostic: total frames processed while active
 
         self.metrics_pub = self.create_publisher(
             Float32MultiArray, '/rear_parking_metrics', 1)
@@ -293,18 +284,11 @@ class RearCamTracker(Node):
             cmd = json.loads(msg.data)
         except json.JSONDecodeError:
             return
-        if cmd.get('type') == 'rear_cam_activate':
-            # Pre-measure: autopark_master sends this between Move2 and Move3
-            self.active = True
-            self._tilt_ema = self._dist_ema = None
-            self._frame_count = 0
-            self.get_logger().info('ACTIVATED (pre-measure for Move3)')
-        elif cmd.get('type') == 'drive' and cmd.get('label') == 'rev_straight_d4':
+        if cmd.get('type') == 'drive' and cmd.get('label') == 'rev_straight_d4':
             if not self.active:
                 self.active = True
                 self._tilt_ema = self._dist_ema = None
-                self._frame_count = 0
-                self.get_logger().info('ACTIVATED (rev_straight_d4)')
+                self.get_logger().info('ACTIVATED')
         elif cmd.get('type') == 'stop' and self.active:
             self.active = False
             self.get_logger().info('DEACTIVATED')
@@ -320,26 +304,16 @@ class RearCamTracker(Node):
 
         bgr = cv2.flip(bgr, -1)
 
-        self._frame_count += 1
         tilt_raw, dist_raw, wall_exited, dbg = self._process(bgr)
 
         self._tilt_ema = self._ema(self._tilt_ema, tilt_raw, EMA_TILT)
         self._dist_ema = self._ema(self._dist_ema, dist_raw, EMA_DIST)
-        # Keep 1 decimal: round() to int truncates 0.4° tilt → 0° (sign lost).
-        tilt_s = round(self._tilt_ema, 1) if self._tilt_ema is not None else None
-        dist_s = round(self._dist_ema)    if self._dist_ema is not None else None
-
-        # Diagnostic: every 25 frames log raw values so you can see detection
-        # without the debug window.
-        if self._frame_count % 25 == 1:
-            self.get_logger().info(
-                f'[diag] frame={self._frame_count}'
-                f'  tilt_raw={tilt_raw}  dist_raw={dist_raw}'
-                f'  tilt_ema={self._tilt_ema}  dist_ema={self._dist_ema}')
+        tilt_s = round(self._tilt_ema) if self._tilt_ema is not None else None
+        dist_s = round(self._dist_ema) if self._dist_ema is not None else None
 
         stop = wall_exited or (dist_s is not None and dist_s <= STOP_DISTANCE_CM)
 
-        if self.debug_view and dbg is not None:
+        if dbg is not None:
             cv2.imshow('Rear Cam Tracker Debug', dbg)
             cv2.waitKey(1)
 
@@ -385,17 +359,12 @@ class RearCamTracker(Node):
         dist_cm, wall_y, wall_exited = measure_distance(detections, smask)
         
         if dist_cm is not None:
-            # ── Distance calibration (SRC_POINTS top y=370) ──────────────────
-            # OLD regression ((dist + 64.8571) / 1.8029) - 26 was fit to SRC top
-            # y=490.  With y=370 the perspective warp is re-scaled; back-calculation
-            # from a single measured point confirms the raw pixel-to-cm value is
-            # already accurate:
-            #   raw ≈ 111 cm,  real measured ≈ 111 cm  →  regression correction ≈ 0.
-            # Use a simple scale factor (update once more calibration points exist):
-            #   scale = real / raw  →  111 / 111 = 1.00  (effectively no-op for now)
-            dist_cm = dist_cm * 1.00     # re-measure and adjust once more points known
+            # --- UPDATED LINEAR REGRESSION CALIBRATION ---   200 190 174 154 133 112   
+            # Convert raw tracker dist_cm (Y) to real calibrated distance (X)
+            # using: real = (tracker + 49.4242) / 1.4636
+            dist_cm = ((dist_cm + 64.8571) / 1.8029) - 26            
             # Bound check and rounding
-            dist_cm = max(0.0, dist_cm)
+            dist_cm = max(0.0, dist_cm) 
             dist_cm = int(round(dist_cm))
 
         # ── Debug overlay ──────────────────────────────────────────────────
