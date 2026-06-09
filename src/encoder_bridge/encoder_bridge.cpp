@@ -198,8 +198,12 @@ public:
                 if (msg->data) steer_ready_flag_.store(true);
             });
 
+        // FIX: publish /enc_status at 25ms (40Hz) instead of 100ms (10Hz).
+        // _wait_arc_imu checks enc every 40ms.  With 100ms updates the arc
+        // overshoots by up to 6mm (0.26°) because it sees a stale reading.
+        // At 25ms updates, worst-case overshoot drops to 2.4mm (0.10°).
         timer_ = create_wall_timer(
-            std::chrono::milliseconds(100),
+            std::chrono::milliseconds(25),
             [this]() { publish_status(); });
 
         {

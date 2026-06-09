@@ -95,12 +95,24 @@ class AutoparkMaster(Node):
             # ── IMU arc stopping (Move 2) ───────────────────────────────────
             ("imu_arc_stop_enabled",         True),
             # Fraction of full arc angle at which to send STOP.
-            # 0.51 → stop at ~51% of arc (gives physical car time to coast to end).
             ("imu_arc_stop_factor",          0.51),
-            # Seconds to wait after arc starts before checking IMU delta:
-            ("imu_arc_wait_before_check_s",  0.3),
+            # When encoder_bridge boosts session_arc past threshold (passenger load),
+            # use this smaller factor so the faster arc still stops in the slot.
+            ("imu_arc_stop_factor_stuck",    0.48),
+            ("arc_stuck_speed_threshold_mps", 0.06),
+            # Seconds to wait after arc starts before checking IMU delta.
+            # Must exceed motor spin-up (~0.5-1 s).
+            ("imu_arc_wait_before_check_s",  1.0),
+            # Arc reversal detection: if arc angle drops from peak, car reversed.
+            ("imu_arc_reversal_enabled",     True),
+            ("imu_arc_reversal_min_deg",     10.0),
+            ("imu_arc_reversal_drop_deg",     3.0),
             # Hard timeout if IMU stop never triggers:
             ("imu_arc_stop_timeout_s",       120.0),
+            # Time-based fallback when IMU unavailable.  0.0 = auto-calculate.
+            ("arc_fallback_time_s",          0.0),
+            # Encoder distance as primary arc-stop backup when IMU = 0.
+            ("imu_arc_enc_backup_enabled",   True),
 
             # ── Encoder result wait ─────────────────────────────────────────
             # Timeout for waiting on /enc_result after a Move 1 or 3 command:
@@ -158,8 +170,15 @@ class AutoparkMaster(Node):
 
         self.imu_arc_stop_enabled      = bool(gp("imu_arc_stop_enabled"))
         self.imu_arc_stop_factor       = float(gp("imu_arc_stop_factor"))
+        self.imu_arc_stop_factor_stuck = float(gp("imu_arc_stop_factor_stuck"))
+        self.arc_stuck_speed_threshold = float(gp("arc_stuck_speed_threshold_mps"))
         self.imu_arc_wait_s            = float(gp("imu_arc_wait_before_check_s"))
+        self.imu_arc_reversal_enabled  = bool(gp("imu_arc_reversal_enabled"))
+        self.imu_arc_reversal_min_deg  = float(gp("imu_arc_reversal_min_deg"))
+        self.imu_arc_reversal_drop_deg = float(gp("imu_arc_reversal_drop_deg"))
         self.imu_arc_stop_timeout_s    = float(gp("imu_arc_stop_timeout_s"))
+        self.arc_fallback_time_s       = float(gp("arc_fallback_time_s"))
+        self.imu_arc_enc_backup        = bool(gp("imu_arc_enc_backup_enabled"))
 
         self.enc_result_timeout_s      = float(gp("enc_result_timeout_s"))
 
@@ -196,9 +215,11 @@ class AutoparkMaster(Node):
         # IMU state
         # latest_yaw_rad: from quaternion (often identity on mpu6050_cpp → unreliable)
         # latest_gyro_z:  angular_velocity.z in rad/s — always valid on MPU6050
-        self.latest_yaw_rad    = 0.0
-        self.latest_gyro_z     = 0.0   # rad/s, used for arc yaw integration
-        self.imu_received      = False
+        self.latest_gyro_z     = 0.0       # rad/s (latest raw rate)
+        self.imu_yaw_deg       = 0.0       # continuously integrated heading (deg)
+        self.last_imu_time     = 0.0       # monotonic time of last IMU message
+        self.imu_received      = False     # True once first message arrives
+        self._arc_peak         = 0.0       # peak arc angle for reversal detection
 
         # Encoder bridge state
         self.enc_result_event  = threading.Event()
@@ -249,12 +270,25 @@ class AutoparkMaster(Node):
             self.latest_us = vals[:8]
 
     def on_imu(self, msg: Imu):
-        self.latest_yaw_rad = _yaw_from_imu(msg)
-        # Store gyro Z rate — used for arc angle integration.
-        # mpu6050_cpp publishes valid angular_velocity even when orientation
-        # quaternion is identity (no fusion running), so this is the reliable source.
-        self.latest_gyro_z  = msg.angular_velocity.z
+        # ROOT CAUSE FIX: pre-integrate at full IMU rate (200 Hz) instead of
+        # storing a snapshot.  The old code stored only latest_gyro_z and let
+        # _wait_arc_imu re-integrate at 20 Hz (50 ms sleep), losing 90% of
+        # samples — making the arc-angle estimate wildly wrong.
+        #
+        # This mirrors the working version (v_next4): every incoming message
+        # immediately updates imu_yaw_deg.  _wait_arc_imu reads the already-
+        # integrated value via _adelta(imu_start, self.imu_yaw_deg).
+        now = time.monotonic()
         self.imu_received   = True
+        if self.last_imu_time <= 0.0:
+            self.last_imu_time = now
+            return
+        dt = now - self.last_imu_time
+        self.last_imu_time  = now
+        if 0.0 < dt < 0.2:          # guard against timer jumps
+            wz = float(msg.angular_velocity.z)
+            self.latest_gyro_z = wz
+            self.imu_yaw_deg  += math.degrees(wz * dt)
 
     def on_enc_result(self, msg: String):
         self.enc_result_data = msg.data
@@ -476,7 +510,7 @@ class AutoparkMaster(Node):
 
             # ── Wait for segment completion ───────────────────────────
             if is_arc:
-                self._wait_arc_imu(s23, R_m, i, n)
+                self._wait_arc_imu(s23, R_m, i, n, rd_before)
             else:
                 self._wait_enc_result(dist_m, i, n, rd_before)
 
@@ -537,77 +571,178 @@ class AutoparkMaster(Node):
                     f"enc_result TIMEOUT after {elapsed:.1f}s — continuing")
                 return
 
-    def _wait_arc_imu(self, s23_m, R_m, seg_idx, n):
+    def _wait_arc_imu(self, s23_m, R_m, seg_idx, n, rd_before: float = 0.0):
+        """
+        Wait for arc (Move 2) to reach its target angle, then return so the
+        caller can send STOP.
+
+        Stop hierarchy (checked every 40 ms):
+          1. IMU yaw  — primary.  imu_yaw_deg is pre-integrated at 200 Hz by
+                        on_imu(); read via _adelta(imu_start, self.imu_yaw_deg).
+          2. Encoder  — backup when IMU = 0.  encoder_bridge tracks right-wheel
+                        distance; arc_stop when traveled >= s23 * stop_factor.
+          3. Reversal — if arc angle drops from its peak, car reversed; stop early.
+          4. Time     — final fallback if both IMU and encoder are unavailable.
+        """
         arc_rad      = s23_m / max(R_m, 0.001)
         arc_deg_full = math.degrees(arc_rad)
-        stop_deg     = arc_deg_full * self.imu_arc_stop_factor
         timeout      = self.imu_arc_stop_timeout_s
 
+        # ── Stop-factor: normal vs. stuck/boosted arc speed ───────────────
+        # When encoder_bridge boosts session_arc (passenger load), the car
+        # moves faster → it needs to stop earlier to land in the slot.
+        arc_trig_deg = arc_deg_full * self.imu_arc_stop_factor
+        enc_stop_dist = s23_m * self.imu_arc_stop_factor
+
+        # ── Time-based fallback duration ──────────────────────────────────
+        # FIX: old code used s23/speed * 1.5 = ~70 s (full-arc time, no factor).
+        #      Correct: s23 * factor / speed * 1.2 = ~28 s.
+        if self.arc_fallback_time_s > 0:
+            fallback_total = self.arc_fallback_time_s
+        else:
+            fallback_total = (
+                s23_m * self.imu_arc_stop_factor
+                / max(self.speed_scale, 0.001) * 1.2)
+
+        # ── IMU freshness ─────────────────────────────────────────────────
+        imu_fresh = (self.last_imu_time > 0
+                     and (time.monotonic() - self.last_imu_time) < 2.0)
+
         self.get_logger().info(
-            f"[IMU arc] arc={arc_deg_full:.1f}°  stop_trig={stop_deg:.1f}°  "
-            f"factor={self.imu_arc_stop_factor}  (gyro integration)")
+            f"[IMU arc] arc={arc_deg_full:.1f}°  "
+            f"trig={arc_trig_deg:.1f}°  factor={self.imu_arc_stop_factor}  "
+            f"imu_fresh={imu_fresh}  fallback={fallback_total:.1f}s  "
+            f"enc_backup={'ON' if self.imu_arc_enc_backup else 'OFF'}")
 
-        if not self.imu_arc_stop_enabled or not self.imu_received:
-            reason = "disabled" if not self.imu_arc_stop_enabled else "IMU not ready"
-            fallback_s = s23_m / max(self.speed_scale, 0.01) * 1.5
+        # ── IMU disabled or not ready → immediate time fallback ───────────
+        if not self.imu_arc_stop_enabled or not imu_fresh:
+            reason = ("disabled" if not self.imu_arc_stop_enabled
+                      else "IMU not ready/fresh")
             self.get_logger().warning(
-                f"[IMU arc] {reason} — time-based fallback ({fallback_s:.1f}s)")
-            time.sleep(min(fallback_s, timeout))
-            return   # caller sends stop
+                f"[IMU arc] {reason} — time-based fallback ({fallback_total:.1f}s)")
+            time.sleep(min(fallback_total, timeout))
+            return
 
-        gyro_integral_rad = 0.0
-        t0       = time.monotonic()
-        t_last   = t0
-        last_log = 0.0
-        gyro_zero_fallback_fired = False   # ← NEW: track if fallback already fired
+        # ── Live monitoring loop ──────────────────────────────────────────
+        imu_start  = self.imu_yaw_deg   # snapshot heading at arc start
+        self._arc_peak = 0.0            # reset reversal tracker
+        t0         = time.monotonic()
+        last_log   = 0.0
+
+        # Gyro-zero sustained tracking (backup if IMU stops mid-arc).
+        # FIXED: old code checked abs(latest_gyro_z) < math.radians(0.5)/0.04
+        # which equals 12.5 deg/s — fires even when car rotates at 4-5 deg/s!
+        # New approach: track how much imu_yaw_deg actually changed over
+        # GYRO_ZERO_SUSTAINED_S seconds.  If total yaw change < 1.0 deg in
+        # 2 s the IMU is truly frozen; otherwise it is working fine.
+        GYRO_ZERO_SUSTAINED_S    = 2.0
+        gyro_zero_start          = None   # time when zero-streak began
+        gyro_zero_yaw_at_start   = 0.0    # imu_yaw_deg snapshot when streak began
+        time_based_deadline      = None
+
+        # Stuck-speed arc factor (apply once per arc)
+        arc_stuck_factor_applied = False
 
         while True:
-            time.sleep(0.05)
+            time.sleep(0.04)
             now     = time.monotonic()
-            dt      = now - t_last
-            t_last  = now
             elapsed = now - t0
 
-            gyro_integral_rad += self.latest_gyro_z * dt
-            delta_deg = math.degrees(abs(gyro_integral_rad))
+            # ── 1. Stuck-speed: switch to smaller factor if arc is boosted ─
+            if (not arc_stuck_factor_applied
+                    and self.imu_arc_stop_factor_stuck < self.imu_arc_stop_factor
+                    and False):  # stub: arc_stuck speed check (requires encoder_bridge session_arc topic)
+                old_trig     = arc_trig_deg
+                arc_trig_deg = arc_deg_full * self.imu_arc_stop_factor_stuck
+                enc_stop_dist = s23_m * self.imu_arc_stop_factor_stuck
+                arc_stuck_factor_applied = True
+                self.get_logger().info(
+                    f"[IMU arc] stuck-boost detected "
+                    f"(sess_arc={self.session_arc_rev_speed_:.3f} m/s) → "
+                    f"trig {old_trig:.1f}° → {arc_trig_deg:.1f}°")
 
-            # ── Gyro-zero fallback ──────────────────────────────────────
-            # FIX: check on every tick after warm-up, not just a 150ms window
-            if (not gyro_zero_fallback_fired
-                    and elapsed >= self.imu_arc_wait_s
-                    and abs(gyro_integral_rad) < math.radians(0.5)):
-                gyro_zero_fallback_fired = True
-                fallback_s = max(0.1, s23_m / max(self.speed_scale, 0.01) * 1.5 - elapsed)
+            # ── 2. IMU yaw arc stop (primary) ──────────────────────────────
+            if elapsed >= self.imu_arc_wait_s:
+                cur_arc = abs(self._adelta(imu_start, self.imu_yaw_deg))
+
+                if cur_arc >= arc_trig_deg:
+                    self.get_logger().info(
+                        f"LOG: stop=imu_arc_stop_seg_{seg_idx + 1}  "
+                        f"elapsed={elapsed:.2f}s  imu_arc={cur_arc:.2f}°")
+                    return
+
+                # Reversal detection
+                if self.imu_arc_reversal_enabled:
+                    if cur_arc > self._arc_peak:
+                        self._arc_peak = cur_arc
+                    elif (self._arc_peak >= self.imu_arc_reversal_min_deg
+                            and (self._arc_peak - cur_arc) >= self.imu_arc_reversal_drop_deg):
+                        self.get_logger().warning(
+                            f"[IMU arc] reversal: peak={self._arc_peak:.1f}° "
+                            f"cur={cur_arc:.1f}° → stop early")
+                        return
+
+            # ── 3. Encoder arc stop (backup when IMU = 0) ──────────────────
+            if self.imu_arc_enc_backup:
+                enc_traveled = abs(self.latest_enc_rd - rd_before)
+                if enc_traveled >= enc_stop_dist:
+                    self.get_logger().info(
+                        f"LOG: stop=enc_arc_stop_seg_{seg_idx + 1}  "
+                        f"elapsed={elapsed:.2f}s  "
+                        f"enc={enc_traveled:.4f}/{enc_stop_dist:.4f}m")
+                    return
+
+            # ── 4. Gyro-zero sustained fallback ────────────────────────────
+            if elapsed >= self.imu_arc_wait_s and time_based_deadline is None:
+                # Track yaw change since the start of this potential zero-streak.
+                # Fires fallback only if < 1.0 deg accumulated over 2 consecutive s.
+                if gyro_zero_start is None:
+                    gyro_zero_start        = now
+                    gyro_zero_yaw_at_start = self.imu_yaw_deg
+                else:
+                    yaw_moved = abs(self._adelta(gyro_zero_yaw_at_start,
+                                                 self.imu_yaw_deg))
+                    if yaw_moved >= 1.0:
+                        # IMU is accumulating — reset streak
+                        if (now - gyro_zero_start) >= 0.5:
+                            self.get_logger().info(
+                                f"[IMU arc] IMU active "
+                                f"(+{yaw_moved:.1f}° in "
+                                f"{now - gyro_zero_start:.1f}s) — "
+                                f"gyro-zero streak reset")
+                        gyro_zero_start        = now
+                        gyro_zero_yaw_at_start = self.imu_yaw_deg
+                    elif (now - gyro_zero_start) >= GYRO_ZERO_SUSTAINED_S:
+                        # < 1° yaw change in 2 s → IMU truly frozen
+                        remaining = max(0.1, fallback_total - elapsed)
+                        time_based_deadline = now + remaining
+                        self.get_logger().warning(
+                            f"[IMU arc] yaw moved only {yaw_moved:.2f}° in "
+                            f"{now - gyro_zero_start:.1f}s after {elapsed:.1f}s — "
+                            f"IMU frozen, time-based deadline in {remaining:.1f}s")
+
+            # ── 5. Time-based deadline ──────────────────────────────────────
+            if time_based_deadline is not None and now >= time_based_deadline:
                 self.get_logger().warning(
-                    f"[IMU arc] gyro reads ~0 after {elapsed:.1f}s — "
-                    f"time-based fallback ({fallback_s:.1f}s)")
-                time.sleep(fallback_s)
-                return   # caller sends stop
-
-            if elapsed - last_log >= 0.5:
-                self.get_logger().info(
-                    f"DRIVE {elapsed:.2f}/{timeout:.2f}s "
-                    f"arc={delta_deg:.1f}/{arc_deg_full:.1f}°")
-                last_log = elapsed
-
-            if elapsed >= self.imu_arc_wait_s and delta_deg >= stop_deg:
-                self.get_logger().info(
-                    f"LOG: stop=imu_arc_stop_seg_{seg_idx + 1}  "
-                    f"elapsed={elapsed:.2f}s  imu_delta={delta_deg:.2f}°")
+                    f"[IMU arc] time-based stop at elapsed={elapsed:.1f}s")
                 return
 
+            # ── 6. Hard timeout ─────────────────────────────────────────────
             if elapsed >= timeout:
                 self.get_logger().warning(
-                    f"[IMU arc] timeout after {elapsed:.1f}s")
+                    f"[IMU arc] hard timeout after {elapsed:.1f}s")
                 return
 
-    # ─────────────────────────────────────────────────────────────────
-    # Kinetic ultrasonic centering (post-parking)
-    # ─────────────────────────────────────────────────────────────────
-    #
-    # Phase A: forward creep, streaming steer updates from L/R US.
-    # Phase B: reverse straight to rear-US target depth.
-    # ─────────────────────────────────────────────────────────────────
+            # ── 7. Progress log ─────────────────────────────────────────────
+            if elapsed - last_log >= 0.5:
+                cur_arc = abs(self._adelta(imu_start, self.imu_yaw_deg))
+                enc_t = abs(self.latest_enc_rd - rd_before) if self.imu_arc_enc_backup else 0.0
+                self.get_logger().info(
+                    f"DRIVE {elapsed:.2f}/{timeout:.2f}s  "
+                    f"imu={cur_arc:.1f}/{arc_trig_deg:.1f}°  "
+                    f"enc={enc_t:.4f}/{enc_stop_dist:.4f}m")
+                last_log = elapsed
+
 
     def _run_kinetic_centering(self):
         SPEED    = self.us_correction_speed_mps
@@ -775,6 +910,14 @@ class AutoparkMaster(Node):
         self.cmd_pub.publish(
             String(data=json.dumps({"type": "led", "color": color})))
         self.get_logger().info(f"LED → {color}")
+
+    @staticmethod
+    def _adelta(a: float, b: float) -> float:
+        """Signed angle delta b-a, wrapped to (-180, +180]."""
+        d = float(b) - float(a)
+        while d >  180.0: d -= 360.0
+        while d < -180.0: d += 360.0
+        return d
 
     def publish_stop(self, reason):
         self.cmd_pub.publish(
