@@ -1,5 +1,6 @@
 import json
 import math
+import threading
 import time
 from typing import Optional
 
@@ -148,8 +149,18 @@ class AutoparkMaster(Node):
             self.get_logger().warning("ignored start switch because busy")
             return
         self.busy = True
+        # Launch in a daemon thread so the ROS executor keeps spinning.
+        # Without this, on_ultrasonic() never fires during parking because
+        # rclpy.spin() is blocked waiting for this callback to return.
+        threading.Thread(target=self._parking_thread, daemon=True).start()
+
+    def _parking_thread(self):
         try:
             self.start_autopark()
+        except Exception as exc:
+            self.get_logger().error(f"parking thread: {exc}")
+            self._led("red")
+            self.publish_stop("parking_exception")
         finally:
             self.busy = False
 
@@ -189,6 +200,7 @@ class AutoparkMaster(Node):
 
         if not motions:
             self.plan_pub.publish(String(data=json.dumps(result)))
+            self._led("red")
             self.publish_stop("planner_returned_empty_motion_sequence")
             return
 
@@ -207,6 +219,7 @@ class AutoparkMaster(Node):
             # ── Step 3: depth correction (rear wall 20 ± 6 cm) ───────
             self._run_depth_correction()
 
+        self._led("green")
         self.publish_stop("parking_complete")
 
     # ── Planner motion execution (unchanged) ──────────────────────────
@@ -462,7 +475,9 @@ class AutoparkMaster(Node):
                 duration = max(0.4, dist / max(speed_mps, 0.05))
 
         speed_mps = min(abs(speed_mps), self.speed_scale)
-        duration  = max(1.2, min(duration, 2.0))
+        # Old clamp max(1.2, min(duration, 2.0)) truncated the arc to only
+        # 0.24 m travel. Arc needs ~15 s at speed_scale=0.12 m/s. Fixed.
+        duration  = max(0.5, min(duration, 60.0))
 
         return {
             "type":      "drive",
@@ -471,6 +486,12 @@ class AutoparkMaster(Node):
             "steer_deg": steer_deg,
             "duration":  duration,
         }
+
+    def _led(self, color: str):
+        """Send LED colour command to ESP32 via serial_bridge."""
+        self.cmd_pub.publish(
+            String(data=json.dumps({"type": "led", "color": color})))
+        self.get_logger().info(f"LED → {color}")
 
     def publish_stop(self, reason):
         self.cmd_pub.publish(
