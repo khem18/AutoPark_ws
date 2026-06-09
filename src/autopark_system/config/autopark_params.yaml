@@ -37,8 +37,28 @@ autopark_master:
     camera_pose_max_age_s:   3.0
 
     # Steer / speed
-    speed_scale:           0.01     # ← was 0.12 in zip; slippery floor tuning
+    # ── Speed & wheel compensation ────────────────────────────────
+    speed_scale:           0.03     # ← 0.03 m/s (was 0.01); arc move uses this directly
     max_command_steer_deg: 30.0
+
+    # Left-wheel slower compensation.  +ve = right bias.
+    # gear=+1 straight: steer += +bias  (corrects leftward fwd drift)
+    # gear=-1 straight: steer += -bias  (corrects rightward rev drift)
+    # Tune: start 0.0 → increase in 0.5° steps until straight.
+    steer_straight_bias_deg: 0.0
+    steer_bias_apply_thresh_deg: 2.0
+
+    # ── IMU arc stopping (Move 2) ─────────────────────────────────
+    imu_topic:                   "/imu/data_raw"
+    imu_arc_stop_enabled:        true
+    imu_arc_stop_factor:         0.51    # stop at 51% of arc yaw change
+    imu_arc_wait_before_check_s: 0.30
+    imu_arc_stop_timeout_s:      120.0
+
+    # ── Encoder result & status topics ───────────────────────────
+    enc_result_topic:    "/enc_result"
+    enc_status_topic:    "/enc_status"
+    enc_result_timeout_s: 130.0
 
     # Steer settle
     steer_ready_timeout_s:  10.0
@@ -116,6 +136,40 @@ autopark_master:
     disable_ultrasonic_block:   true
     min_clearance_m:            0.12
     us_safety_start_delay_s:    0.50
+
+    # ── Ultrasonic centering mode ──────────────────────────────────────
+    # us_center_enable: master on/off for ALL post-park US correction
+    # us_kinetic_enable: true  → kinetic (continuous-motion) centering  [NEW]
+    #                   false → legacy discrete stop-measure-correct loop
+    us_center_enable:            true
+    us_kinetic_enable:           true    # ← kinetic centering ON
+
+    # Kinetic Phase-A (forward creep with live steer for lateral):
+    us_kinetic_fwd_max_m:        0.12    # max 12 cm forward travel
+    # Kinetic Phase-B (reverse straight, stopped by rear US for depth):
+    us_kinetic_rev_max_m:        0.25    # max 25 cm reverse travel
+    # Control rate for streaming steer/speed updates (Hz):
+    us_kinetic_update_hz:        10.0    # 100 ms per update tick
+    # Pause between Phase-A and Phase-B:
+    us_kinetic_settle_s:         0.40
+
+    # Shared US params (used by both kinetic and legacy modes)
+    us_left_idx:                 1
+    us_right_idx:                2
+    us_rear_idx:                 6
+    us_deadband_m:               0.060   # 6 cm — within this → skip lateral phase
+    us_steer_gain:               150.0   # error * gain = steer_deg
+    us_max_steer_deg:            15.0
+    us_correction_speed_mps:     0.06    # speed during kinetic + legacy moves
+    us_correction_dist_m:        0.12    # legacy mode: fixed step distance
+    us_max_attempts:             3       # legacy mode only
+    us_rear_target_m:            0.20    # 20 cm from rear wall
+    us_rear_tolerance_m:         0.06    # ± 6 cm
+    us_depth_max_step_m:         0.04    # legacy depth: max one-step correction
+    us_depth_max_attempts:       4       # legacy depth only
+    us_stop_buffer_s:            0.20
+    us_stop_settle_s:            0.60
+    us_steer_wait_s:             2.0     # time to pre-steer before moving
 
     # Rear-camera Move3 correction
     rear_cam_enabled:          false

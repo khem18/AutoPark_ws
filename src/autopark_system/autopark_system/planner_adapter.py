@@ -1,5 +1,5 @@
 """
-planner_adapter.py  —  Analytical Geometric Perpendicular Parking Planner v6
+planner_adapter.py  —  Analytical Geometric Perpendicular Parking Planner v5
 =============================================================================
 Arc steer = −30° (LEFT steer, gear=−1 → CCW rotation → correct path direction)
 
@@ -8,26 +8,14 @@ WHY:
   gear=−1  steer=+30°  kappa>0  dθ=(−1)(+|k|)ds = −|k|ds < 0  → CW   ✗
 
 CCW arc from yaw=π (facing aisle) to yaw=3π/2 (front faces aisle, rear faces slot):
-  Δx_lateral = +R = +1.335 m  (car moves from −R to 0, centred in slot)
-  Δy_depth   = +R = +1.335 m  (car moves toward slot entrance)
+  Δx_lateral = +R = +1.28 m  (car moves from −1.28 to 0, perfectly centred)
+  Δy_depth   = +R = +1.28 m  (car moves toward slot entrance)
   Final yaw  = 3π/2  →  reverse (gear=−1) moves in +y = INTO SLOT  ✓
 
-v6 changes (for 1-second replan loop + rear-cam + US centering architecture):
-  Move 1 now has TWO paths selected by how far the car is from the slot entrance:
-
-    x0_aisle >= R  →  STRAIGHT  (steer1 = 0°)
-      Car is R or more from slot. Arc has natural room; no pre-angle needed.
-      steer = 0° = spring-return default, so steer_ready fires almost instantly.
-      Saves ~2 s of steer-settle time vs the 30° path.
-      d1 = R_MIN_STEER × |theta_1| (same short formula as the steer path).
-
-    x0_aisle < R   →  MAXSTEER  (steer1 = −30°)
-      Car is less than R from slot. Max steer pre-angles in minimum distance.
-      d1 = R_MIN_STEER × |theta_1| ≈ 0.30 m  (86 % shorter than old ~2.2 m).
-      Lateral residual (~22 cm) is corrected by rear_cam + US4/US5 centering.
-
-  Arc (s23) and Move 3 (d4) formulas are identical for both paths.
-  d4 fallback buffer reduced from +0.40 m to +0.20 m."""
+The original forward-momentum issue (first test was fast = 7.64°/s because car
+was still coasting from fwd_setup) is now resolved — fwd_setup speed is slow
+(0.033 m/s) and there is a 1.2 s pause between moves.
+"""
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
@@ -121,22 +109,19 @@ def _analytical_plan(start_x: float, start_y: float,
       y = lateral          (positive = right side, car approach side)
       yaw = π              (car front faces −x = faces aisle)
 
-    Equations (v6 — two paths for Move 1):
+    Equations:
+      R    = WB / tan(30°)  = 1.2800 m  (measured: 1.335 m)
+      d1   = y_lateral + R + 0.1        ← forward setup LEFT  (gear=+1, steer=0°)
+      s23  = R × π/2 = 2.097 m          ← reverse CCW arc      (gear=−1, steer=+30°)
+      d4   = TGT_X_AXLE − (y0_depth+R)  ← reverse into slot    (gear=−1, steer=0°)
+                                           rear US 200 mm = PRIMARY stop
 
-      x0_aisle = −start_x  (distance from slot entrance, always positive)
+    Camera detection range: x = −0.225 m to −1.125 m (−22.5 cm to −112.5 cm).
+    The arc requires only that (y0_depth + R) > 0, i.e. start_x > −R = −1.335 m,
+    which is satisfied across the full camera detection range.
 
-      IF x0_aisle >= R  (car is far from slot → STRAIGHT Move 1):
-        d1      = R_MIN_STEER × |theta_1|   steer1 = 0°
-      ELSE           (car is close to slot → MAXSTEER Move 1):
-        d1      = R_MIN_STEER × |theta_1|   steer1 = −30°
-
-      s23     = R × (π/2 − theta_m1)    ← reverse CCW arc  (same for both paths)
-      d4      = −y0_depth + 0.20        ← reverse into slot (rear_cam overrides)
-
-    STRAIGHT path: steer=0° is the spring-return default; steer_ready fires
-    almost instantly, saving ~2 s of settle time.
-    MAXSTEER path: pre-angles the car in ~0.30 m before the arc; residual
-    lateral error is corrected by rear_cam (yaw) and US4/US5 (lateral).
+    After arc: car at lateral=0 (centred), depth = y0_depth + R (slot entrance region),
+    then d4 reverses straight into the slot until rear US fires.
     """
     x0_lateral = start_y    # lateral offset (right=+)
     y0_depth   = start_x    # depth (in aisle = negative)
@@ -154,49 +139,41 @@ def _analytical_plan(start_x: float, start_y: float,
                               case_name, [], [], {}, 1e9),
             motions=[])
 
-    # ── Move 1 decision ───────────────────────────────────────────────────
-    # R_MIN_STEER = WB / tan(30°) = 1.280 m — the tightest the steering can turn.
-    # x0_aisle = distance the car is from the slot entrance (always positive).
-    #
-    # Two paths based on how far the car is from the slot:
-    #
-    #   x0_aisle >= R  →  STRAIGHT path (steer1 = 0°)
-    #     The car is R or more from the slot entrance.  The arc has natural
-    #     room; no pre-angle is needed.  steer=0° is the spring-return default,
-    #     so steer_ready fires almost instantly — saves ~2 s of settle time vs 30°.
-    #     d1 uses the same short formula as the steer path.
-    #
-    #   x0_aisle < R   →  MAXSTEER path (steer1 = −30°)
-    #     Car is less than R from the slot entrance.  Max steer pre-angles the
-    #     car in the minimum distance (~0.30 m) before the arc.
-    #     Residual lateral error (~22 cm) is corrected by rear_cam + US centering.
-    #
-    # Both paths use d1 = R_MIN_STEER × |theta_1| (same short formula).
-    # The arc (s23) and d4 are identical in both cases.
+    # ── Move 1 geometric formula (from diagram) ───────────────────────────
+    # θm1 = atan2(R − y0, x0 + R)
+    #   y0 = x0_lateral (lateral offset from slot centre)
+    #   x0 = −y0_depth  (aisle depth, positive = further from slot)
+    # θ1  = θm1 − θ0   where θ0 = yaw deviation from π (= 0 when perfectly aligned)
+    # steer1 chosen so r1 = d1/θ1 ≥ r_min (= WB/tan(30°) = 1.280 m)
+    # Benefit: when x0_lateral (y0) is small, θ1 is large and the steer in Move1
+    # pre-angles the car so the arc (Move2) still fits within steer_max = 30°.
     R_MIN_STEER = WB / math.tan(math.radians(STEER_MAX))   # 1.280 m
 
-    x0_aisle   = -y0_depth                      # aisle depth (always positive)
+    x0_aisle   = -y0_depth    # aisle depth (positive)
     theta_m1   = math.atan2(R - x0_lateral, x0_aisle + R)
-    theta_0    = yaw_rad - math.pi               # yaw deviation from π (ideal = 0)
-    theta_1    = theta_m1 - theta_0             # yaw change needed in Move 1
+    theta_0    = yaw_rad - math.pi           # yaw deviation from π (ideal = 0)
+    theta_1    = theta_m1 - theta_0         # yaw change needed in Move1
 
-    if x0_aisle >= R:
-        # ── STRAIGHT path: car is far enough, no steer needed ────────────
-        r1         = R_MIN_STEER
-        d1         = max(r1 * abs(theta_1), 0.10)
-        steer1_deg = 0.0                         # 0° = spring default, settles instantly
+    d1_geo     = x0_lateral + R + 0.15            # original lateral formula (baseline)
 
-    elif abs(theta_1) < math.radians(1.0):
-        # ── Nearly aligned and close — short straight run ─────────────────
-        d1_geo     = x0_lateral + R + 0.05
+    if abs(theta_1) < math.radians(1.0):
+        # Nearly straight ahead — keep original formula, steer = 0
         d1         = max(d1_geo, 0.10)
         steer1_deg = 0.0
-
     else:
-        # ── MAXSTEER path: car is close (x0_aisle < R), pre-angle needed ──
-        r1         = R_MIN_STEER
-        d1         = max(r1 * abs(theta_1), 0.10)
-        steer1_deg = -STEER_MAX                  # −30° → steer_ready fires after settle
+        # Curved Move1: r1 = d1/|θ1|, steer = atan(WB/r1)
+        # Use geometric d1 as baseline; r1 from that.
+        # If r1 < r_min (steer would exceed 30°), extend d1 to r_min*|θ1|.
+        d1_geo     = max(d1_geo, 0.10)
+        r1_from_geo = d1_geo / abs(theta_1)
+        r1          = max(r1_from_geo, R_MIN_STEER)
+        d1          = r1 * abs(theta_1)
+        # Negative steer: Move1 gear=+1 forward with LEFT steer → yaw decreases.
+        # This pre-angles in the SAME direction as the arc (arc also decreases yaw π→π/2).
+        # Positive steer would yaw AWAY from arc direction (wrong).
+        steer1_deg  = -min(
+            math.degrees(math.atan(WB / r1)),
+            STEER_MAX)
 
     d1  = max(d1, 0.10)
     # Move 2 arc distance — user formula (from diagram):
@@ -207,9 +184,7 @@ def _analytical_plan(start_x: float, start_y: float,
     # When θm1=15.9° (y=0.70): s23 = 1.727m (shorter arc). ✓
     s23 = R * (math.pi / 2 - theta_m1)   # = πR × (90-θm1_deg) / 180
     s23 = max(s23, 0.10)  # safety: never negative
-    d4  = -y0_depth + 0.20   # fallback only — rear_cam overrides at runtime
-                              # reduced buffer (0.40→0.20) to avoid over-travel
-                              # if rear_cam fails
+    d4  = -y0_depth + 0.40
 
     if d1 < -0.01:
         reason = f"lateral_too_left: d1={d1:.3f} (lateral={x0_lateral:.3f} < −R)"
@@ -279,30 +254,13 @@ def _analytical_plan(start_x: float, start_y: float,
         "yaw_err_deg": 0.0,
         "x_f": x_f, "y_f": y_f,
         "R_m": R,
-        "d1_m": d1, "steer1_deg": round(steer1_deg, 2),
-        "theta1_deg": round(math.degrees(theta_1), 2),
-        "s23_m": s23,
-        "theta_m1_deg": round(math.degrees(theta_m1), 2),
-        "d4_m": d4,
-        "d4_fallback_m": round(d4, 4),
-        # arc_end_depth: positive = arc dips into slot entrance (OK).
+        "d1_m": d1, "steer1_deg": round(steer1_deg, 2), "theta1_deg": round(math.degrees(theta_1), 2), "s23_m": s23, "theta_m1_deg": round(math.degrees(theta_m1), 2), "d4_m": d4,
+        "d4_fallback_m": round(d4, 4),   # planner estimate; overridden at runtime by rear cam
+        # arc_end_depth: positive = arc dips into slot entrance (OK); negative = stays in aisle.
         "arc_end_depth_m": round(y0_depth + R, 4),
         "arc_in_aisle": (y0_depth + R) <= 0.01,
         "arc_steer_note": "+30° (RIGHT steer + reverse = CCW = correct direction)",
-        "move3_rear_cam": True,
-        # ── v6 formula info ──────────────────────────────────────────────
-        # Records which Move 1 path was selected.
-        "move1_path":    "straight" if steer1_deg == 0.0 else "maxsteer",
-        "move1_reason":  (
-            "x0_aisle>=R: straight (no pre-angle needed)"  if x0_aisle >= R
-            else "theta1<1deg: nearly aligned"             if abs(theta_1) < math.radians(1.0)
-            else "x0_aisle<R: maxsteer (pre-angle required)"
-        ),
-        # Rough time estimates at typical speeds (for 20-second target tracking).
-        # Actual times depend on encoder_bridge speeds and YAML tuning.
-        "est_d1_time_s":  round(d1  / 0.10, 2),   # Move 1 @ 0.10 m/s
-        "est_arc_time_s": round(s23 / 0.236, 2),   # Arc    @ 0.236 m/s (physics limit)
-        "est_d4_time_s":  round(d4  / 0.15, 2),    # Move 3 @ 0.15 m/s (tuned d4_speed)
+        "move3_rear_cam": True,   # Move3 steer/dist overridden by rear camera at runtime
     }
 
     ok = (metrics["rear_clear"] >= 0.015
@@ -314,7 +272,7 @@ def _analytical_plan(start_x: float, start_y: float,
     return PlannedPath(
         result=PlanResult(
             success=True, practical_success=ok, strict_success=ok,
-            reason="analytical_success", planner="analytical_v6",
+            reason="analytical_success", planner="analytical_v5",
             case_name=case_name, primitive_seq=primitives,
             path=path, metrics=metrics, score=0.0),
         motions=motions)
@@ -355,24 +313,16 @@ def result_to_dict(planned: PlannedPath) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print(f"R = {R:.4f} m   R_MIN_STEER = {WB/math.tan(math.radians(STEER_MAX)):.4f} m")
-    print(f"Boundary: start_x = {-R:.4f} m  (x0_aisle = R = {R:.4f} m)")
+    print(f"R = {R:.4f} m   s23 = {R*math.pi/2:.4f} m   TGT = {TGT_X_AXLE:.4f} m")
     print()
-
-    cases = [
-        (-1.28, 0.70, "default  (x0_aisle < R → MAXSTEER)"),
-        (-1.50, 0.70, "far     (x0_aisle > R → STRAIGHT)"),
-    ]
-    for sx, sy, label in cases:
-        p = plan_from_start(sx, sy, 180.0, "right_only")
-        d = result_to_dict(p)
-        m = d["metrics"]
-        print(f"--- {label} ---")
-        print(f"  move1_path : {m['move1_path']}  ({m['move1_reason']})")
-        print(f"  d1         : {m['d1_m']:.4f} m  steer1 = {m['steer1_deg']:+.1f}°")
-        print(f"  s23        : {m['s23_m']:.4f} m  (arc)")
-        print(f"  d4 fallback: {m['d4_m']:.4f} m  (rear_cam overrides)")
-        print(f"  est. times : M1={m['est_d1_time_s']:.1f}s  arc={m['est_arc_time_s']:.1f}s  M3={m['est_d4_time_s']:.1f}s")
-        total = m['est_d1_time_s'] + m['est_arc_time_s'] + m['est_d4_time_s']
-        print(f"  drive total: {total:.1f} s  + overhead → ~{total+7:.0f} s")
-        print()
+    p = plan_from_start(-1.28, 0.70, 180.0, "right_only")
+    d = result_to_dict(p)
+    m = d["metrics"]
+    print(f"d1  = {m['d1_m']:.4f} m  (fwd setup)")
+    print(f"s23 = {m['s23_m']:.4f} m  (rev CCW arc, steer=−30°)")
+    print(f"d4  = {m['d4_m']:.4f} m  (rev straight into slot)")
+    print(f"Rear clearance  = {m['rear_clear']*1000:.0f} mm")
+    print(f"Side clearances = {m['left_clear']*1000:.0f} mm / {m['right_clear']*1000:.0f} mm")
+    print(f"Arc in aisle    = {m['arc_in_aisle']}")
+    print()
+    print(f"Note: {m['arc_steer_note']}")
