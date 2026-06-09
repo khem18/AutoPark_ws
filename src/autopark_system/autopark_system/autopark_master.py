@@ -95,10 +95,10 @@ class AutoparkMaster(Node):
             # ── IMU arc stopping (Move 2) ───────────────────────────────────
             ("imu_arc_stop_enabled",         True),
             # Fraction of full arc angle at which to send STOP.
-            ("imu_arc_stop_factor",          0.51),
+            ("imu_arc_stop_factor",          0.88),
             # When encoder_bridge boosts session_arc past threshold (passenger load),
             # use this smaller factor so the faster arc still stops in the slot.
-            ("imu_arc_stop_factor_stuck",    0.48),
+            ("imu_arc_stop_factor_stuck",    0.85),
             ("arc_stuck_speed_threshold_mps", 0.06),
             # Seconds to wait after arc starts before checking IMU delta.
             # Must exceed motor spin-up (~0.5-1 s).

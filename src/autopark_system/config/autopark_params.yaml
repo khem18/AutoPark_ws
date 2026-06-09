@@ -51,8 +51,8 @@ autopark_master:
     # ── IMU arc stopping (Move 2) ─────────────────────────────────
     imu_topic:                   "/imu/data_raw"
     imu_arc_stop_enabled:        true
-    imu_arc_stop_factor:         0.71    # stop at 51% of arc yaw change
-    imu_arc_stop_factor_stuck:   0.68   # smaller factor when arc is boosted (passenger load)
+    imu_arc_stop_factor:         0.88    # stop at 51% of arc yaw change
+    imu_arc_stop_factor_stuck:   0.85   # smaller factor when arc is boosted (passenger load)
     arc_stuck_speed_threshold_mps: 0.06 # session_arc speed above which stuck-factor applies
     imu_arc_wait_before_check_s: 1.00   # FIX was 0.30 — car needs ~1s to start rotating
     imu_arc_reversal_enabled:    true   # stop early if arc angle drops from peak
@@ -93,8 +93,8 @@ autopark_master:
     # IMU arc stop
     imu_arc_stop_enabled:         true
     imu_arc_min_steer_deg:        8.0
-    imu_arc_stop_factor:          0.51
-    imu_arc_stop_factor_stuck:    0.48
+    imu_arc_stop_factor:          0.88
+    imu_arc_stop_factor_stuck:    0.85
     arc_stuck_speed_threshold_mps: 0.06
     imu_arc_wait_before_check_s:  1.0   # FIX was 0.3
     imu_arc_reversal_enabled:     true

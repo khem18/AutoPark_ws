@@ -154,7 +154,7 @@ def _analytical_plan(start_x: float, start_y: float,
     theta_0    = yaw_rad - math.pi           # yaw deviation from π (ideal = 0)
     theta_1    = theta_m1 - theta_0         # yaw change needed in Move1
 
-    d1_geo     = x0_lateral + R + 0.15            # original lateral formula (baseline)
+    d1_geo     = x0_lateral + R + 0.12            # original lateral formula (baseline)
 
     if abs(theta_1) < math.radians(1.0):
         # Nearly straight ahead — keep original formula, steer = 0
