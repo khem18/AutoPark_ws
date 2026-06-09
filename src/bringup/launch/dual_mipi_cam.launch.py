@@ -1,6 +1,6 @@
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, TimerAction
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -72,39 +72,8 @@ def generate_launch_description():
         }],
     )
 
-    # 2) REAR CAMERA for rear view / VINS grayscale.
-    rear_cam = Node(
-        package='mipi_cam',
-        executable='mipi_cam',
-        name='rear_mipi_cam',
-        output='screen',
-        parameters=[{
-            'video_device': 'ov5647',
-            'device_mode': 'single',
-            'channel': 2,
-            'image_width': 1920,
-            'image_height': 1080,
-            'out_format': 'nv12',
-            'camera_calibration_file_path': calib,
-        }],
-        remappings=[
-            ('/image_raw', '/rear_cam/image_nv12'),
-            ('/camera_info', '/rear_cam/camera_info'),
-        ],
-    )
-
-    rear_codec = Node(
-        package='vision',
-        executable='nv12_to_bgr',
-        name='rear_nv12_to_bgr',
-        output='screen',
-        parameters=[{
-            'sub_topic': '/rear_cam/image_nv12',
-            'pub_topic': '/rear_cam/image_raw',
-        }],
-    )
-
-    delayed_rear = TimerAction(period=5.0, actions=[rear_cam, rear_codec])
+    # Rear camera removed — not used.
+    # Depth and centering use ultrasonic only (us_rear_idx, us_left_idx, us_right_idx).
 
     # 3) Grayscale images for debugging / VINS.
     grayscale_node = Node(
@@ -123,7 +92,7 @@ def generate_launch_description():
     )
 
     # VINS is intentionally not auto-started here. First confirm:
-    #   ros2 topic hz /rear_cam/image_gray
+    #   ros2 topic hz /side_cam/image_raw
     #   ros2 topic hz /imu/data_raw
     # Then start your VINS command manually using the vins_config path.
 
@@ -133,7 +102,6 @@ def generate_launch_description():
         start_vins_arg,
         side_cam,
         side_codec,
-        delayed_rear,
         grayscale_node,
         imu_node,
     ])

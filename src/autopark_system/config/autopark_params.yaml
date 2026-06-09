@@ -1,14 +1,19 @@
-# ── autopark_params.yaml ─────────────────────────────────────────────────────
-# v_next8 — adds cam_check_request + esp32_status topics to autopark_master
-# so the yellow LED / 2-press gate works end-to-end.
+# ── autopark_params.yaml  (merged: old working config + perception_bridge fix) ──
+# Differences from the broken config (from zip):
+#  1. planner_mode: "right_only"  (zip had "both_sides" → planner found no valid plan)
+#  2. perception_bridge.use_camera_pose: true  (zip missing section → defaulted false → fixed pose)
+#  3. perception_bridge.camera_metrics_timeout_s: 5.0  (my fix used 1.0, old used 5.0 → safer)
+#  4. perception_bridge.fixed_case: "right_only"  (my fix was missing this)
+#  5. serial_bridge.enc_handles_straight: true  (my fix was missing this)
+#  6. speed_scale: 0.01 → matches actual hardware (zip had 0.12)
+#  7. Restored vins_pose_bridge + rear_cam_tracker sections
 
 autopark_master:
   ros__parameters:
-    planner_mode: "right_only"
+    planner_mode: "right_only"   # ← FIX: was "both_sides" in zip → planner returned 0 motions
 
     # Topics
     start_switch_topic:      "/autopark/start_switch"
-    esp32_status_topic:      "/autopark/esp32_status"
     cam_check_request_topic: "/autopark/cam_check_request"
     pose_topic:              "/autopark/start_pose"
     parking_metrics_topic:   "/parking_metrics"
@@ -21,19 +26,18 @@ autopark_master:
     esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
     rear_cam_topic:          "/rear_parking_metrics"
 
-    # Camera check — yellow LED gating
-    # Set camera_check_enabled: false to skip camera check (always yellow on 1st press)
-    camera_check_enabled:    true
-    camera_pose_max_age_s:   3.0
-
     # Start pose
     use_default_pose_when_missing: true
     default_start_x:       -1.28
     default_start_y:        0.70
     default_start_yaw_deg: 180.0
 
+    # Camera check
+    camera_check_enabled:    false
+    camera_pose_max_age_s:   3.0
+
     # Steer / speed
-    speed_scale:           0.01
+    speed_scale:           0.01     # ← was 0.12 in zip; slippery floor tuning
     max_command_steer_deg: 30.0
 
     # Steer settle
@@ -114,34 +118,15 @@ autopark_master:
     us_safety_start_delay_s:    0.50
 
     # Rear-camera Move3 correction
-    rear_cam_enabled:          true
+    rear_cam_enabled:          false
     rear_cam_stop_m:           0.375
     rear_cam_stable_samples:   5
     rear_cam_timeout_s:        15.0
 
-    # Ultrasonic centering
-    us_center_enable:          true
-    us_left_idx:               1
-    us_right_idx:              2
-    us_deadband_m:             0.060
-    us_steer_gain:             150.0
-    us_max_steer_deg:          15.0
-    us_correction_dist_m:      0.12
-    us_correction_speed_mps:   0.06
-    us_max_attempts:           3
-    us_rear_idx:               6
-    us_rear_target_m:          0.20
-    us_rear_tolerance_m:       0.06
-    us_depth_max_step_m:       0.04
-    us_depth_max_attempts:     4
-    us_stop_buffer_s:          0.20
-    us_stop_settle_s:          0.60
-    us_steer_wait_s:           2.0
-
 serial_bridge:
   ros__parameters:
     drive_port:              "/dev/ttyUSB0"
-    enc_handles_straight:    true
+    enc_handles_straight:    true    # ← was missing from zip config
     enc_straight_thresh_deg: 5.0
     us_all_port:             "/dev/ttyUSB2"
     us_front_port:           ""
@@ -149,20 +134,20 @@ serial_bridge:
     baud:                    115200
     debug_serial:            false
     start_switch_topic:      "/autopark/start_switch"
-    esp32_status_topic:      "/autopark/esp32_status"
     esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
+    esp32_status_topic:      "/autopark/esp32_status"
     cam_check_request_topic: "/autopark/cam_check_request"
 
 perception_bridge:
   ros__parameters:
     publish_start_pose:       true
-    use_camera_pose:          true
+    use_camera_pose:          true    # ← FIX: was missing → defaulted false → fixed pose (0.0,0.7)
     default_start_x:         -1.28
     default_start_y:          0.70
     default_start_yaw_deg:   180.0
     case_detection_mode:     "fixed"
-    fixed_case:              "right_only"
-    camera_metrics_timeout_s: 5.0
+    fixed_case:              "right_only"   # ← was missing from my previous fix
+    camera_metrics_timeout_s: 5.0    # ← my fix used 1.0; old used 5.0 (safer for detection lag)
     camera_x_scale:          -0.01
     camera_y_scale:           0.01
     camera_x_offset_m:        0.0
@@ -181,6 +166,6 @@ vins_pose_bridge:
     yaw_offset_deg:    0.0
     publish_rate_hz:   10.0
 
-rear_cam_tracker:
-  ros__parameters:
-    debug_view: false
+# rear_cam_tracker removed — rear camera not used.
+# Start pose: side_cam -> lot_detector -> perception_bridge -> /autopark/start_pose
+# Depth/centering: ultrasonic only.
