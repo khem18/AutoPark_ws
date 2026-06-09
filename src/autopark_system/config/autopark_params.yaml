@@ -1,70 +1,171 @@
+# ── autopark_params.yaml  (merged: old working config + perception_bridge fix) ──
+# Differences from the broken config (from zip):
+#  1. planner_mode: "right_only"  (zip had "both_sides" → planner found no valid plan)
+#  2. perception_bridge.use_camera_pose: true  (zip missing section → defaulted false → fixed pose)
+#  3. perception_bridge.camera_metrics_timeout_s: 5.0  (my fix used 1.0, old used 5.0 → safer)
+#  4. perception_bridge.fixed_case: "right_only"  (my fix was missing this)
+#  5. serial_bridge.enc_handles_straight: true  (my fix was missing this)
+#  6. speed_scale: 0.01 → matches actual hardware (zip had 0.12)
+#  7. Restored vins_pose_bridge + rear_cam_tracker sections
+
 autopark_master:
   ros__parameters:
-    planner_mode: "both_sides"
+    planner_mode: "right_only"   # ← FIX: was "both_sides" in zip → planner returned 0 motions
+
+    # Topics
+    start_switch_topic:      "/autopark/start_switch"
+    cam_check_request_topic: "/autopark/cam_check_request"
+    pose_topic:              "/autopark/start_pose"
+    parking_metrics_topic:   "/parking_metrics"
+    ultrasonic_topic:        "/autopark/ultrasonic"
+    command_topic:           "/autopark/cmd_json"
+    plan_topic:              "/autopark/plan_result"
+    slot_topic:              "/autopark/slot_info"
+    flow_distance_topic:     "/autopark/flow_distance"
+    imu_topic:               "/imu/data_raw"
+    esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
+    rear_cam_topic:          "/rear_parking_metrics"
+
+    # Start pose
     use_default_pose_when_missing: true
-    default_start_x: -1.28    # was 0.00 → planner rejected (x must be ≤ -0.10)
-    default_start_y: 0.70
+    default_start_x:       -1.28
+    default_start_y:        0.70
     default_start_yaw_deg: 180.0
-    disable_ultrasonic_block: true
-    steer_wait_seconds: 4.0
-    speed_scale: 0.12
 
-    # ── Replan loop ───────────────────────────────────────────────────
-    replan_interval_s: 1.0
-    replan_max_attempts: 10
+    # Camera check
+    camera_check_enabled:    false
+    camera_pose_max_age_s:   3.0
 
-    # ── Ultrasonic post-park correction ──────────────────────────────
-    us_center_enable: true
+    # Steer / speed
+    speed_scale:           0.01     # ← was 0.12 in zip; slippery floor tuning
+    max_command_steer_deg: 30.0
 
-    # ── Lateral (left / right wall) centering ────────────────────────
-    us_left_idx: 1
-    us_right_idx: 2
-    us_deadband_m: 0.060        # ignore errors smaller than 6 cm
-    us_steer_gain: 150.0        # correction_steer = error_m × gain (deg/m)
-    us_max_steer_deg: 15.0
-    us_correction_dist_m: 0.12  # exit + re-enter distance per attempt
-    us_max_attempts: 3
+    # Steer settle
+    steer_ready_timeout_s:  10.0
+    steer_settle_pause_s:   0.5
+    steer_wait_fallback_s:  6.0
+    pause_between_commands: 5.0
+    motor_start_delay_s:    1.8
+    arc_fallback_time_s:    12.0
 
-    # ── Depth (rear wall) correction ─────────────────────────────────
-    us_rear_idx: 6
-    us_rear_target_m: 0.20      # target = 20 cm from rear wall
-    us_rear_tolerance_m: 0.06   # ±6 cm  →  window [14, 26] cm
-    us_depth_max_step_m: 0.04   # max reverse per depth step (safety cap)
-    us_depth_max_attempts: 4
+    # Calibrated speeds
+    forward_turn_speed_mps:       0.225
+    reverse_turn_speed_mps:       0.236
+    forward_straight_speed_mps:   0.060
+    reverse_straight_speed_mps:   0.040
+    straight_steer_threshold_deg: 3.0
 
-    # ── Stop timing ───────────────────────────────────────────────────
-    # us_stop_buffer_s is used for:
-    #   • Time-based moves: stop this many seconds early (legacy)
-    #   • Real-time US moves: lead time = buffer × speed
-    #     At 0.06 m/s → lead = 0.20 × 0.06 = 1.2 cm
-    #     Trigger fires at 20 + 1.2 = 21.2 cm so car coasts to ≈20 cm
-    us_stop_buffer_s: 0.20
-    us_stop_settle_s: 0.60      # wait after stop before reading sensors
-    us_steer_wait_s: 2.0        # steer settle for correction moves only
-    us_correction_speed_mps: 0.06
+    # Timing
+    max_segment_dist_m: 2.5
+    min_chunk_dist_m:   0.10
+    drive_time_min_s:   1.0
+    drive_time_max_s:   120.0
 
-    # ── Real-time US monitoring ───────────────────────────────────────
-    # Poll rate during active correction moves.
-    # 50 Hz → check every 20 ms; at 0.06 m/s → 0.12 cm per tick.
-    # Increase if sensor publishes faster; decrease if CPU is tight.
-    us_monitor_hz: 50.0
+    # IMU arc stop
+    imu_arc_stop_enabled:         true
+    imu_arc_min_steer_deg:        8.0
+    imu_arc_stop_factor:          0.51
+    imu_arc_wait_before_check_s:  0.3
+    imu_arc_reversal_enabled:    true
+    imu_arc_reversal_min_deg:    10.0
+    imu_arc_reversal_drop_deg:    3.0
+    imu_arc_stop_factor_stuck:      0.48
+    arc_stuck_speed_threshold_mps:  0.06
+
+    # IMU straight heading correction
+    imu_straight_correct_enabled:    true
+    imu_straight_correct_thresh_deg: 2.0
+    imu_straight_correct_gain:       1.5
+    imu_straight_correct_max_deg:    8.0
+
+    # Flow stop (disabled)
+    flow_straight_stop_enabled:         false
+    flow_straight_stop_factor:          0.90
+    flow_straight_wait_before_check_s:  0.3
+
+    # Rear US stop
+    rear_ultrasonic_stop_m:  0.200
+    rear_us_indices: [6]
+    d4_speed_mps:            0.003
+
+    # All-sensor emergency stop
+    drive_ultrasonic_safety: false
+    ultrasonic_stop_m:       0.050
+
+    # Stuck detection
+    enable_stuck_detection:   true
+    stuck_check_after_s:      15.0
+    stuck_gyro_min_rads:      0.006
+    stuck_flow_delta_min_m:   0.005
+    stuck_kick_speed_mps:     0.10
+    stuck_kick_duration_s:    0.5
+    stuck_retry_pause_s:      0.2
+    stuck_max_retries:        1
+
+    # Steer stuck kick
+    steer_stuck_kick_enabled:           true
+    steer_stuck_kick_overshoot:         2.5
+    steer_stuck_kick_limit_deg:         75.0
+    steer_stuck_kick_hold_s:            1.0
+    steer_stuck_kick_retries:           3
+    steer_stuck_kick_drive_speed_mps:   0.08
+    steer_stuck_kick_timeout_s:         3.0
+
+    flow_valid_required:        false
+    send_arm_command_on_start:  false
+    disable_ultrasonic_block:   true
+    min_clearance_m:            0.12
+    us_safety_start_delay_s:    0.50
+
+    # Rear-camera Move3 correction
+    rear_cam_enabled:          true
+    rear_cam_stop_m:           0.375
+    rear_cam_stable_samples:   5
+    rear_cam_timeout_s:        15.0
 
 serial_bridge:
   ros__parameters:
-    drive_port: "/dev/ttyUSB0"
-    us_front_port: ""
-    us_rear_port: ""
-    us_all_port: "/dev/ttyUSB2"
-    baud: 115200
+    drive_port:              "/dev/ttyUSB0"
+    enc_handles_straight:    true    # ← was missing from zip config
+    enc_straight_thresh_deg: 5.0
+    us_all_port:             "/dev/ttyUSB2"
+    us_front_port:           ""
+    us_rear_port:            ""
+    baud:                    115200
+    debug_serial:            false
+    start_switch_topic:      "/autopark/start_switch"
+    esp32_steer_ready_topic: "/autopark/esp32_steer_ready"
+    esp32_status_topic:      "/autopark/esp32_status"
+    cam_check_request_topic: "/autopark/cam_check_request"
+
+perception_bridge:
+  ros__parameters:
+    publish_start_pose:       true
+    use_camera_pose:          true    # ← FIX: was missing → defaulted false → fixed pose (0.0,0.7)
+    default_start_x:         -1.28
+    default_start_y:          0.70
+    default_start_yaw_deg:   180.0
+    case_detection_mode:     "fixed"
+    fixed_case:              "right_only"   # ← was missing from my previous fix
+    camera_metrics_timeout_s: 5.0    # ← my fix used 1.0; old used 5.0 (safer for detection lag)
+    camera_x_scale:          -0.01
+    camera_y_scale:           0.01
+    camera_x_offset_m:        0.0
+    camera_y_offset_m:        0.0
 
 motion_executor:
   ros__parameters:
     plan_topic: "/autopark/plan_result_disabled"
-    drive_topic: "/autopark/cmd_json"
-    speed_scale: 0.035
-    steer_scale: 0.5
-    stop_between_segments: true
 
-slot_detector:
+vins_pose_bridge:
   ros__parameters:
-    use_mock_detection: true
+    odom_topic:       "/vins_estimator/odometry"
+    start_pose_topic: "/autopark/start_pose"
+    x_offset:          0.0
+    y_offset:          0.0
+    yaw_offset_deg:    0.0
+    publish_rate_hz:   10.0
+
+rear_cam_tracker:
+  ros__parameters:
+    debug_view: false
