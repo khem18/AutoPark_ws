@@ -1,12 +1,14 @@
 """
-serial_bridge.py  —  v_next7
-Fixes vs v_next5:
-  1. enc_handles_straight param: when True, do NOT forward straight
-     drive commands (|steer_deg|≤5° and speed>0) to ttyUSB2.
-     encoder_bridge.cpp handles those with closed-loop encoder control.
-     Arc commands (|steer_deg|>5°) and non-drive commands are always forwarded.
-  2. Subscribes to /enc_busy so it knows when encoder is actively driving —
-     even if a steer command sneaks through, it stops forwarding while busy.
+serial_bridge.py  —  v_next8
+Changes vs v_next7:
+  1. publishStatus() in the ESP32 firmware sends a full JSON every 100 ms
+     that includes btn_state.  This is received on the drive port (ttyUSB0)
+     and forwarded on /autopark/esp32_status so autopark_master can watch
+     for btn_state=="parking" to start the parking thread.
+  2. on_cam_check_request topic is still published (True/False) so
+     autopark_master.on_cam_check_request() can respond with yellow/red.
+  3. start_switch is still published as Bool for any other subscribers
+     that need it.
 """
 import json, re, time
 from typing import List, Tuple
@@ -31,10 +33,7 @@ class SerialBridge(Node):
             ('us_rear_port',  ''),
             ('baud',          115200),
             ('debug_serial',  False),
-            # v6: when True, encoder_bridge handles straight moves;
-            # serial_bridge skips forwarding them to avoid port conflicts.
             ('enc_handles_straight', True),
-            # threshold in degrees — must match encoder_bridge straight_steer_thresh
             ('enc_straight_thresh_deg', 5.0),
         ]:
             self.declare_parameter(name, default)
@@ -50,7 +49,6 @@ class SerialBridge(Node):
         self.enc_handles_straight   = bool(gp('enc_handles_straight'))
         self.enc_straight_thresh    = float(gp('enc_straight_thresh_deg'))
 
-        # v6: enc_busy flag set by /enc_busy topic from encoder_bridge
         self.enc_busy = False
 
         try:
@@ -80,12 +78,11 @@ class SerialBridge(Node):
 
         self.timer = self.create_timer(0.05, self.poll_serial)
         self.get_logger().info(
-            f'serial_bridge v_next6 started  '
+            f'serial_bridge v_next8 started  '
             f'enc_handles_straight={self.enc_handles_straight}  '
             f'thresh={self.enc_straight_thresh}°')
 
     def on_enc_busy(self, msg: Bool):
-        """Track whether encoder_bridge is actively driving a straight move."""
         self.enc_busy = bool(msg.data)
 
     def _open(self, port, baud):
@@ -99,46 +96,19 @@ class SerialBridge(Node):
             self.get_logger().warning(f'Cannot open {port}: {e}')
             return None
 
-    def _is_straight_drive(self, json_str: str) -> bool:
-        """Return True if this is a straight drive command encoder_bridge should handle."""
-        try:
-            obj = json.loads(json_str)
-            if obj.get('type') != 'drive':
-                return False
-            steer = abs(float(obj.get('steer_deg', 999.0)))
-            speed = float(obj.get('speed_mps', 0.0))
-            gear  = int(obj.get('gear', 0))
-            return steer <= self.enc_straight_thresh and speed > 0.0 and gear != 0
-        except Exception:
-            return False
-
     def on_cmd(self, msg: String):
         if self.drive is None:
             self.get_logger().error('drive serial NOT open')
             return
 
-        # v8 filter fix: only block REVERSE (gear<0) drive CMDs when enc_busy.
-        #
-        # v7 was wrong: it blocked ALL speed>0 drive CMDs when enc_busy=True.
-        # For Monitor mode (Move1, gear=+1), encoder_bridge intercepts the CMD and
-        # publishes enc_busy=True. Due to DDS timing, that enc_busy=True notification
-        # can arrive at serial_bridge BEFORE serial_bridge processes its own copy of
-        # the same cmd_json message → serial_bridge blocks the CMD → car never drives
-        # → encoder sees 0m → 89s TIMEOUT.
-        #
-        # Correct behaviour by gear:
-        #   gear=+1 (forward, Monitor mode): encoder_bridge MONITORS only, does NOT
-        #     send motor commands via DriveSerial. serial_bridge MUST forward the CMD.
-        #     → NEVER block forward CMDs on enc_busy.
-        #   gear=-1 (reverse, Drive mode):  encoder_bridge drives via DriveSerial.
-        #     serial_bridge must stay silent to avoid port conflicts.
-        #     → Block reverse CMDs when enc_busy=True.
+        # Block REVERSE drive commands only when enc_busy (avoid port conflict).
+        # Forward, steer, stop, led, arm etc. are always forwarded.
         if self.enc_busy:
             try:
                 obj = json.loads(msg.data)
                 if (obj.get('type') == 'drive'
                         and float(obj.get('speed_mps', 0)) > 0
-                        and int(obj.get('gear', 1)) < 0):        # reverse only
+                        and int(obj.get('gear', 1)) < 0):
                     if self.debug_serial:
                         self.get_logger().info(
                             f'SKIP (enc_busy=True, rev): {msg.data.strip()[:80]}')
@@ -198,12 +168,19 @@ class SerialBridge(Node):
             if self.debug_serial:
                 self.get_logger().info(f'RX: {obj}')
 
+            # ── start_switch (raw bool) ───────────────────────────────
             if 'start_switch' in obj:
                 self.start_pub.publish(Bool(data=bool(obj['start_switch'])))
 
+            # ── steer_ready ───────────────────────────────────────────
             if 'steer_ready' in obj:
                 self.steer_ready_pub.publish(Bool(data=bool(obj['steer_ready'])))
 
+            # ── btn_state state machine ────────────────────────────────
+            # ESP32 publishStatus() sends btn_state every 100 ms.
+            # On transition to waiting_cam → trigger cam_check_request so
+            # autopark_master.on_cam_check_request() can reply with yellow/red.
+            # On transition back to idle → send False to cancel.
             if 'btn_state' in obj:
                 new_state = str(obj['btn_state'])
                 if new_state != self.last_btn_state:
@@ -214,11 +191,14 @@ class SerialBridge(Node):
                         self.cam_req_pub.publish(Bool(data=False))
                     self.last_btn_state = new_state
 
-            if 'mode' in obj or 'steer_deg' in obj:
-                try:
-                    self.esp32_status_pub.publish(String(data=json.dumps(obj)))
-                except Exception:
-                    pass
+            # ── full status object → esp32_status ─────────────────────
+            # Forward every status packet so autopark_master can watch
+            # for btn_state=="parking" to start the parking thread.
+            # Also forwards mode, steer_deg, led_color, etc. for logging.
+            try:
+                self.esp32_status_pub.publish(String(data=json.dumps(obj)))
+            except Exception:
+                pass
 
     def _poll_us(self) -> List[float]:
         if self.us_all is not None:

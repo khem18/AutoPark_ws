@@ -18,11 +18,13 @@ class AutoparkMaster(Node):
 
         for name, default in [
             ("start_switch_topic",           "/autopark/start_switch"),
+            ("esp32_status_topic",           "/autopark/esp32_status"),
             ("pose_topic",                   "/autopark/start_pose"),
             ("parking_metrics_topic",        "/parking_metrics"),
             ("ultrasonic_topic",             "/autopark/ultrasonic"),
             ("command_topic",                "/autopark/cmd_json"),
             ("plan_topic",                   "/autopark/plan_result"),
+            ("cam_check_request_topic",      "/autopark/cam_check_request"),
 
             ("min_clearance_m",              0.12),
             ("disable_ultrasonic_block",     True),
@@ -37,6 +39,10 @@ class AutoparkMaster(Node):
             ("default_motion_seconds",       1.0),
             ("pause_between_commands",       0.30),
             ("steer_wait_seconds",           4.0),
+
+            # Camera check
+            ("camera_check_enabled",         True),
+            ("camera_pose_max_age_s",        3.0),
 
             # ── Ultrasonic centering ──────────────────────────────────
             ("us_center_enable",             True),
@@ -53,18 +59,14 @@ class AutoparkMaster(Node):
 
             # Rear wall (depth) sensor
             ("us_rear_idx",                  6),
-            ("us_rear_target_m",             0.20),   # target 20 cm from wall
-            ("us_rear_tolerance_m",          0.06),   # ±6 cm  →  14–26 cm is OK
-            ("us_depth_max_step_m",          0.04),   # max reverse per depth step
+            ("us_rear_target_m",             0.20),
+            ("us_rear_tolerance_m",          0.06),
+            ("us_depth_max_step_m",          0.04),
             ("us_depth_max_attempts",        4),
 
             # Stop timing
-            # Send stop this many seconds BEFORE the calculated end of motion
-            # to compensate for ROS→serial→ESP32 latency (~100 ms) + decel.
             ("us_stop_buffer_s",             0.20),
-            # After stop, wait this long before reading sensors or sending next cmd.
             ("us_stop_settle_s",             0.60),
-            # Steer settle wait used only during correction moves (faster than main).
             ("us_steer_wait_s",              2.0),
         ]:
             self.declare_parameter(name, default)
@@ -82,6 +84,10 @@ class AutoparkMaster(Node):
         self.default_motion_seconds    = float(self.get_parameter("default_motion_seconds").value)
         self.pause_between_commands    = float(self.get_parameter("pause_between_commands").value)
         self.steer_wait_seconds        = float(self.get_parameter("steer_wait_seconds").value)
+
+        # ── camera check params ───────────────────────────────────────
+        self.camera_check_enabled      = bool(self.get_parameter("camera_check_enabled").value)
+        self.camera_pose_max_age_s     = float(self.get_parameter("camera_pose_max_age_s").value)
 
         # ── ultrasonic params ─────────────────────────────────────────
         self.us_center_enable          = bool(self.get_parameter("us_center_enable").value)
@@ -106,12 +112,26 @@ class AutoparkMaster(Node):
 
         # ── state ─────────────────────────────────────────────────────
         self.latest_pose: Optional[Pose2D] = None
+        self.latest_pose_time: Optional[float] = None   # monotonic time of last pose
         self.latest_us   = [9.9] * 8
         self.latest_metrics = []
         self.busy = False
 
+        # ── Subscriptions ─────────────────────────────────────────────
+        # esp32_status carries btn_state — used to gate parking start
         self.create_subscription(
-            Bool, self.get_parameter("start_switch_topic").value, self.on_start_switch, 10)
+            String,
+            self.get_parameter("esp32_status_topic").value,
+            self.on_esp32_status,
+            10)
+
+        # cam_check_request: serial_bridge fires True when ESP32 enters waiting_cam
+        self.create_subscription(
+            Bool,
+            self.get_parameter("cam_check_request_topic").value,
+            self.on_cam_check_request,
+            10)
+
         self.create_subscription(
             Pose2D, self.get_parameter("pose_topic").value, self.on_pose, 10)
         self.create_subscription(
@@ -132,6 +152,7 @@ class AutoparkMaster(Node):
 
     def on_pose(self, msg):
         self.latest_pose = msg
+        self.latest_pose_time = time.monotonic()
 
     def on_metrics(self, msg):
         self.latest_metrics = list(msg.data)
@@ -141,18 +162,66 @@ class AutoparkMaster(Node):
         if len(vals) >= 8:
             self.latest_us = vals[:8]
 
-    def on_start_switch(self, msg):
-        self.get_logger().info("START SWITCH CALLBACK: " + str(msg.data))
+    def on_cam_check_request(self, msg: Bool):
+        """
+        Called when serial_bridge detects ESP32 entered BTN_WAITING_CAM.
+        msg.data=True  → button was pressed, ESP32 wants camera result.
+        msg.data=False → button cancelled or timed out, ignore.
+
+        We reply with yellow (camera OK) or red (camera not seeing slot).
+        The ESP32 uses yellow to advance BTN_WAITING_CAM → BTN_CONFIRM,
+        then waits for the 2nd press before arming.
+        """
         if not msg.data:
             return
-        if self.busy:
-            self.get_logger().warning("ignored start switch because busy")
+
+        if not self.camera_check_enabled:
+            # Camera check disabled → always yellow (always ready)
+            self.get_logger().info("CAM CHECK: disabled → LED yellow (always ready)")
+            self._led("yellow")
             return
-        self.busy = True
-        # Launch in a daemon thread so the ROS executor keeps spinning.
-        # Without this, on_ultrasonic() never fires during parking because
-        # rclpy.spin() is blocked waiting for this callback to return.
-        threading.Thread(target=self._parking_thread, daemon=True).start()
+
+        pose_fresh = self._is_pose_fresh()
+        if pose_fresh:
+            self.get_logger().info(
+                "CAM CHECK: pose fresh (age=%.2fs) → LED yellow" %
+                (time.monotonic() - self.latest_pose_time))
+            self._led("yellow")
+        else:
+            age_str = (
+                "%.2fs" % (time.monotonic() - self.latest_pose_time)
+                if self.latest_pose_time else "never"
+            )
+            self.get_logger().warning(
+                f"CAM CHECK: pose NOT fresh (age={age_str}) → LED red")
+            self._led("red")
+
+    def _is_pose_fresh(self) -> bool:
+        """Return True if perception_bridge sent a pose recently enough."""
+        if self.latest_pose is None or self.latest_pose_time is None:
+            return False
+        age = time.monotonic() - self.latest_pose_time
+        return age <= self.camera_pose_max_age_s
+
+    def on_esp32_status(self, msg: String):
+        """
+        Listen for btn_state=="parking" which means the 2-press sequence
+        completed (1st press → camera check → yellow → 2nd press → arm).
+        Only then start the parking thread.
+
+        This replaces the old on_start_switch which fired on raw GPIO True
+        and bypassed the 2-press state machine entirely.
+        """
+        try:
+            obj = json.loads(msg.data)
+        except Exception:
+            return
+
+        btn_state = obj.get("btn_state", "")
+        if btn_state == "parking" and not self.busy:
+            self.busy = True
+            self.get_logger().info("btn_state=parking → launching parking thread")
+            threading.Thread(target=self._parking_thread, daemon=True).start()
 
     def _parking_thread(self):
         try:
@@ -188,9 +257,8 @@ class AutoparkMaster(Node):
 
         yaw_deg = math.degrees(pose.theta)
         self.get_logger().info(
-            "planning from pose x=" + str(pose.x)
-            + " y=" + str(pose.y)
-            + " theta_deg=" + str(yaw_deg))
+            "planning from pose x=%.2f y=%.2f theta_deg=%.1f"
+            % (pose.x, pose.y, yaw_deg))
 
         planned = plan_from_start(pose.x, pose.y, yaw_deg, self.planner_mode)
         result  = result_to_dict(planned)
@@ -219,10 +287,11 @@ class AutoparkMaster(Node):
             # ── Step 3: depth correction (rear wall 20 ± 6 cm) ───────
             self._run_depth_correction()
 
+        self.get_logger().info("PARKING COMPLETE — sending LED green")
         self._led("green")
         self.publish_stop("parking_complete")
 
-    # ── Planner motion execution (unchanged) ──────────────────────────
+    # ── Planner motion execution ───────────────────────────────────────
 
     def execute_motions(self, motions):
         self.get_logger().info("EXECUTING MOTIONS")
@@ -260,19 +329,8 @@ class AutoparkMaster(Node):
     # ── Step 2: lateral centering ─────────────────────────────────────
 
     def _run_lateral_centering(self):
-        """
-        Equalise left and right wall distances.
-
-        error = (left_dist - right_dist) / 2
-          positive → car biased right → need to shift LEFT
-          negative → car biased left  → need to shift RIGHT
-
-        When reversing with +steer (left turn command) the rear swings
-        right, shifting the body left. Sign of correction_steer = sign
-        of error.
-        """
         self.get_logger().info("LATERAL CENTERING START")
-        time.sleep(0.40)  # let car settle after main sequence
+        time.sleep(0.40)
 
         for attempt in range(self.us_max_attempts):
             left_dist  = self.latest_us[self.us_left_idx]
@@ -303,19 +361,12 @@ class AutoparkMaster(Node):
                 f"[LATERAL] error={error*100:.1f} cm → "
                 f"steer={correction_steer:.1f} deg")
 
-            # Phase 1: forward arc (opposite steer to reverse phase)
-            # Using -correction_steer on exit and +correction_steer on
-            # re-entry creates an S-maneuver: both arcs shift the car
-            # laterally in the same direction, doubling the correction
-            # compared to a straight exit while the heading changes from
-            # each arc partially cancel each other.
             self.get_logger().info(
                 f"[LATERAL] phase 1: forward arc steer={-correction_steer:.1f}")
             self._send_correction_move(
                 gear=1, steer_deg=-correction_steer,
                 dist_m=self.us_correction_dist_m)
 
-            # Phase 2: reverse arc (same steer sign as before)
             self.get_logger().info(
                 f"[LATERAL] phase 2: reverse arc steer={correction_steer:.1f}")
             self._send_correction_move(
@@ -329,29 +380,13 @@ class AutoparkMaster(Node):
     # ── Step 3: depth correction (rear wall) ─────────────────────────
 
     def _run_depth_correction(self):
-        """
-        Adjust depth so the rear wall distance is us_rear_target_m ± us_rear_tolerance_m
-        (default 20 ± 6 cm → acceptable window 14 cm … 26 cm).
-
-        Uses straight-only moves (steer=0) and caps each reverse step to
-        us_depth_max_step_m so the car cannot overshoot into the wall even
-        if the stop buffer is slightly off.
-
-        Stop-timing safety
-        ──────────────────
-        _send_correction_move sends the stop command us_stop_buffer_s
-        seconds BEFORE the calculated end of travel.  At 0.06 m/s that
-        means the car stops ~1.2 cm short of the intended position.
-        For the last reverse step this undershoot is intentional — it
-        provides a physical safety margin against the wall.
-        """
         self.get_logger().info("DEPTH CORRECTION START")
         time.sleep(0.40)
 
         target = self.us_rear_target_m
         tol    = self.us_rear_tolerance_m
-        lo     = target - tol   # 0.14 m
-        hi     = target + tol   # 0.26 m
+        lo     = target - tol
+        hi     = target + tol
 
         for attempt in range(self.us_depth_max_attempts):
             rear_dist = self.latest_us[self.us_rear_idx]
@@ -373,18 +408,13 @@ class AutoparkMaster(Node):
                 break
 
             if rear_dist < lo:
-                # Too close — drive forward to create space
                 move_dist = min(lo - rear_dist + 0.02, self.us_correction_dist_m)
                 self.get_logger().info(
                     f"[DEPTH] too close ({rear_dist*100:.1f} cm < {lo*100:.0f} cm) "
                     f"→ forward {move_dist*100:.1f} cm")
                 self._send_correction_move(
                     gear=1, steer_deg=0.0, dist_m=move_dist)
-
             else:
-                # Too far — reverse toward wall in a small capped step.
-                # Each step is at most us_depth_max_step_m to prevent
-                # wall collision even if the stop command is slightly late.
                 move_dist = min(rear_dist - target, self.us_depth_max_step_m)
                 self.get_logger().info(
                     f"[DEPTH] too far ({rear_dist*100:.1f} cm > {hi*100:.0f} cm) "
@@ -402,31 +432,9 @@ class AutoparkMaster(Node):
     # ── Low-level correction move ─────────────────────────────────────
 
     def _send_correction_move(self, gear: int, steer_deg: float, dist_m: float):
-        """
-        Execute one correction arc/straight segment.
-
-        Stop-buffer fix
-        ───────────────
-        The stop command is sent us_stop_buffer_s seconds BEFORE the
-        calculated end of motion.  This compensates for the chain:
-            Python sleep ends
-            → ROS publish
-            → serial_bridge.on_cmd()
-            → serial.write()
-            → ESP32 reads on next 2 ms loop tick
-            → stopDriveMotor() called
-        Total latency is typically 50–150 ms.  At us_correction_speed_mps
-        = 0.06 m/s the car travels 0.9–1.5 cm during that window.
-        Stopping 0.20 s early keeps overshoot well under 1 cm.
-
-        After stop we wait us_stop_settle_s (default 0.60 s) before
-        returning so the car is fully stationary when the caller reads
-        sensors or sends the next pre-steer command.
-        """
         speed    = self.us_correction_speed_mps
         duration = dist_m / max(speed, 0.01)
 
-        # ── Pre-steer (wheels move, body stationary) ──────────────────
         steer_cmd = {
             "type":      "drive",
             "gear":      0,
@@ -436,7 +444,6 @@ class AutoparkMaster(Node):
         self.cmd_pub.publish(String(data=json.dumps(steer_cmd)))
         time.sleep(self.us_steer_wait_s)
 
-        # ── Drive ─────────────────────────────────────────────────────
         drive_cmd = {
             "type":      "drive",
             "gear":      gear,
@@ -445,13 +452,11 @@ class AutoparkMaster(Node):
         }
         self.cmd_pub.publish(String(data=json.dumps(drive_cmd)))
 
-        # Stop early to compensate for serial + ESP32 latency
         effective_sleep = max(0.05, duration - self.us_stop_buffer_s)
         time.sleep(effective_sleep)
 
-        # ── Stop + settle ─────────────────────────────────────────────
         self.publish_stop("correction_move_done")
-        time.sleep(self.us_stop_settle_s)  # wait for car to be stationary
+        time.sleep(self.us_stop_settle_s)
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -475,8 +480,6 @@ class AutoparkMaster(Node):
                 duration = max(0.4, dist / max(speed_mps, 0.05))
 
         speed_mps = min(abs(speed_mps), self.speed_scale)
-        # Old clamp max(1.2, min(duration, 2.0)) truncated the arc to only
-        # 0.24 m travel. Arc needs ~15 s at speed_scale=0.12 m/s. Fixed.
         duration  = max(0.5, min(duration, 60.0))
 
         return {
