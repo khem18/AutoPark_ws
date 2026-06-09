@@ -537,32 +537,15 @@ class AutoparkMaster(Node):
                     f"enc_result TIMEOUT after {elapsed:.1f}s — continuing")
                 return
 
-    def _wait_arc_imu(self, s23_m: float, R_m: float, seg_idx: int, n: int):
-        """
-        Wait for arc (Move 2) completion via gyroscope integration.
-
-        Uses angular_velocity.z (gyro rate) integration — NOT orientation quaternion.
-        The mpu6050_cpp node does not run orientation fusion, so the quaternion
-        is always identity (yaw=0°).  The gyro rate is always valid.
-
-        Stop criterion:
-          |∫ gyro_z dt| >= arc_deg_full * imu_arc_stop_factor
-
-        Falls back to time-based if:
-          - imu_arc_stop_enabled = False
-          - IMU topic not yet received
-          - Gyro appears stuck at zero for the first imu_arc_wait_s seconds
-        """
+    def _wait_arc_imu(self, s23_m, R_m, seg_idx, n):
         arc_rad      = s23_m / max(R_m, 0.001)
         arc_deg_full = math.degrees(arc_rad)
         stop_deg     = arc_deg_full * self.imu_arc_stop_factor
         timeout      = self.imu_arc_stop_timeout_s
 
         self.get_logger().info(
-            f"[IMU arc] arc={arc_deg_full:.1f}°  "
-            f"stop_trig={stop_deg:.1f}°  "
-            f"factor={self.imu_arc_stop_factor}  "
-            f"(gyro integration)")
+            f"[IMU arc] arc={arc_deg_full:.1f}°  stop_trig={stop_deg:.1f}°  "
+            f"factor={self.imu_arc_stop_factor}  (gyro integration)")
 
         if not self.imu_arc_stop_enabled or not self.imu_received:
             reason = "disabled" if not self.imu_arc_stop_enabled else "IMU not ready"
@@ -570,16 +553,13 @@ class AutoparkMaster(Node):
             self.get_logger().warning(
                 f"[IMU arc] {reason} — time-based fallback ({fallback_s:.1f}s)")
             time.sleep(min(fallback_s, timeout))
-            return
+            return   # caller sends stop
 
-        # ── Gyro integration ──────────────────────────────────────
-        gyro_integral_rad = 0.0   # accumulates ∫ gyro_z dt
+        gyro_integral_rad = 0.0
         t0       = time.monotonic()
         t_last   = t0
         last_log = 0.0
-
-        self.get_logger().info(
-            f"DRIVE 0.00/{timeout:.2f}s arc=0.0/{arc_deg_full:.1f}°")
+        gyro_zero_fallback_fired = False   # ← NEW: track if fallback already fired
 
         while True:
             time.sleep(0.05)
@@ -588,22 +568,21 @@ class AutoparkMaster(Node):
             t_last  = now
             elapsed = now - t0
 
-            # Integrate gyro Z (rad/s × s = rad)
             gyro_integral_rad += self.latest_gyro_z * dt
             delta_deg = math.degrees(abs(gyro_integral_rad))
 
-            # ── Gyro-zero fallback ─────────────────────────────────
-            # If gyro still reads ~0 after the warm-up delay, the IMU
-            # might not be publishing useful data → time-based fallback.
-            if elapsed >= self.imu_arc_wait_s and abs(gyro_integral_rad) < math.radians(0.5):
-                # Only trigger this once (at the warm-up boundary)
-                if abs(elapsed - self.imu_arc_wait_s) < 0.15:
-                    fallback_s = max(0.1, s23_m / max(self.speed_scale, 0.01) * 1.5 - elapsed)
-                    self.get_logger().warning(
-                        f"[IMU arc] gyro reads ~0 after {elapsed:.1f}s — "
-                        f"time-based fallback ({fallback_s:.1f}s remaining)")
-                    time.sleep(fallback_s)
-                    return
+            # ── Gyro-zero fallback ──────────────────────────────────────
+            # FIX: check on every tick after warm-up, not just a 150ms window
+            if (not gyro_zero_fallback_fired
+                    and elapsed >= self.imu_arc_wait_s
+                    and abs(gyro_integral_rad) < math.radians(0.5)):
+                gyro_zero_fallback_fired = True
+                fallback_s = max(0.1, s23_m / max(self.speed_scale, 0.01) * 1.5 - elapsed)
+                self.get_logger().warning(
+                    f"[IMU arc] gyro reads ~0 after {elapsed:.1f}s — "
+                    f"time-based fallback ({fallback_s:.1f}s)")
+                time.sleep(fallback_s)
+                return   # caller sends stop
 
             if elapsed - last_log >= 0.5:
                 self.get_logger().info(
@@ -611,19 +590,15 @@ class AutoparkMaster(Node):
                     f"arc={delta_deg:.1f}/{arc_deg_full:.1f}°")
                 last_log = elapsed
 
-            # ── IMU stop condition (after warm-up delay) ───────────
             if elapsed >= self.imu_arc_wait_s and delta_deg >= stop_deg:
                 self.get_logger().info(
                     f"LOG: stop=imu_arc_stop_seg_{seg_idx + 1}  "
-                    f"elapsed={elapsed:.2f}s  "
-                    f"imu_delta={delta_deg:.2f}°  "
-                    f"gyro_z={math.degrees(self.latest_gyro_z):.1f}°/s")
+                    f"elapsed={elapsed:.2f}s  imu_delta={delta_deg:.2f}°")
                 return
 
             if elapsed >= timeout:
                 self.get_logger().warning(
-                    f"[IMU arc] timeout after {elapsed:.1f}s — "
-                    f"imu_delta={delta_deg:.2f}° < {stop_deg:.1f}°")
+                    f"[IMU arc] timeout after {elapsed:.1f}s")
                 return
 
     # ─────────────────────────────────────────────────────────────────
