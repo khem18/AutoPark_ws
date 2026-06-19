@@ -160,10 +160,13 @@ autopark_master:
 
     # ── Forward clearance guard ────────────────────────────────────────
     # Skips any gear=+1 move when a front-facing sensor is too close.
-    # x4 (index 3, 0-based) = forward sensor, reads 9.93 cm when at front wall.
-    # Set us_fwd_min_m to 15 cm so any reading under 15 cm aborts the fwd move.
+    # FIX: confirmed hardware layout (1-based labels):
+    #   x1,x2,x3 = front (idx 0,1,2)   x4 = left (idx 3)   x5 = right (idx 4)
+    #   x6,x7,x8 = rear  (idx 5,6,7)
+    # Was [3] (x4) — that's the LEFT sensor, not front. Front guard now
+    # checks all three actual front sensors and takes the minimum.
     us_fwd_guard_enable:         true
-    us_fwd_indices:              [3]      # x4 = index 3 (0-based in the 8-sensor array)
+    us_fwd_indices:              [0, 1, 2]  # x1,x2,x3 (was [3]=x4, wrong sensor)
     us_fwd_min_m:                0.15     # skip forward move if front sensor < 15 cm
 
     # ── Ultrasonic centering mode ──────────────────────────────────────
@@ -184,11 +187,32 @@ autopark_master:
     us_kinetic_update_hz:        10.0    # 100 ms per update tick
     # Pause after each phase:
     us_kinetic_settle_s:         0.40
+    # FIX: re-arm ESP32 before kinetic. encoder_bridge's DriveSerial sends
+    # stop() at the end of Move 3 via its own fd on the drive port — the
+    # ESP32 firmware requires {"type":"arm"} before accepting new drive
+    # commands after a stop, otherwise ALL kinetic commands are ignored
+    # and the motor doesn't react at all.
+    kinetic_rearm_wait_s:        0.5
+    # FIX: emergency abort during kinetic — independent of the rear-target
+    # window. Checked against all 8 sensors every loop tick; catches
+    # overshoot from sensor-update lag or motor coast during the gear-
+    # switch settle pause. The car was observed parked at 2.7cm from the
+    # rear wall (target window is 14-26cm) before this was added.
+    us_kinetic_min_safe_m:       0.05    # 5cm hard floor — emergency stop
+    us_kinetic_max_data_age_s:   0.30    # refuse to drive on stale US data
 
     # Shared US params (used by both kinetic and legacy modes)
-    us_left_idx:                 1
-    us_right_idx:                2
+    # FIX: was us_left_idx=1 (x2), us_right_idx=2 (x3) — both FRONT sensors,
+    # reading 150-260cm (open space) in every log → lateral centering's
+    # OOB-skip guard fired on nearly every run, so it never corrected.
+    # Confirmed hardware layout: x4=left (idx 3), x5=right (idx 4).
+    us_left_idx:                 3       # x4 = left  (was 1 → x2, front sensor)
+    us_right_idx:                4       # x5 = right (was 2 → x3, front sensor)
     us_rear_idx:                 6
+    # x4=left/x5=right now confirmed, so default sign (+1.0) should be
+    # correct. Flip to -1.0 only if the car steers toward the closer wall
+    # instead of away from it after this fix.
+    lateral_correction_sign:     1.0
     # Lateral deadband: slot side clearance is 19–31 cm (range 12 cm).
     # Centre = 25 cm each side → accept ±6 cm from centre → deadband 6 cm.
     us_deadband_m:               0.060   # 6 cm lateral deadband
@@ -213,10 +237,10 @@ autopark_master:
 
 serial_bridge:
   ros__parameters:
-    drive_port:              "/dev/ttyUSB0"
+    drive_port:              "/dev/ttyUSB2"
     enc_handles_straight:    true    # ← was missing from zip config
     enc_straight_thresh_deg: 5.0
-    us_all_port:             "/dev/ttyUSB2"
+    us_all_port:             "/dev/ttyUSB0"
     us_front_port:           ""
     us_rear_port:            ""
     baud:                    115200

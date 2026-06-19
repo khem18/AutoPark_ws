@@ -1,23 +1,22 @@
 """
-autopark_master.py  —  v_next9
+autopark_master.py  —  v_next10
 =============================================================================
-Changes vs v_next8 (zip version):
-  1. speed_scale 0.01 → 0.03.
-  2. dist_m forwarded in every drive command:
-       Move 1 (fwd_setup, gear=+1)           → encoder_bridge FORWARD MONITOR
-       Move 2 (rev_arc_90, gear=-1 steer=30°) → serial_bridge + arc_monitor (IMU stop)
-       Move 3 (rev_straight_d4, gear=-1 steer=0°, use_encoder=True)
-                                               → encoder_bridge REVERSE DRIVE
-  3. Subscribes to /enc_result → waits for SUCCESS instead of time-sleep
-     for Moves 1 and 3.
-  4. Subscribes to /imu/data_raw → monitors yaw delta for arc (Move 2) stop.
-  5. Subscribes to /enc_status  → live right-encoder distance for progress log.
-  6. steer_straight_bias_deg param: +ve = right bias applied to steer=0 moves.
-       gear=+1 straight: add +bias  (compensates left-slow leftward drift)
-       gear=-1 straight: add -bias  (compensates left-slow rightward drift in rev)
-  7. MOVE X/N logging + DRIVE dist/target progress at 500 ms intervals.
-  8. Single encoder: encoder_bridge already uses rightDistM only (no change needed).
-  9. Kinetic ultrasonic centering retained from previous version.
+Changes vs v_next9:
+  FIX: kinetic centering motor not reacting after 3-move planner sequence.
+
+  Root cause: encoder_bridge.DriveSerial owns /dev/ttyUSB0 and sends the
+  final drive_/stop() at the end of Move 3 (driveStraight). The real ESP32
+  firmware requires an explicit {"type":"arm"} before it will accept new
+  drive commands after a stop. Kinetic centering never sent arm, so both
+  KINETIC-A (forward) and KINETIC-B (reverse) received drive commands that
+  the ESP32 silently ignored.
+
+  Fixes applied:
+  1. Send {"type":"arm"} at the start of _run_kinetic_centering() and wait
+     kinetic_rearm_wait_s (default 0.5 s) for ESP32 to arm.
+  2. Subscribe to /enc_busy → track self.enc_busy_from_encoder; log its
+     value at kinetic start so any enc_busy leak is immediately visible.
+  3. New param kinetic_rearm_wait_s (default 0.5).
 """
 import json
 import math
@@ -118,19 +117,39 @@ class AutoparkMaster(Node):
             # Timeout for waiting on /enc_result after a Move 1 or 3 command:
             ("enc_result_timeout_s",         130.0),
 
+            # ── Confirmed physical sensor layout (hardware owner, 1-based labels) ──
+            #   x1, x2, x3 = front   → 0-based indices 0, 1, 2
+            #   x4         = left    → 0-based index 3
+            #   x5         = right   → 0-based index 4
+            #   x6, x7, x8 = rear    → 0-based indices 5, 6, 7
+
             # ── Forward clearance guard (applied before each gear=+1 move) ────
             # If any sensor in us_fwd_indices reads below us_fwd_min_m,
             # the forward move is skipped entirely (car is already at front wall).
+            # FIX: was [3] (x4) — that's the LEFT sensor, not front. Front is
+            # x1/x2/x3 → indices 0,1,2. Checking all three for the guard.
             ("us_fwd_guard_enable",          True),
-            ("us_fwd_indices",               [3]),     # x4 → index 3 (0-based)
+            ("us_fwd_indices",               [0, 1, 2]),  # x1,x2,x3 (was [3]=x4, wrong)
             ("us_fwd_min_m",                 0.15),    # skip forward if <15 cm clearance
 
             # ── Ultrasonic centering ────────────────────────────────────────
+            # FIX: us_left_idx/us_right_idx were 1, 2 (→ x2, x3) — those are
+            # FRONT sensors, not left/right, and read 150-260cm (open space)
+            # in every observed log. KINETIC-A's "if L > 2.0 or R > 2.0: skip"
+            # fired on almost every run → lateral centering silently never
+            # executed. Correct sensors per confirmed hardware layout above.
             ("us_center_enable",             True),
-            ("us_left_idx",                  1),
-            ("us_right_idx",                 2),
+            ("us_left_idx",                  3),    # x4 = left  (was 1 → x2, front)
+            ("us_right_idx",                 4),    # x5 = right (was 2 → x3, front)
             ("us_deadband_m",                0.060),
             ("us_steer_gain",                150.0),
+            # x4=left, x5=right is now confirmed, so the original sign
+            # convention (steer0 = -correction) should be correct by
+            # default. Kept as a tunable in case the physical steer/servo
+            # direction itself is reversed on this chassis — flip to -1.0
+            # if correction still drives toward the closer wall instead of
+            # away from it.
+            ("lateral_correction_sign",      1.0),
             ("us_max_steer_deg",             15.0),
             ("us_correction_dist_m",         0.12),
             ("us_correction_speed_mps",      0.06),
@@ -150,6 +169,16 @@ class AutoparkMaster(Node):
             ("us_kinetic_rev_max_m",         0.25),
             ("us_kinetic_update_hz",         10.0),
             ("us_kinetic_settle_s",          0.40),
+            # FIX: arm the ESP32 before kinetic so it accepts drive commands
+            # after encoder_bridge's DriveSerial sent stop() at end of Move 3.
+            ("kinetic_rearm_wait_s",          0.5),
+            # FIX: emergency abort — independent of the rear-target window.
+            # Checked against ALL 8 sensors, every loop tick, in both Phase A
+            # and Phase B. Catches overshoot from sensor-update lag or motor
+            # coast during the gear-switch settle pause, regardless of which
+            # sensor (not just us_rear_idx) is closing in on an obstacle.
+            ("us_kinetic_min_safe_m",         0.05),   # 5 cm hard floor
+            ("us_kinetic_max_data_age_s",     0.30),   # treat stale US data as unsafe
         ]:
             self.declare_parameter(name, default)
 
@@ -198,6 +227,7 @@ class AutoparkMaster(Node):
         self.us_right_idx              = int(gp("us_right_idx"))
         self.us_deadband_m             = float(gp("us_deadband_m"))
         self.us_steer_gain             = float(gp("us_steer_gain"))
+        self.lateral_correction_sign   = float(gp("lateral_correction_sign"))
         self.us_max_steer_deg          = float(gp("us_max_steer_deg"))
         self.us_correction_dist_m      = float(gp("us_correction_dist_m"))
         self.us_correction_speed_mps   = float(gp("us_correction_speed_mps"))
@@ -215,11 +245,15 @@ class AutoparkMaster(Node):
         self.us_kinetic_rev_max_m      = float(gp("us_kinetic_rev_max_m"))
         self.us_kinetic_update_hz      = float(gp("us_kinetic_update_hz"))
         self.us_kinetic_settle_s       = float(gp("us_kinetic_settle_s"))
+        self.kinetic_rearm_wait_s      = float(gp("kinetic_rearm_wait_s"))
+        self.us_kinetic_min_safe_m     = float(gp("us_kinetic_min_safe_m"))
+        self.us_kinetic_max_data_age_s = float(gp("us_kinetic_max_data_age_s"))
 
         # ── state ─────────────────────────────────────────────────────
         self.latest_pose: Optional[Pose2D] = None
         self.latest_pose_time: Optional[float] = None
         self.latest_us         = [9.9] * 8
+        self.latest_us_time    = 0.0   # FIX: monotonic time of last US update
         self.latest_metrics    = []
         self.busy              = False
 
@@ -236,6 +270,7 @@ class AutoparkMaster(Node):
         self.enc_result_event  = threading.Event()
         self.enc_result_data   = None
         self.latest_enc_rd     = 0.0   # rightDistM from /enc_status
+        self.enc_busy_from_encoder = False  # FIX: track enc_busy for kinetic diagnostics
 
         # ── Subscriptions ─────────────────────────────────────────────
         self.create_subscription(
@@ -254,6 +289,9 @@ class AutoparkMaster(Node):
             String, gp("enc_result_topic"), self.on_enc_result, 10)
         self.create_subscription(
             String, gp("enc_status_topic"), self.on_enc_status, 10)
+        # FIX: track enc_busy so kinetic start can log/warn if it leaks True
+        self.create_subscription(
+            Bool, "/enc_busy", self.on_enc_busy, 10)
 
         self.cmd_pub  = self.create_publisher(
             String, gp("command_topic"), 10)
@@ -278,7 +316,8 @@ class AutoparkMaster(Node):
     def on_ultrasonic(self, msg):
         vals = list(msg.data)
         if len(vals) >= 8:
-            self.latest_us = vals[:8]
+            self.latest_us      = vals[:8]
+            self.latest_us_time = time.monotonic()   # FIX: stamp for staleness check
 
     def on_imu(self, msg: Imu):
         # ROOT CAUSE FIX: pre-integrate at full IMU rate (200 Hz) instead of
@@ -311,6 +350,9 @@ class AutoparkMaster(Node):
             self.latest_enc_rd = float(obj.get("rd", self.latest_enc_rd))
         except Exception:
             pass
+
+    def on_enc_busy(self, msg: Bool):
+        self.enc_busy_from_encoder = bool(msg.data)
 
     def on_cam_check_request(self, msg: Bool):
         if not msg.data:
@@ -413,16 +455,30 @@ class AutoparkMaster(Node):
         self.execute_motions(motions, metrics)
 
         # ── Step 2: kinetic ultrasonic centering ──────────────────────
+        kinetic_ok = True
         if self.us_center_enable:
             if self.us_kinetic_enable:
-                self._run_kinetic_centering()
+                kinetic_ok = self._run_kinetic_centering()
             else:
                 self._run_lateral_centering()
                 self._run_depth_correction()
 
-        self.get_logger().info("PARKING DONE → Green LED 1s")
-        self._led("green")
-        self.publish_stop("parking_complete")
+        # FIX: the final LED/status used to always go green regardless of
+        # whether kinetic centering actually landed inside its tolerance
+        # window. A car parked 2.7cm from the rear wall (well outside the
+        # 14-26cm target) was being reported identically to a clean park —
+        # the only way to find out was to read the raw sensor dump after
+        # the fact. Now a failed/out-of-tolerance finish is surfaced.
+        if kinetic_ok:
+            self.get_logger().info("PARKING DONE → Green LED 1s")
+            self._led("green")
+            self.publish_stop("parking_complete")
+        else:
+            self.get_logger().error(
+                "PARKING DONE WITH WARNING — kinetic centering finished "
+                "outside tolerance → Yellow LED 1s")
+            self._led("yellow")
+            self.publish_stop("parking_complete_out_of_tolerance")
 
     # ─────────────────────────────────────────────────────────────────
     # execute_motions  —  3-move encoder/IMU guided sequence
@@ -774,8 +830,51 @@ class AutoparkMaster(Node):
                     f"enc={enc_t:.4f}/{enc_stop_dist:.4f}m")
                 last_log = elapsed
 
+    # ── FIX: kinetic emergency safety check ─────────────────────────────
+    # Phase B (depth/reverse correction) was observed driving the car to
+    # within ~2.7cm of the rear wall — well past the 14-26cm target window
+    # — because the window check only watches us_rear_idx and only fires
+    # the gear-flip once per 100ms loop tick. If ultrasonic data lags the
+    # control loop (or the car coasts during the 2s direction-switch
+    # settle pause), the target-window logic alone is not enough.
+    #
+    # This check is independent of which sensor "should" matter for the
+    # current phase/direction — ANY of the 8 sensors dropping below the
+    # absolute floor immediately aborts the whole kinetic routine. It also
+    # treats stale ultrasonic data (no update in us_kinetic_max_data_age_s)
+    # as unsafe, since driving on a frozen reading is how the overshoot
+    # happens in the first place.
+    def _kinetic_safety_ok(self, phase: str) -> bool:
+        us = self.latest_us
+        if not us:
+            return True
 
-    def _run_kinetic_centering(self):
+        age = time.monotonic() - self.latest_us_time
+        if age > self.us_kinetic_max_data_age_s:
+            self.get_logger().error(
+                f"KINETIC SAFETY ABORT [{phase}]: ultrasonic data stale "
+                f"(age={age:.2f}s > {self.us_kinetic_max_data_age_s:.2f}s) "
+                f"— refusing to drive blind")
+            self.publish_stop(f"kinetic_safety_stale_data_{phase}")
+            return False
+
+        min_val = min(us)
+        if min_val < self.us_kinetic_min_safe_m:
+            idx = us.index(min_val)
+            self.get_logger().error(
+                f"KINETIC SAFETY ABORT [{phase}]: sensor idx={idx} "
+                f"= {min_val*100:.1f}cm < safety floor "
+                f"{self.us_kinetic_min_safe_m*100:.1f}cm — STOPPING")
+            self.publish_stop(f"kinetic_safety_abort_{phase}")
+            return False
+
+        return True
+
+    def _run_kinetic_centering(self) -> bool:
+        """Returns True if the car finished within tolerance on both lateral
+        and depth checks, False if it aborted early (safety) or finished
+        out-of-tolerance (e.g. budget exhausted before reaching the rear
+        target window)."""
         SPEED     = self.us_correction_speed_mps
         DT        = 1.0 / max(self.us_kinetic_update_hz, 1.0)
         MAX_FWD   = self.us_kinetic_fwd_max_m
@@ -784,6 +883,28 @@ class AutoparkMaster(Node):
         KEEPALIVE = round(DT * 6, 2)
 
         time.sleep(0.50)
+
+        # ── FIX: re-arm ESP32 before kinetic ─────────────────────────────
+        # encoder_bridge's DriveSerial sends stop("distance_reached") at the
+        # end of Move 3 via its own fd on /dev/ttyUSB0.  The real ESP32
+        # firmware requires {"type":"arm"} before it will accept drive
+        # commands after a stop.  Without this, ALL kinetic commands (both
+        # forward KINETIC-A and reverse KINETIC-B) are silently ignored and
+        # the motor does not react at all.
+        if self.enc_busy_from_encoder:
+            self.get_logger().warning(
+                f"KINETIC START — enc_busy=True (leaked from Move 3!), "
+                f"waiting 2s for encoder_bridge to release...")
+            time.sleep(2.0)
+        else:
+            self.get_logger().info(
+                f"KINETIC START — enc_busy={self.enc_busy_from_encoder} (OK)")
+
+        self.get_logger().info(
+            f"KINETIC ARM — sending arm to ESP32, wait={self.kinetic_rearm_wait_s}s")
+        self.cmd_pub.publish(String(data=json.dumps({"type": "arm"})))
+        time.sleep(self.kinetic_rearm_wait_s)
+
         self.get_logger().info("KINETIC CENTERING START")
 
         # ── Phase A: lateral centering (forward creep with live steer) ────
@@ -802,7 +923,10 @@ class AutoparkMaster(Node):
         else:
             correction = max(-self.us_max_steer_deg,
                              min(self.us_max_steer_deg, err * self.us_steer_gain))
-            steer0 = -correction   # gear=+1: neg steer compensates right excess
+            steer0 = -correction * self.lateral_correction_sign
+            # gear=+1: neg steer compensates right excess (sign flip via
+            # lateral_correction_sign if x4/x5 turn out to be mounted
+            # right/left instead of left/right)
 
             self.cmd_pub.publish(String(data=json.dumps({
                 "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": steer0})))
@@ -810,6 +934,9 @@ class AutoparkMaster(Node):
 
             steps = max(1, int(MAX_FWD / (SPEED * DT)))
             for step in range(steps):
+                if not self._kinetic_safety_ok("A"):
+                    return False
+
                 L   = self.latest_us[self.us_left_idx]
                 R   = self.latest_us[self.us_right_idx]
                 err = (L - R) / 2.0
@@ -821,7 +948,7 @@ class AutoparkMaster(Node):
 
                 corr  = max(-self.us_max_steer_deg,
                             min(self.us_max_steer_deg, err * self.us_steer_gain))
-                steer = -corr
+                steer = -corr * self.lateral_correction_sign
 
                 self.cmd_pub.publish(String(data=json.dumps({
                     "type": "drive", "gear": 1, "speed_mps": SPEED,
@@ -865,6 +992,9 @@ class AutoparkMaster(Node):
             last_gear = 0
 
             for step in range(max_steps):
+                if not self._kinetic_safety_ok("B"):
+                    return False
+
                 rear = self.latest_us[self.us_rear_idx]
 
                 if lo <= rear <= hi:
@@ -889,6 +1019,11 @@ class AutoparkMaster(Node):
                         "type": "drive", "gear": 0,
                         "speed_mps": 0.0, "steer_deg": 0.0})))
                     time.sleep(self.us_steer_wait_s)
+                    # FIX: ~2.5s elapsed since the `rear` read above — the car
+                    # may have coasted during the stop. Re-check before firing
+                    # the new-direction drive command on a stale reading.
+                    if not self._kinetic_safety_ok("B_post_switch"):
+                        return False
                 last_gear = gear
 
                 # [FIX] Apply steer_straight_bias_deg during depth moves.
@@ -910,6 +1045,17 @@ class AutoparkMaster(Node):
                         f"KINETIC-B [{step:02d}] {direction}: rear={rear*100:.1f}cm "
                         f"target={target*100:.0f}±{tol*100:.0f}cm")
                 time.sleep(DT)
+            else:
+                # FIX: for/else — fires only if the loop ran out of max_steps
+                # WITHOUT breaking (i.e. never reached the tolerance window
+                # and was never caught by the safety abort either). This is
+                # exactly how the car can end up parked at 2.7cm from the
+                # wall while the code still calls it "done": budget ran out
+                # mid-overshoot/mid-recovery and the loop just exits.
+                self.get_logger().warning(
+                    f"KINETIC-B: budget exhausted ({max_steps} steps) "
+                    f"before reaching tolerance window — rear={rear*100:.1f}cm "
+                    f"target={lo*100:.0f}-{hi*100:.0f}cm")
 
             self.publish_stop("kinetic_depth_done")
             time.sleep(SETTLE)
@@ -917,9 +1063,25 @@ class AutoparkMaster(Node):
         L    = self.latest_us[self.us_left_idx]
         R    = self.latest_us[self.us_right_idx]
         rear = self.latest_us[self.us_rear_idx]
-        self.get_logger().info(
+        lat_err_cm = (L - R) / 2 * 100
+
+        # FIX: explicit pass/fail — previously this was just an info log
+        # with no signal back to start_autopark(), so a car that finished
+        # 2.7cm from the wall (vs a 14-26cm target) was reported identically
+        # to a clean park. Both checks are skipped (treated as pass) if the
+        # corresponding sensor read OOB (>2.0m), matching the skip logic
+        # used during the live phases above.
+        lat_ok  = (L > 2.0 or R > 2.0) or (abs(lat_err_cm / 100.0) < self.us_deadband_m)
+        rear_ok = (rear > 2.0) or (lo <= rear <= hi)
+        ok = lat_ok and rear_ok
+
+        log_fn = self.get_logger().info if ok else self.get_logger().warning
+        log_fn(
             f"KINETIC DONE — L={L:.3f}m R={R:.3f}m rear={rear:.3f}m "
-            f"lat_err={(L-R)/2*100:.1f}cm")
+            f"lat_err={lat_err_cm:.1f}cm  "
+            f"{'OK' if ok else 'OUT-OF-TOLERANCE'}")
+
+        return ok
 
     # ─────────────────────────────────────────────────────────────────
     # Legacy discrete centering (fallback when us_kinetic_enable=false)
@@ -938,6 +1100,7 @@ class AutoparkMaster(Node):
                 break
             corr = max(-self.us_max_steer_deg,
                        min(self.us_max_steer_deg, err * self.us_steer_gain))
+            corr *= self.lateral_correction_sign
             self._send_correction_move(1,  -corr, self.us_correction_dist_m)
             self._send_correction_move(-1, +corr, self.us_correction_dist_m)
             time.sleep(0.30)

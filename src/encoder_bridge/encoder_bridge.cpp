@@ -1,30 +1,24 @@
 // ============================================================
-//  encoder_bridge.cpp  —  ROS2 encoder closed-loop bridge  v6
+//  encoder_bridge.cpp  —  ROS2 encoder closed-loop bridge  v7
 //
-//  CHANGES vs v5:
-//  [v6] Arc-move stuck detection (Move2 reverse arc / any curved reverse).
-//       v5 handled straight reverse and forward monitor; arc reverse was left
-//       to serial_bridge + IMU stop with no speed-boost when passengers stall
-//       the motor mid-arc.
+//  CHANGES vs v6:
+//  [v7a] drive_thread_ lambda now has try-catch.
+//        Previously, if driveStraight() threw an uncaught C++ exception
+//        (e.g. from a serial read/write error on /dev/ttyUSB0), set_busy(false)
+//        was never called → enc_busy stayed True → serial_bridge silently
+//        blocked ALL subsequent kinetic REVERSE commands (gear < 0).
+//        The motor appeared dead during KINETIC-B even though commands were
+//        being sent by autopark_master.
+//        Fix: wrap the thread body in try/catch; call set_busy(false) and
+//        publish ENC_FAIL result on any exception path.
 //
-//       New: arc_monitor_thread_ watches encoder during non-intercepted
-//       reverse arc commands (gear=-1, |steer_deg|>steer_thresh_).
-//         • Monitors encoder distance every stuck_check_s seconds.
-//         • If car hasn't moved stuck_min_move_m → boosts session_arc_rev_speed_
-//           by stuck_boost_mps_, sets enc_busy=True, takes over ttyUSB2 with
-//           driveWithSteer() at the boosted speed.
-//         • Boost repeats up to stuck_max_speed_mps.
-//         • session_arc_rev_speed_ is initialised from the first arc command
-//           speed_mps and persists for the whole parking round.
-//         • When autopark_master sends stop (IMU arc done), handle_command
-//           aborts arc_monitor, releases enc_busy, motor stops normally.
+//  [v7b] arc_monitor_thread_ already had try-catch and set_busy(false) in
+//        all paths — no change needed there.
 //
-//  Existing v5 behaviour:
-//  [v5] Straight reverse (Move3): session_rev_speed_ by ref → boost in driveStraight().
-//  [v5] Forward monitor (Move1, incl. curved): stuck → driveStraight() takeover.
-//  [v5] Deadlock fix: abort driver_ before joining monitor_thread_.
-//  [v5] JSON fix: skip optional space after colon in parsed values.
-//  [v5] Encoder guard: fallback to serial_bridge when encoder not yet valid.
+//  Existing behaviour (unchanged):
+//  [v6] Arc-move stuck detection (arc_monitor_thread_).
+//  [v5] Straight reverse (Move3): session_rev_speed_ boost.
+//  [v5] Forward monitor (Move1): stuck → driveStraight() takeover.
 // ============================================================
 
 #include <rclcpp/rclcpp.hpp>
@@ -529,29 +523,62 @@ private:
 
         drive_thread_ = std::thread(
             [this, target_m, timeout, steer_deg]() {
-            StraightResult result = driver_->driveStraight(
-                target_m,
-                false,
-                session_rev_speed_,
-                timeout,
-                steer_deg,
-                /*skipArm=*/true);
+            // [v7a] try-catch: set_busy(false) MUST be called on every exit path.
+            // Without this, a serial exception inside driveStraight() left
+            // enc_busy=True forever → serial_bridge blocked all kinetic REVERSE
+            // commands silently (no log, debug_serial=false by default).
+            try {
+                StraightResult result = driver_->driveStraight(
+                    target_m,
+                    false,
+                    session_rev_speed_,
+                    timeout,
+                    steer_deg,
+                    /*skipArm=*/true);
 
-            RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
-                "Straight done: %s  dist=%.4fm  target=%.4fm"
-                "  session_rev now=%.4f",
-                straightResultName(result), driver_->lastDist(), target_m,
-                session_rev_speed_);
+                RCLCPP_INFO(rclcpp::get_logger("encoder_bridge"),
+                    "Straight done: %s  dist=%.4fm  target=%.4fm"
+                    "  session_rev now=%.4f",
+                    straightResultName(result), driver_->lastDist(), target_m,
+                    session_rev_speed_);
 
-            set_busy(false);
+                set_busy(false);
 
-            auto msg = std_msgs::msg::String();
-            char buf[256];
-            snprintf(buf, sizeof(buf),
-                "{\"enc_result\":\"%s\",\"dist\":%.4f,\"target\":%.4f}",
-                straightResultName(result), driver_->lastDist(), target_m);
-            msg.data = buf;
-            pub_result_->publish(msg);
+                auto msg = std_msgs::msg::String();
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                    "{\"enc_result\":\"%s\",\"dist\":%.4f,\"target\":%.4f}",
+                    straightResultName(result), driver_->lastDist(), target_m);
+                msg.data = buf;
+                pub_result_->publish(msg);
+
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(rclcpp::get_logger("encoder_bridge"),
+                    "Drive thread exception: %s — releasing enc_busy", e.what());
+                set_busy(false);
+                try {
+                    auto msg = std_msgs::msg::String();
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                        "{\"enc_result\":\"ERROR\",\"dist\":0.0,\"target\":%.4f}",
+                        target_m);
+                    msg.data = buf;
+                    pub_result_->publish(msg);
+                } catch (...) {}
+            } catch (...) {
+                RCLCPP_ERROR(rclcpp::get_logger("encoder_bridge"),
+                    "Drive thread unknown exception — releasing enc_busy");
+                set_busy(false);
+                try {
+                    auto msg = std_msgs::msg::String();
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                        "{\"enc_result\":\"ERROR\",\"dist\":0.0,\"target\":%.4f}",
+                        target_m);
+                    msg.data = buf;
+                    pub_result_->publish(msg);
+                } catch (...) {}
+            }
         });
     }
 
