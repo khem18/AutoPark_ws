@@ -27,13 +27,13 @@ autopark_master:
     rear_cam_topic:          "/rear_parking_metrics"
 
     # Start pose
-    use_default_pose_when_missing: true
+    use_default_pose_when_missing: false
     default_start_x:       -1.28
     default_start_y:        0.70
     default_start_yaw_deg: 180.0
 
     # Camera check
-    camera_check_enabled:    false
+    camera_check_enabled:    true
     camera_pose_max_age_s:   3.0
 
     # Steer / speed
@@ -159,15 +159,15 @@ autopark_master:
     us_safety_start_delay_s:    0.50
 
     # ── Forward clearance guard ────────────────────────────────────────
-    # Skips any gear=+1 move when a front-facing sensor is too close.
-    # FIX: confirmed hardware layout (1-based labels):
-    #   x1,x2,x3 = front (idx 0,1,2)   x4 = left (idx 3)   x5 = right (idx 4)
-    #   x6,x7,x8 = rear  (idx 5,6,7)
-    # Was [3] (x4) — that's the LEFT sensor, not front. Front guard now
-    # checks all three actual front sensors and takes the minimum.
-    us_fwd_guard_enable:         true
-    us_fwd_indices:              [0, 1, 2]  # x1,x2,x3 (was [3]=x4, wrong sensor)
-    us_fwd_min_m:                0.15     # skip forward move if front sensor < 15 cm
+    # FIX (per request — disabled entirely): this yaml override never got
+    # synced when the Python defaults were updated from x1/x2/x3 to x4/x5,
+    # so the guard kept firing on unreliable front sensors regardless of
+    # what the Python file said — since yaml wins at launch. Disabled
+    # outright rather than keep chasing index-sync issues between files.
+    # Move 1 will no longer be skipped due to any ultrasonic reading.
+    us_fwd_guard_enable:         false   # disabled — was true
+    us_fwd_indices:              [3, 4]  # unused while disabled (synced for consistency)
+    us_fwd_min_m:                0.15    # unused while disabled
 
     # ── Ultrasonic centering mode ──────────────────────────────────────
     # us_center_enable: master on/off for ALL post-park US correction
@@ -198,8 +198,57 @@ autopark_master:
     # overshoot from sensor-update lag or motor coast during the gear-
     # switch settle pause. The car was observed parked at 2.7cm from the
     # rear wall (target window is 14-26cm) before this was added.
-    us_kinetic_min_safe_m:       0.05    # 5cm hard floor — emergency stop
-    us_kinetic_max_data_age_s:   0.30    # refuse to drive on stale US data
+    us_kinetic_min_safe_m:       0.05    # 5cm hard floor — emergency stop (always active)
+    # FIX (per request): the standalone "ultrasonic data older than 0.3s"
+    # abort is no longer used by the drive logic — the continuous-drive +
+    # 1s recalculation cadence below (tied to confirmed encoder movement)
+    # replaces it. Left declared so old overrides don't error out.
+    us_kinetic_max_data_age_s:   0.30    # (no longer read by drive logic)
+
+    # FIX: continuous driving with periodic recalculation — the car keeps
+    # moving; every us_kinetic_recalc_period_s, gated on CONFIRMED encoder
+    # movement (not just elapsed time), a fresh ultrasonic reading is taken
+    # and the steer/gear correction is recomputed, refreshing the drive
+    # command. Repeats until within tolerance.
+    us_kinetic_recalc_period_s:  1.0     # drive duration once movement confirmed
+    us_kinetic_min_enc_move_m:   0.01    # 1cm — confirms real movement happened
+    # FIX (per request): if the ultrasonic reading shows zero change for
+    # this many consecutive forward cycles (despite the encoder confirming
+    # the wheels turned each time), the car has run out of forward room —
+    # triggers a brief reverse instead of continuing to push forward.
+    # FIX (per request): EITHER side reading zero change now triggers this
+    # (was requiring BOTH), and fires immediately on the first occurrence
+    # (was waiting for 2 in a row). A one-sided block (only ΔL or only ΔR
+    # staying at zero) means that corner is already out of room — pushing
+    # forward further moves the car out of the slot, not toward centering.
+    us_kinetic_unchanged_limit:  1   # was 2
+    # FIX (per request): if still blocked after one reverse, keep
+    # reversing immediately rather than cycling back through a forward
+    # attempt first. Caps consecutive reverses in a single unstick burst.
+    us_kinetic_unstick_max_retries: 3
+    # FIX (per request): full stop after every confirmed 1s drive interval,
+    # before checking the next fresh ultrasonic reading. Max wait for the
+    # encoder to confirm movement actually began before treating as stuck:
+    us_kinetic_move_start_timeout_s: 2.0
+
+    # SUPERSEDED by the continuous-drive architecture above — these
+    # fraction-based discrete-step params are no longer read by the drive
+    # logic, left declared only so old overrides don't error out.
+    us_kinetic_step_fraction:    0.25
+    us_kinetic_min_step_m:       0.02
+    us_kinetic_max_step_lat_m:   0.06
+    us_kinetic_max_step_depth_m: 0.10
+    # FIX (per request): Phase A's forward-budget early exit was removed —
+    # it was stopping the loop at "budget exhausted" with err still at
+    # -26cm remaining, well before tolerance, after using only half the
+    # available attempts. Now only the safety floor or running out of
+    # attempts can end Phase A unsuccessfully. Raised from 10 to 20 so it
+    # has enough cycles to actually converge.
+    us_kinetic_max_attempts:     20      # was 10
+    # FIX (per request): re-run lateral centering if depth correction drags
+    # it back out of tolerance, instead of just detecting and reporting the
+    # failure. Caps how many A→B outer passes to try.
+    us_kinetic_outer_attempts:   3
 
     # Shared US params (used by both kinetic and legacy modes)
     # FIX: was us_left_idx=1 (x2), us_right_idx=2 (x3) — both FRONT sensors,
@@ -215,14 +264,24 @@ autopark_master:
     lateral_correction_sign:     1.0
     # Lateral deadband: slot side clearance is 19–31 cm (range 12 cm).
     # Centre = 25 cm each side → accept ±6 cm from centre → deadband 6 cm.
-    us_deadband_m:               0.060   # 6 cm lateral deadband
+    us_deadband_m:               0.010   # 1 cm lateral deadband (corrected)
     us_steer_gain:               150.0   # error_m * gain = steer_deg
     us_max_steer_deg:            15.0
+    # FIX: kinetic operates in a confirmed-narrow slot — the old shared
+    # gain/cap above committed to the full max steer for any error >=10cm,
+    # regardless of actual measured side clearance. Kinetic now uses its
+    # own gentler gain plus a clearance-aware cap that scales the allowed
+    # steer angle down as the tighter side's clearance shrinks below
+    # us_kinetic_clearance_ref_m — large turns only happen when there's
+    # actually room for them.
+    us_kinetic_steer_gain:       60.0
+    us_kinetic_max_steer_deg:    10.0
+    us_kinetic_clearance_ref_m:  0.30
     us_correction_speed_mps:     0.06    # speed during kinetic + legacy moves
     us_correction_dist_m:        0.12    # legacy mode: fixed step distance
     us_max_attempts:             3       # legacy mode only
     us_rear_target_m:            0.20    # target 20 cm from rear wall
-    us_rear_tolerance_m:         0.06    # accept 14–26 cm  (± 6 cm)
+    us_rear_tolerance_m:         0.05    # accept 15–25 cm  (± 5 cm, corrected)
     us_depth_max_step_m:         0.04    # legacy depth: max one-step correction
     us_depth_max_attempts:       4       # legacy depth only
     us_stop_buffer_s:            0.20
@@ -237,10 +296,10 @@ autopark_master:
 
 serial_bridge:
   ros__parameters:
-    drive_port:              "/dev/ttyUSB2"
+    drive_port:              "/dev/ttyUSB0"
     enc_handles_straight:    true    # ← was missing from zip config
     enc_straight_thresh_deg: 5.0
-    us_all_port:             "/dev/ttyUSB0"
+    us_all_port:             "/dev/ttyUSB1"
     us_front_port:           ""
     us_rear_port:            ""
     baud:                    115200

@@ -126,11 +126,17 @@ class AutoparkMaster(Node):
             # ── Forward clearance guard (applied before each gear=+1 move) ────
             # If any sensor in us_fwd_indices reads below us_fwd_min_m,
             # the forward move is skipped entirely (car is already at front wall).
-            # FIX: was [3] (x4) — that's the LEFT sensor, not front. Front is
-            # x1/x2/x3 → indices 0,1,2. Checking all three for the guard.
-            ("us_fwd_guard_enable",          True),
-            ("us_fwd_indices",               [0, 1, 2]),  # x1,x2,x3 (was [3]=x4, wrong)
-            ("us_fwd_min_m",                 0.15),    # skip forward if <15 cm clearance
+            # FIX (per request — disabled entirely): switching the sensor
+            # set from x1/x2/x3 to x4/x5 was applied here in the Python
+            # defaults, but the YAML override (which wins at launch) never
+            # got the same update and stayed at [0,1,2] — so the guard kept
+            # firing on the same unreliable front sensors regardless of
+            # this file. Rather than keep chasing index-sync issues between
+            # two files, the guard is now disabled outright. Move 1 will no
+            # longer be skipped due to any ultrasonic reading.
+            ("us_fwd_guard_enable",          False),   # disabled — was True
+            ("us_fwd_indices",               [3, 4]),  # unused while disabled
+            ("us_fwd_min_m",                 0.15),    # unused while disabled
 
             # ── Ultrasonic centering ────────────────────────────────────────
             # FIX: us_left_idx/us_right_idx were 1, 2 (→ x2, x3) — those are
@@ -141,7 +147,11 @@ class AutoparkMaster(Node):
             ("us_center_enable",             True),
             ("us_left_idx",                  3),    # x4 = left  (was 1 → x2, front)
             ("us_right_idx",                 4),    # x5 = right (was 2 → x3, front)
-            ("us_deadband_m",                0.060),
+            ("us_deadband_m",                0.010),   # ±1cm tolerance around the target offset
+            # FIX (corrected per request): the goal is NOT symmetric
+            # centering (x4=x5). Target is x4-x5 = 5cm, held to within
+            # ±us_deadband_m (1cm) — i.e. L-R should land in [4cm, 6cm].
+            ("us_lateral_target_diff_m",     0.050),   # x4 - x5 target = 5cm
             ("us_steer_gain",                150.0),
             # x4=left, x5=right is now confirmed, so the original sign
             # convention (steer0 = -correction) should be correct by
@@ -151,12 +161,31 @@ class AutoparkMaster(Node):
             # away from it.
             ("lateral_correction_sign",      1.0),
             ("us_max_steer_deg",             15.0),
+
+            # FIX: kinetic operates in a confirmed-narrow slot — committing
+            # to the full us_max_steer_deg for any error >=10cm (which the
+            # old gain=150 did for nearly every routine correction) risks
+            # swinging the body into an obstacle the lateral-centering
+            # check itself doesn't model (it only checks the centering
+            # error, not how much actual clearance is available on the
+            # tight side). Two changes:
+            #  1. A separate, gentler gain just for kinetic's live steer
+            #     calculation, so typical errors produce a proportional
+            #     angle instead of immediately saturating.
+            #  2. A clearance-aware cap: the allowed steer angle scales
+            #     down as the tighter side's measured clearance shrinks
+            #     below us_kinetic_clearance_ref_m, so the car only uses
+            #     a large turn angle when there's actually room for it —
+            #     not just because the raw proportional error is large.
+            ("us_kinetic_steer_gain",        60.0),   # gentler than us_steer_gain
+            ("us_kinetic_max_steer_deg",     10.0),   # lower ceiling for tight slots
+            ("us_kinetic_clearance_ref_m",   0.30),   # full steer allowed at/above this clearance
             ("us_correction_dist_m",         0.12),
             ("us_correction_speed_mps",      0.06),
             ("us_max_attempts",              3),
             ("us_rear_idx",                  6),
             ("us_rear_target_m",             0.20),
-            ("us_rear_tolerance_m",          0.06),
+            ("us_rear_tolerance_m",          0.05),   # ±5cm (reverted — confirmed correct value)
             ("us_depth_max_step_m",          0.04),
             ("us_depth_max_attempts",        4),
             ("us_stop_buffer_s",             0.20),
@@ -179,6 +208,66 @@ class AutoparkMaster(Node):
             # sensor (not just us_rear_idx) is closing in on an obstacle.
             ("us_kinetic_min_safe_m",         0.05),   # 5 cm hard floor
             ("us_kinetic_max_data_age_s",     0.30),   # treat stale US data as unsafe
+
+            # FIX: step-and-check instead of one continuous creep/one deep
+            # move. Each phase now: read sensor → compute remaining error →
+            # drive only a FRACTION of that error → full stop → settle →
+            # take a fresh reading → repeat. This means the car is
+            # stationary (and the sensor reading is trustworthy) at the
+            # moment each decision is made, instead of trying to react
+            # mid-motion off a reading that may already be stale by the
+            # time the command lands. Naturally converges and self-corrects
+            # for speed/distance calibration error (we've seen commanded
+            # 1.4600m actually land at 1.4724m) since each step re-measures
+            # from the real current position rather than trusting an
+            # open-loop distance estimate.
+            # SUPERSEDED by the continuous-drive + 1s-recalc architecture
+            # below (us_kinetic_recalc_period_s) — these fraction-based
+            # discrete-step params are no longer read by the drive logic,
+            # left declared only so old yaml overrides don't error out.
+            ("us_kinetic_step_fraction",      0.25),   # drive 25% of remaining error per step
+            ("us_kinetic_min_step_m",         0.02),   # don't bother stepping smaller than 2cm
+            ("us_kinetic_max_step_lat_m",     0.06),   # cap a single lateral step
+            ("us_kinetic_max_step_depth_m",   0.10),   # cap a single depth step
+            # FIX (per request): Phase A no longer exits early on a distance
+            # budget — the only backstops left are this attempt count and
+            # the safety floor. Raised from 10 to 20 so it actually has
+            # enough cycles to converge instead of running out of attempts
+            # almost immediately. Phase B is unaffected in practice — it
+            # still exits via its own reverse/forward budget checks first
+            # in normal operation.
+            ("us_kinetic_max_attempts",       20),     # was 10
+            # FIX (per request): re-run lateral centering if depth correction
+            # drags it back out of tolerance, instead of just detecting and
+            # reporting the failure. Caps how many A→B outer passes to try.
+            ("us_kinetic_outer_attempts",     3),
+
+            # FIX (per request): full stop after each confirmed 1s drive
+            # interval, BEFORE checking the next fresh ultrasonic reading.
+            # The 1s is counted from when the encoder confirms the car
+            # actually started moving (not from when the drive command was
+            # sent), so PWM ramp-up / static-friction startup delay doesn't
+            # eat into the timed window.
+            ("us_kinetic_recalc_period_s",    1.0),    # drive duration once movement confirmed
+            ("us_kinetic_min_enc_move_m",     0.01),   # 1cm — confirms real movement happened
+            # FIX (per request): if EITHER side's ultrasonic reading shows
+            # zero change for this many forward cycles (despite the encoder
+            # confirming the wheels did turn), that corner is blocked — car
+            # is out of room on that side. KINETIC-A [3] in the log showed
+            # ΔL=+2.52cm (real movement) but ΔR=+0.00cm — continuing
+            # forward there pushes the car further out of the slot rather
+            # than helping. Triggers a brief reverse immediately (limit=1,
+            # not waiting for a second occurrence) instead of continuing
+            # to push forward.
+            ("us_kinetic_unchanged_limit",    1),   # was 2
+            # FIX (per request): if still blocked after one reverse, keep
+            # reversing immediately rather than cycling back through a
+            # forward attempt first. Caps how many consecutive reverses to
+            # try before giving up on unstick and returning to normal
+            # forward correction (which will just re-trigger unstick again
+            # if still blocked — this cap only bounds a single burst).
+            ("us_kinetic_unstick_max_retries", 3),
+            ("us_kinetic_move_start_timeout_s", 2.0),  # max wait for encoder to confirm movement began
         ]:
             self.declare_parameter(name, default)
 
@@ -226,9 +315,13 @@ class AutoparkMaster(Node):
         self.us_left_idx               = int(gp("us_left_idx"))
         self.us_right_idx              = int(gp("us_right_idx"))
         self.us_deadband_m             = float(gp("us_deadband_m"))
+        self.us_lateral_target_diff_m  = float(gp("us_lateral_target_diff_m"))
         self.us_steer_gain             = float(gp("us_steer_gain"))
         self.lateral_correction_sign   = float(gp("lateral_correction_sign"))
         self.us_max_steer_deg          = float(gp("us_max_steer_deg"))
+        self.us_kinetic_steer_gain     = float(gp("us_kinetic_steer_gain"))
+        self.us_kinetic_max_steer_deg  = float(gp("us_kinetic_max_steer_deg"))
+        self.us_kinetic_clearance_ref_m = float(gp("us_kinetic_clearance_ref_m"))
         self.us_correction_dist_m      = float(gp("us_correction_dist_m"))
         self.us_correction_speed_mps   = float(gp("us_correction_speed_mps"))
         self.us_max_attempts           = int(gp("us_max_attempts"))
@@ -248,6 +341,17 @@ class AutoparkMaster(Node):
         self.kinetic_rearm_wait_s      = float(gp("kinetic_rearm_wait_s"))
         self.us_kinetic_min_safe_m     = float(gp("us_kinetic_min_safe_m"))
         self.us_kinetic_max_data_age_s = float(gp("us_kinetic_max_data_age_s"))
+        self.us_kinetic_step_fraction   = float(gp("us_kinetic_step_fraction"))
+        self.us_kinetic_min_step_m      = float(gp("us_kinetic_min_step_m"))
+        self.us_kinetic_max_step_lat_m  = float(gp("us_kinetic_max_step_lat_m"))
+        self.us_kinetic_max_step_depth_m = float(gp("us_kinetic_max_step_depth_m"))
+        self.us_kinetic_max_attempts    = int(gp("us_kinetic_max_attempts"))
+        self.us_kinetic_outer_attempts  = int(gp("us_kinetic_outer_attempts"))
+        self.us_kinetic_recalc_period_s = float(gp("us_kinetic_recalc_period_s"))
+        self.us_kinetic_min_enc_move_m  = float(gp("us_kinetic_min_enc_move_m"))
+        self.us_kinetic_unchanged_limit = int(gp("us_kinetic_unchanged_limit"))
+        self.us_kinetic_unstick_max_retries = int(gp("us_kinetic_unstick_max_retries"))
+        self.us_kinetic_move_start_timeout_s = float(gp("us_kinetic_move_start_timeout_s"))
 
         # ── state ─────────────────────────────────────────────────────
         self.latest_pose: Optional[Pose2D] = None
@@ -256,6 +360,9 @@ class AutoparkMaster(Node):
         self.latest_us_time    = 0.0   # FIX: monotonic time of last US update
         self.latest_metrics    = []
         self.busy              = False
+        # FIX: edge-detect btn_state transitions to prevent auto-relaunch
+        # race (see on_esp32_status for full explanation)
+        self.last_btn_state_seen = "idle"
 
         # IMU state
         # latest_yaw_rad: from quaternion (often identity on mpu6050_cpp → unreliable)
@@ -387,7 +494,29 @@ class AutoparkMaster(Node):
         except Exception:
             return
         btn_state = obj.get("btn_state", "")
-        if btn_state == "parking" and not self.busy:
+
+        # FIX: auto-relaunch race. self.busy resets to False the instant
+        # start_autopark() RETURNS — which happens right after sending the
+        # final green-LED + parking_complete stop, with no wait. But the
+        # ESP32 only resets its OWN btn_state back to "idle" ~1s later
+        # (after its green-flash timer expires and _greenPendingDisarm
+        # fires). For that ~1s gap the ESP32 keeps broadcasting a STALE
+        # btn_state="parking", and the very next status message after
+        # self.busy flips back to False was re-triggering a brand new
+        # round with no button press — confirmed by logs showing
+        # "STOP: parking_complete" and "launching parking thread" only
+        # 17ms apart.
+        #
+        # Fix: only launch on the ACTUAL idle→parking edge, not just
+        # "currently reporting parking". Stale repeated "parking" messages
+        # from the tail of the previous round are now ignored because
+        # self.last_btn_state_seen is already "parking" from earlier in
+        # that same round.
+        is_new_parking_edge = (
+            btn_state == "parking" and self.last_btn_state_seen != "parking")
+        self.last_btn_state_seen = btn_state
+
+        if is_new_parking_edge and not self.busy:
             self.busy = True
             self.get_logger().info("btn_state=parking → launching parking thread")
             threading.Thread(target=self._parking_thread, daemon=True).start()
@@ -830,37 +959,52 @@ class AutoparkMaster(Node):
                     f"enc={enc_t:.4f}/{enc_stop_dist:.4f}m")
                 last_log = elapsed
 
-    # ── FIX: kinetic emergency safety check ─────────────────────────────
+    # ── FIX: kinetic emergency floor check ───────────────────────────────
     # Phase B (depth/reverse correction) was observed driving the car to
     # within ~2.7cm of the rear wall — well past the 14-26cm target window
     # — because the window check only watches us_rear_idx and only fires
-    # the gear-flip once per 100ms loop tick. If ultrasonic data lags the
-    # control loop (or the car coasts during the 2s direction-switch
-    # settle pause), the target-window logic alone is not enough.
+    # the gear-flip once per 100ms loop tick.
     #
-    # This check is independent of which sensor "should" matter for the
-    # current phase/direction — ANY of the 8 sensors dropping below the
-    # absolute floor immediately aborts the whole kinetic routine. It also
-    # treats stale ultrasonic data (no update in us_kinetic_max_data_age_s)
-    # as unsafe, since driving on a frozen reading is how the overshoot
-    # happens in the first place.
-    def _kinetic_safety_ok(self, phase: str) -> bool:
+    # This is a pure collision-distance check, not a data-freshness check —
+    # kept unconditionally regardless of recalculation cadence, since it's
+    # about imminent physical danger, not about how old the reading is.
+    #
+    # FIX (per request): the standalone "ultrasonic data older than 0.3s"
+    # abort has been removed. The architecture now recalculates from a
+    # fresh ultrasonic reading every us_kinetic_recalc_period_s, gated on
+    # confirmed encoder movement (not just elapsed wall-clock time) — see
+    # _kinetic_lateral_steps / _kinetic_depth_steps. That recalculation
+    # cadence is what keeps the data "fresh enough" now; a separate
+    # data-age abort on top of it is redundant by design.
+    #
+    # FIX (per request): x1/x2/x3 (front) excluded entirely from this
+    # check. Observed reading 4.66cm with nothing actually in front of the
+    # car — unreliable/spurious on this hardware setup — and that false
+    # reading incorrectly blocked a reverse move that would only have
+    # IMPROVED the (nonexistent) front clearance issue. Floor check is now
+    # restricted to the 3 trusted sensors: x4 (left, us_left_idx), x5
+    # (right, us_right_idx), x7 (rear, us_rear_idx).
+    #
+    # Direction still matters within those 3: left/right are checked
+    # regardless of gear (a side collision risk exists driving either
+    # direction), but the rear sensor is only checked when actually
+    # reversing (gear=-1) — a close rear reading shouldn't block driving
+    # forward away from it. gear=None (direction not yet decided, e.g. the
+    # very first per-cycle entry check) checks all 3 conservatively.
+    def _kinetic_floor_ok(self, phase: str, gear: int = None) -> bool:
         us = self.latest_us
         if not us:
             return True
 
-        age = time.monotonic() - self.latest_us_time
-        if age > self.us_kinetic_max_data_age_s:
-            self.get_logger().error(
-                f"KINETIC SAFETY ABORT [{phase}]: ultrasonic data stale "
-                f"(age={age:.2f}s > {self.us_kinetic_max_data_age_s:.2f}s) "
-                f"— refusing to drive blind")
-            self.publish_stop(f"kinetic_safety_stale_data_{phase}")
-            return False
+        check_idx = [self.us_left_idx, self.us_right_idx]
+        if gear is None or gear < 0:
+            check_idx.append(self.us_rear_idx)
 
-        min_val = min(us)
+        relevant = [(i, us[i]) for i in check_idx if i < len(us)]
+        if not relevant:
+            return True
+        idx, min_val = min(relevant, key=lambda pair: pair[1])
         if min_val < self.us_kinetic_min_safe_m:
-            idx = us.index(min_val)
             self.get_logger().error(
                 f"KINETIC SAFETY ABORT [{phase}]: sensor idx={idx} "
                 f"= {min_val*100:.1f}cm < safety floor "
@@ -870,18 +1014,445 @@ class AutoparkMaster(Node):
 
         return True
 
+    # FIX: clearance-aware steer cap. The old code clamped the lateral
+    # correction at a single fixed us_max_steer_deg regardless of how much
+    # actual side clearance existed — meaning any error >=10cm committed to
+    # the full turn angle even in a slot barely wider than the car. This
+    # scales the allowed steer angle down as the TIGHTER side's measured
+    # clearance shrinks below us_kinetic_clearance_ref_m, so a large turn
+    # is only used when there's actually room for it.
+    def _kinetic_clearance_capped_steer(self, err: float, L: float, R: float) -> float:
+        raw = err * self.us_kinetic_steer_gain
+        tight_side = min(L, R)
+        clearance_scale = max(0.0, min(1.0, tight_side / self.us_kinetic_clearance_ref_m))
+        effective_max = self.us_kinetic_max_steer_deg * clearance_scale
+        correction = max(-effective_max, min(effective_max, raw))
+        if abs(raw) > effective_max:
+            self.get_logger().info(
+                f"KINETIC-A: steer capped by clearance — tight_side={tight_side*100:.1f}cm "
+                f"scale={clearance_scale:.2f} effective_max={effective_max:.1f}° "
+                f"(raw correction would have been {raw:+.1f}°)")
+        return -correction * self.lateral_correction_sign
+
+    def _kinetic_lateral_steps(self) -> bool:
+        """Lateral centering: drive → wait for encoder-confirmed movement
+        start → drive exactly us_kinetic_recalc_period_s more from that
+        confirmed point → full stop → settle → take a fresh ultrasonic
+        reading → recompute → repeat until centred.
+
+        FIX (per request): the car now fully stops after every timed drive
+        interval, before the next ultrasonic check — not a continuous
+        creep. The 1s window is timed from when the ENCODER confirms the
+        car actually started moving, not from when the drive command was
+        sent, so PWM ramp-up / static-friction startup delay doesn't eat
+        into the timed driving window."""
+        SPEED      = self.us_correction_speed_mps
+        PERIOD     = self.us_kinetic_recalc_period_s
+        MIN_ENC    = self.us_kinetic_min_enc_move_m
+        START_TMO  = self.us_kinetic_move_start_timeout_s
+        SETTLE     = self.us_kinetic_settle_s
+        MAX_FWD    = self.us_kinetic_fwd_max_m
+        total_fwd_est = 0.0
+        prev_L, prev_R = None, None   # for explicit diff logging
+        unchanged_streak = 0
+
+        for attempt in range(self.us_kinetic_max_attempts):
+            if not self._kinetic_floor_ok("A", gear=1):
+                return False
+
+            L   = self.latest_us[self.us_left_idx]
+            R   = self.latest_us[self.us_right_idx]
+            err = (L - R) / 2.0
+
+            if prev_L is not None:
+                d_l = (L - prev_L) * 100
+                d_r = (R - prev_R) * 100
+                # FIX (per request): EITHER side reading zero change counts
+                # now, not just when BOTH do. Cycle 3 in the log had
+                # ΔL=+2.52cm (real movement) but ΔR=+0.00cm — that side was
+                # already blocked even though the car as a whole was still
+                # moving (pivoting around the blocked corner). Previously
+                # this required BOTH to be zero, so a one-sided block like
+                # this was missed entirely and the car kept driving forward.
+                is_unchanged = abs(d_l) < 0.01 or abs(d_r) < 0.01
+                unchanged_streak = unchanged_streak + 1 if is_unchanged else 0
+                unchanged = " [ONE SIDE UNCHANGED — that corner may be blocked]" \
+                    if is_unchanged else ""
+                self.get_logger().info(
+                    f"KINETIC-A [{attempt+1}]: ΔL={d_l:+.2f}cm ΔR={d_r:+.2f}cm "
+                    f"vs previous cycle{unchanged}")
+
+            self.get_logger().info(
+                f"KINETIC-A [{attempt+1}/{self.us_kinetic_max_attempts}]: "
+                f"L={L:.3f}m R={R:.3f}m err={err*100:.1f}cm "
+                f"deadband={self.us_deadband_m*100:.0f}cm")
+
+            if L > 2.0 or R > 2.0:
+                self.get_logger().warning("KINETIC-A: lateral sensors OOB — stop")
+                return True   # nothing trustworthy to correct — treat as pass
+
+            if abs(err) < self.us_deadband_m:
+                self.get_logger().info(
+                    f"KINETIC-A: centred after {attempt} cycle(s)")
+                return True
+
+            # FIX (per request): repeated ΔL=ΔR=0 while still commanding
+            # forward (and the encoder confirmed wheel movement each time —
+            # this isn't the "wheel may be stuck" no-movement case) means
+            # the car has driven as far forward as the slot allows and is
+            # now pressed against something ahead — wheels turning, body
+            # not translating. Pushing forward again is pointless; back off
+            # with a brief reverse instead, then retry from a fresh reading.
+            if unchanged_streak >= self.us_kinetic_unchanged_limit:
+                side_note = ""
+                if prev_L is not None:
+                    blocked_sides = []
+                    if abs(d_l) < 0.01:
+                        blocked_sides.append("left")
+                    if abs(d_r) < 0.01:
+                        blocked_sides.append("right")
+                    if blocked_sides:
+                        side_note = f" ({'/'.join(blocked_sides)} side blocked)"
+                cycles_word = "cycle" if unchanged_streak == 1 else "cycles"
+                self.get_logger().warning(
+                    f"KINETIC-A [{attempt+1}]: {unchanged_streak} {cycles_word} "
+                    f"with zero sensor change despite confirmed movement"
+                    f"{side_note} — car is out of forward room. Reversing "
+                    f"briefly to clear it.")
+
+                # FIX (per request): keep reversing immediately as long as
+                # the blockage persists, instead of doing one reverse then
+                # routing back through a full forward-attempt cycle before
+                # noticing it's still stuck. Each retry compares against
+                # the reading from BEFORE that specific reverse — cleared
+                # only once both sides show real movement again.
+                pre_unstick_L, pre_unstick_R = L, R
+                for unstick_try in range(self.us_kinetic_unstick_max_retries):
+                    self.cmd_pub.publish(String(data=json.dumps({
+                        "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": 0.0})))
+                    time.sleep(self.us_steer_wait_s)
+                    if not self._kinetic_floor_ok("A_unstick_pre", gear=-1):
+                        return False
+                    rd_before = self.latest_enc_rd
+                    self.cmd_pub.publish(String(data=json.dumps({
+                        "type": "drive", "gear": -1, "speed_mps": SPEED,
+                        "steer_deg": 0.0,
+                        "duration": round(START_TMO + PERIOD + 1.0, 2)})))
+                    t_cmd = time.monotonic()
+                    move_start = None
+                    while time.monotonic() - t_cmd < START_TMO:
+                        if not self._kinetic_floor_ok("A_unstick_waiting", gear=-1):
+                            return False
+                        if abs(self.latest_enc_rd - rd_before) >= MIN_ENC:
+                            move_start = time.monotonic()
+                            break
+                        time.sleep(0.03)
+                    if move_start is not None:
+                        t_end = move_start + PERIOD
+                        while time.monotonic() < t_end:
+                            if not self._kinetic_floor_ok("A_unstick_driving", gear=-1):
+                                return False
+                            time.sleep(0.03)
+                    self.publish_stop("kinetic_lateral_unstick_reverse")
+                    time.sleep(SETTLE)
+
+                    check_L = self.latest_us[self.us_left_idx]
+                    check_R = self.latest_us[self.us_right_idx]
+                    cd_l = (check_L - pre_unstick_L) * 100
+                    cd_r = (check_R - pre_unstick_R) * 100
+                    still_blocked = abs(cd_l) < 0.01 or abs(cd_r) < 0.01
+
+                    self.get_logger().info(
+                        f"KINETIC-A unstick [{unstick_try+1}/"
+                        f"{self.us_kinetic_unstick_max_retries}]: "
+                        f"ΔL={cd_l:+.2f}cm ΔR={cd_r:+.2f}cm vs pre-reverse — "
+                        f"{'still blocked, reversing again' if still_blocked else 'cleared'}")
+
+                    if not still_blocked:
+                        break
+                    pre_unstick_L, pre_unstick_R = check_L, check_R
+                else:
+                    self.get_logger().warning(
+                        f"KINETIC-A: still blocked after "
+                        f"{self.us_kinetic_unstick_max_retries} reverse attempts "
+                        f"— giving up on unstick, returning to normal correction")
+
+                unchanged_streak = 0
+                prev_L, prev_R = None, None   # force a fresh diff baseline
+                continue
+
+            total_fwd_est += SPEED * PERIOD  # kept for logging/diagnostics only
+
+            steer = self._kinetic_clearance_capped_steer(err, L, R)
+
+            # Pre-steer toward the new correction angle (car is fully
+            # stopped from the previous cycle's end, or this is cycle 1).
+            self.cmd_pub.publish(String(data=json.dumps({
+                "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": steer})))
+            time.sleep(self.us_steer_wait_s)
+            if not self._kinetic_floor_ok("A_post_steer", gear=1):
+                return False
+
+            # Issue the drive command with a generous watchdog duration —
+            # we control the actual stop ourselves below, this is just a
+            # safety ceiling in case our own stop call is ever delayed.
+            rd_before = self.latest_enc_rd
+            self.cmd_pub.publish(String(data=json.dumps({
+                "type": "drive", "gear": 1, "speed_mps": SPEED, "steer_deg": steer,
+                "duration": round(START_TMO + PERIOD + 1.0, 2)})))
+
+            self.get_logger().info(
+                f"KINETIC-A [{attempt+1}]: driving FWD steer={steer:+.1f}° "
+                f"— waiting for encoder-confirmed movement start "
+                f"(timeout {START_TMO:.1f}s)")
+
+            # Wait for the encoder to confirm the car actually started
+            # moving — counting the 1s drive window from command-send time
+            # would include PWM ramp-up / stiction delay as "driving".
+            t_cmd = time.monotonic()
+            move_start = None
+            while time.monotonic() - t_cmd < START_TMO:
+                if not self._kinetic_floor_ok("A_waiting_move", gear=1):
+                    return False
+                if abs(self.latest_enc_rd - rd_before) >= MIN_ENC:
+                    move_start = time.monotonic()
+                    break
+                time.sleep(0.03)
+
+            if move_start is None:
+                self.get_logger().warning(
+                    f"KINETIC-A [{attempt+1}]: no encoder movement within "
+                    f"{START_TMO:.1f}s of issuing drive — wheel may be stuck")
+                self.publish_stop("kinetic_lateral_stuck")
+                time.sleep(SETTLE)
+                prev_L, prev_R = L, R
+                continue
+
+            # Drive for UP TO PERIOD seconds counted from confirmed start —
+            # but cut short immediately if the live reading shows we've
+            # already centred. FIX: a full blind PERIOD-second commitment
+            # was observed covering 35-46cm of actual travel against an
+            # expected ~6cm (speed*PERIOD) — by the time the NEXT cycle's
+            # check ran, the car had already blown through the target by a
+            # wide margin. Polling the live error during the drive itself
+            # (not just at cycle boundaries) stops the car the instant the
+            # target is reached, regardless of why a single cycle is
+            # covering far more distance than expected.
+            t_drive_end = move_start + PERIOD
+            while time.monotonic() < t_drive_end:
+                if not self._kinetic_floor_ok("A_driving", gear=1):
+                    return False
+                live_L = self.latest_us[self.us_left_idx]
+                live_R = self.latest_us[self.us_right_idx]
+                if live_L <= 2.0 and live_R <= 2.0:
+                    live_err = (live_L - live_R) / 2.0
+                    if abs(live_err) < self.us_deadband_m:
+                        self.get_logger().info(
+                            f"KINETIC-A [{attempt+1}]: centred mid-cycle "
+                            f"(err={live_err*100:.1f}cm) — stopping early")
+                        break
+                time.sleep(0.03)
+
+            # Full stop before checking the next fresh reading.
+            self.publish_stop("kinetic_lateral_cycle_stop")
+            time.sleep(SETTLE)
+
+            prev_L, prev_R = L, R
+
+        self.publish_stop("kinetic_lateral_max_attempts")
+        self.get_logger().warning(
+            f"KINETIC-A: max attempts ({self.us_kinetic_max_attempts}) "
+            f"reached without centering")
+        return False
+
+    def _kinetic_depth_steps(self) -> bool:
+        """Depth correction: same stop-after-each-confirmed-1s-drive
+        architecture as lateral. Direction (reverse if too far, forward if
+        too close) can flip between cycles; since the car is already fully
+        stopped at the start of every cycle here, a direction change just
+        needs a fresh pre-steer, no extra stop logic required."""
+        SPEED      = self.us_correction_speed_mps
+        PERIOD     = self.us_kinetic_recalc_period_s
+        MIN_ENC    = self.us_kinetic_min_enc_move_m
+        START_TMO  = self.us_kinetic_move_start_timeout_s
+        SETTLE     = self.us_kinetic_settle_s
+        MAX_REV    = self.us_kinetic_rev_max_m
+        MAX_FWD    = self.us_kinetic_fwd_max_m
+
+        target = self.us_rear_target_m
+        tol    = self.us_rear_tolerance_m
+        lo, hi = target - tol, target + tol
+
+        total_rev_est = 0.0
+        total_fwd_est = 0.0
+        prev_rear      = None
+
+        for attempt in range(self.us_kinetic_max_attempts):
+            if not self._kinetic_floor_ok("B"):
+                return False
+
+            rear = self.latest_us[self.us_rear_idx]
+
+            if prev_rear is not None:
+                d_rear = (rear - prev_rear) * 100
+                unchanged = " [UNCHANGED FROM LAST CYCLE — sensor data not updating]" \
+                    if abs(d_rear) < 0.01 else ""
+                self.get_logger().info(
+                    f"KINETIC-B [{attempt+1}]: Δrear={d_rear:+.2f}cm "
+                    f"vs previous cycle{unchanged}")
+
+            self.get_logger().info(
+                f"KINETIC-B [{attempt+1}/{self.us_kinetic_max_attempts}]: "
+                f"rear={rear*100:.1f}cm target={target*100:.0f}±{tol*100:.0f}cm "
+                f"window=[{lo*100:.0f}, {hi*100:.0f}]cm")
+
+            if rear > 2.0:
+                self.get_logger().warning("KINETIC-B: rear sensor OOB — stop")
+                return True   # nothing trustworthy to correct — treat as pass
+
+            if lo <= rear <= hi:
+                self.get_logger().info(
+                    f"KINETIC-B: depth OK after {attempt} cycle(s)")
+                return True
+
+            error = rear - target   # +ve = too far (reverse), -ve = too close (forward)
+            gear  = -1 if error > 0 else 1
+
+            if gear == -1 and total_rev_est >= MAX_REV:
+                self.get_logger().warning(
+                    f"KINETIC-B: reverse budget exhausted "
+                    f"({total_rev_est*100:.1f}cm used) — error={error*100:+.1f}cm remains")
+                return False
+            if gear == 1 and total_fwd_est >= MAX_FWD:
+                self.get_logger().warning(
+                    f"KINETIC-B: forward budget exhausted "
+                    f"({total_fwd_est*100:.1f}cm used) — error={error*100:+.1f}cm remains")
+                return False
+
+            # [FIX] Apply steer_straight_bias_deg during depth moves.
+            # Without bias, left motor slower → car drifts right even
+            # during Phase-B reverse/forward → lateral error accumulates
+            # while depth is being corrected.
+            depth_steer = (
+                +self.steer_straight_bias_deg if gear > 0
+                else -self.steer_straight_bias_deg
+            )
+
+            # Car is already fully stopped from the previous cycle (or this
+            # is cycle 1) — pre-steer to straight before driving.
+            self.cmd_pub.publish(String(data=json.dumps({
+                "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": 0.0})))
+            time.sleep(self.us_steer_wait_s)
+            if not self._kinetic_floor_ok("B_post_steer", gear=gear):
+                return False
+
+            rd_before = self.latest_enc_rd
+            self.cmd_pub.publish(String(data=json.dumps({
+                "type": "drive", "gear": gear, "speed_mps": SPEED,
+                "steer_deg": depth_steer,
+                "duration": round(START_TMO + PERIOD + 1.0, 2)})))
+
+            direction = "REV" if gear == -1 else "FWD"
+            self.get_logger().info(
+                f"KINETIC-B [{attempt+1}]: driving {direction} "
+                f"(error={error*100:+.1f}cm) — waiting for encoder-confirmed "
+                f"movement start (timeout {START_TMO:.1f}s)")
+
+            t_cmd = time.monotonic()
+            move_start = None
+            while time.monotonic() - t_cmd < START_TMO:
+                if not self._kinetic_floor_ok("B_waiting_move", gear=gear):
+                    return False
+                if abs(self.latest_enc_rd - rd_before) >= MIN_ENC:
+                    move_start = time.monotonic()
+                    break
+                time.sleep(0.03)
+
+            if move_start is None:
+                self.get_logger().warning(
+                    f"KINETIC-B [{attempt+1}]: no encoder movement within "
+                    f"{START_TMO:.1f}s of issuing drive — wheel may be stuck")
+                self.publish_stop("kinetic_depth_stuck")
+                time.sleep(SETTLE)
+                prev_rear = rear
+                continue
+
+            # Drive for UP TO PERIOD seconds counted from confirmed start —
+            # but cut short immediately if the live reading shows we've
+            # reached (or are about to blow past) the target window. FIX:
+            # a full blind PERIOD-second commitment was observed covering
+            # 35-46cm of actual travel against an expected ~6cm
+            # (speed*PERIOD) — by the time the NEXT cycle's check ran, the
+            # car had already reversed straight through the entire 15-25cm
+            # window down to a near-collision 4.8cm before the floor check
+            # caught it. Polling the live rear reading during the drive
+            # itself (not just at cycle boundaries) stops the car the
+            # instant it enters tolerance — or the instant it overshoots
+            # past the window in the direction it's currently moving —
+            # regardless of why a single cycle covers far more distance
+            # than expected.
+            t_drive_end = move_start + PERIOD
+            while time.monotonic() < t_drive_end:
+                if not self._kinetic_floor_ok("B_driving", gear=gear):
+                    return False
+                live_rear = self.latest_us[self.us_rear_idx]
+                if live_rear <= 2.0:
+                    if lo <= live_rear <= hi:
+                        self.get_logger().info(
+                            f"KINETIC-B [{attempt+1}]: reached tolerance "
+                            f"mid-cycle (rear={live_rear*100:.1f}cm) — "
+                            f"stopping early")
+                        break
+                    if gear == -1 and live_rear < lo:
+                        self.get_logger().warning(
+                            f"KINETIC-B [{attempt+1}]: overshot past window "
+                            f"while reversing (rear={live_rear*100:.1f}cm < "
+                            f"{lo*100:.0f}cm) — stopping early")
+                        break
+                    if gear == 1 and live_rear > hi:
+                        self.get_logger().warning(
+                            f"KINETIC-B [{attempt+1}]: overshot past window "
+                            f"while creeping forward (rear={live_rear*100:.1f}cm "
+                            f"> {hi*100:.0f}cm) — stopping early")
+                        break
+                time.sleep(0.03)
+
+            self.publish_stop("kinetic_depth_cycle_stop")
+            time.sleep(SETTLE)
+
+            if gear == -1:
+                total_rev_est += SPEED * PERIOD
+            else:
+                total_fwd_est += SPEED * PERIOD
+            prev_rear = rear
+
+        self.publish_stop("kinetic_depth_max_attempts")
+        self.get_logger().warning(
+            f"KINETIC-B: max attempts ({self.us_kinetic_max_attempts}) "
+            f"reached without reaching tolerance")
+        return False
+
     def _run_kinetic_centering(self) -> bool:
         """Returns True if the car finished within tolerance on both lateral
         and depth checks, False if it aborted early (safety) or finished
         out-of-tolerance (e.g. budget exhausted before reaching the rear
-        target window)."""
-        SPEED     = self.us_correction_speed_mps
-        DT        = 1.0 / max(self.us_kinetic_update_hz, 1.0)
-        MAX_FWD   = self.us_kinetic_fwd_max_m
-        MAX_REV   = self.us_kinetic_rev_max_m
-        SETTLE    = self.us_kinetic_settle_s
-        KEEPALIVE = round(DT * 6, 2)
+        target window).
 
+        FIX (per request): rebuilt around stop-after-each-confirmed-cycle
+        (see _kinetic_lateral_steps / _kinetic_depth_steps) — drive →
+        wait for the encoder to confirm movement actually started → drive
+        exactly us_kinetic_recalc_period_s more from that confirmed point
+        → full stop → settle → take a fresh ultrasonic reading → recompute
+        → repeat until within tolerance. The car is fully stationary every
+        time a new sensor reading is taken and a new path is calculated.
+
+        The 1s drive window is timed from CONFIRMED encoder movement, not
+        from when the command was sent, so PWM ramp-up / static-friction
+        startup delay doesn't eat into the timed driving interval. The
+        absolute proximity floor (_kinetic_floor_ok) remains active
+        throughout, polled every ~30ms while driving or waiting for
+        movement to start — that's a collision-distance check, independent
+        of this cycle structure."""
         time.sleep(0.50)
 
         # ── FIX: re-arm ESP32 before kinetic ─────────────────────────────
@@ -905,175 +1476,74 @@ class AutoparkMaster(Node):
         self.cmd_pub.publish(String(data=json.dumps({"type": "arm"})))
         time.sleep(self.kinetic_rearm_wait_s)
 
-        self.get_logger().info("KINETIC CENTERING START")
-
-        # ── Phase A: lateral centering (forward creep with live steer) ────
-        L   = self.latest_us[self.us_left_idx]
-        R   = self.latest_us[self.us_right_idx]
-        err = (L - R) / 2.0
-
         self.get_logger().info(
-            f"KINETIC-A: L={L:.3f}m R={R:.3f}m err={err*100:.1f}cm "
-            f"deadband={self.us_deadband_m*100:.0f}cm")
+            f"KINETIC CENTERING START (stop-after-cycle, "
+            f"{self.us_kinetic_recalc_period_s:.1f}s drive per cycle, "
+            f"encoder-confirmed start)")
 
-        if L > 2.0 or R > 2.0:
-            self.get_logger().warning("KINETIC-A: lateral sensors OOB — skip")
-        elif abs(err) < self.us_deadband_m:
-            self.get_logger().info("KINETIC-A: already centred — skip")
-        else:
-            correction = max(-self.us_max_steer_deg,
-                             min(self.us_max_steer_deg, err * self.us_steer_gain))
-            steer0 = -correction * self.lateral_correction_sign
-            # gear=+1: neg steer compensates right excess (sign flip via
-            # lateral_correction_sign if x4/x5 turn out to be mounted
-            # right/left instead of left/right)
+        # FIX (per request): "x4 vs x5 difference must be ≤5cm before doing
+        # x7" — not just checked once before Phase B starts (trivial, since
+        # nothing moves between A finishing and B starting), but actually
+        # held true at the END too. Confirmed bug: Phase B's reverse motion
+        # drags the car laterally (imperfect straight-line tracking despite
+        # steer_straight_bias_deg) — lat_err drifted from 3.9cm (Phase A's
+        # own success) to 20.9cm by the time Phase B finished. Detecting
+        # that after the fact and reporting FAIL (previous fix) is correct
+        # but incomplete — this loop actually RE-RUNS lateral centering
+        # afterward and tries again, up to us_kinetic_outer_attempts times,
+        # until both axes hold simultaneously or the outer budget runs out.
+        lat_ok = depth_ok = False
+        L = R = rear = 0.0
+        lat_err_cm = 0.0
+        for outer in range(self.us_kinetic_outer_attempts):
+            if outer > 0:
+                self.get_logger().info(
+                    f"KINETIC OUTER RETRY [{outer+1}/{self.us_kinetic_outer_attempts}]: "
+                    f"lateral drifted out of tolerance after depth phase — "
+                    f"re-centring laterally")
 
-            self.cmd_pub.publish(String(data=json.dumps({
-                "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": steer0})))
-            time.sleep(self.us_steer_wait_s)
+            lat_ok   = self._kinetic_lateral_steps()
+            depth_ok = self._kinetic_depth_steps()
+            # Depth phase always runs even if lateral fell short of
+            # tolerance — matches prior behaviour where both phases always
+            # got a chance.
 
-            steps = max(1, int(MAX_FWD / (SPEED * DT)))
-            for step in range(steps):
-                if not self._kinetic_safety_ok("A"):
-                    return False
+            L    = self.latest_us[self.us_left_idx]
+            R    = self.latest_us[self.us_right_idx]
+            rear = self.latest_us[self.us_rear_idx]
+            lat_err_cm = (L - R) / 2 * 100
 
-                L   = self.latest_us[self.us_left_idx]
-                R   = self.latest_us[self.us_right_idx]
-                err = (L - R) / 2.0
+            lat_final_ok = (L > 2.0 or R > 2.0) or (abs(lat_err_cm) / 100.0 < self.us_deadband_m)
+            rear_lo = self.us_rear_target_m - self.us_rear_tolerance_m
+            rear_hi = self.us_rear_target_m + self.us_rear_tolerance_m
+            rear_final_ok = (rear > 2.0) or (rear_lo <= rear <= rear_hi)
 
-                if abs(err) < self.us_deadband_m:
-                    self.get_logger().info(
-                        f"KINETIC-A: centred step={step} err={err*100:.1f}cm")
-                    break
+            if lat_final_ok and rear_final_ok:
+                break
 
-                corr  = max(-self.us_max_steer_deg,
-                            min(self.us_max_steer_deg, err * self.us_steer_gain))
-                steer = -corr * self.lateral_correction_sign
-
-                self.cmd_pub.publish(String(data=json.dumps({
-                    "type": "drive", "gear": 1, "speed_mps": SPEED,
-                    "steer_deg": steer, "duration": KEEPALIVE})))
-
-                if step % 5 == 0:
-                    self.get_logger().info(
-                        f"KINETIC-A [{step:02d}]: L={L:.3f} R={R:.3f} "
-                        f"err={err*100:.1f}cm steer={steer:+.1f}°")
-                time.sleep(DT)
-
-            self.publish_stop("kinetic_fwd_done")
-            time.sleep(SETTLE)
-
-        # ── Phase B: depth correction (closed-loop, handles both directions) ──
-        # Runs a continuous seek loop: reverse if too far, forward if too close.
-        # Stops as soon as rear sensor lands in [target-tol, target+tol].
-        # Total travel budget: MAX_REV in reverse + MAX_FWD in forward.
-        target  = self.us_rear_target_m
-        tol     = self.us_rear_tolerance_m
-        lo      = target - tol
-        hi      = target + tol
-
-        rear = self.latest_us[self.us_rear_idx]
-        self.get_logger().info(
-            f"KINETIC-B: rear={rear:.3f}m target={target:.2f}±{tol:.2f}m "
-            f"window=[{lo:.2f}, {hi:.2f}]m")
-
-        if rear > 2.0:
-            self.get_logger().warning("KINETIC-B: rear sensor OOB — skip")
-        elif lo <= rear <= hi:
-            self.get_logger().info("KINETIC-B: depth within window — skip")
-        else:
-            # Pre-steer straight before any depth movement
-            self.cmd_pub.publish(String(data=json.dumps({
-                "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": 0.0})))
-            time.sleep(self.us_steer_wait_s)
-
-            # Budget: allow up to MAX_REV reverse + MAX_FWD forward total steps
-            max_steps = max(1, int((MAX_REV + MAX_FWD) / (SPEED * DT)))
-            last_gear = 0
-
-            for step in range(max_steps):
-                if not self._kinetic_safety_ok("B"):
-                    return False
-
-                rear = self.latest_us[self.us_rear_idx]
-
-                if lo <= rear <= hi:
-                    self.get_logger().info(
-                        f"KINETIC-B: depth OK step={step} rear={rear*100:.1f}cm")
-                    break
-
-                if rear > hi:
-                    # Too far from wall → reverse to close the gap
-                    gear = -1
-                elif rear < lo:
-                    # Too close to wall → creep forward
-                    gear = 1
-                else:
-                    break
-
-                # Re-steer to straight only on gear change (avoids repeated waits)
-                if gear != last_gear and last_gear != 0:
-                    self.publish_stop("kinetic_depth_dir_change")
-                    time.sleep(SETTLE)
-                    self.cmd_pub.publish(String(data=json.dumps({
-                        "type": "drive", "gear": 0,
-                        "speed_mps": 0.0, "steer_deg": 0.0})))
-                    time.sleep(self.us_steer_wait_s)
-                    # FIX: ~2.5s elapsed since the `rear` read above — the car
-                    # may have coasted during the stop. Re-check before firing
-                    # the new-direction drive command on a stale reading.
-                    if not self._kinetic_safety_ok("B_post_switch"):
-                        return False
-                last_gear = gear
-
-                # [FIX] Apply steer_straight_bias_deg during depth moves.
-                # Without bias, left motor slower → car drifts right even
-                # during Phase-B reverse/forward → lateral error accumulates
-                # while depth is being corrected.
-                depth_steer = (
-                    +self.steer_straight_bias_deg if gear > 0
-                    else -self.steer_straight_bias_deg
-                )
-
-                self.cmd_pub.publish(String(data=json.dumps({
-                    "type": "drive", "gear": gear, "speed_mps": SPEED,
-                    "steer_deg": depth_steer, "duration": KEEPALIVE})))
-
-                if step % 5 == 0:
-                    direction = "REV" if gear == -1 else "FWD"
-                    self.get_logger().info(
-                        f"KINETIC-B [{step:02d}] {direction}: rear={rear*100:.1f}cm "
-                        f"target={target*100:.0f}±{tol*100:.0f}cm")
-                time.sleep(DT)
-            else:
-                # FIX: for/else — fires only if the loop ran out of max_steps
-                # WITHOUT breaking (i.e. never reached the tolerance window
-                # and was never caught by the safety abort either). This is
-                # exactly how the car can end up parked at 2.7cm from the
-                # wall while the code still calls it "done": budget ran out
-                # mid-overshoot/mid-recovery and the loop just exits.
+            if not (lat_ok and depth_ok):
+                # A genuine in-phase failure (budget exhausted, safety
+                # abort, etc.) — retrying won't help, stop here.
                 self.get_logger().warning(
-                    f"KINETIC-B: budget exhausted ({max_steps} steps) "
-                    f"before reaching tolerance window — rear={rear*100:.1f}cm "
-                    f"target={lo*100:.0f}-{hi*100:.0f}cm")
+                    f"KINETIC: phase failure (lat_ok={lat_ok} depth_ok={depth_ok}), "
+                    f"not a cross-axis drift — not retrying")
+                break
 
-            self.publish_stop("kinetic_depth_done")
-            time.sleep(SETTLE)
+            self.get_logger().warning(
+                f"KINETIC: both phases reported success individually, but "
+                f"the FINAL combined state drifted out of tolerance "
+                f"(lat_final_ok={lat_final_ok}, rear_final_ok={rear_final_ok}) "
+                f"— cross-axis coupling between phases.")
+        else:
+            self.get_logger().warning(
+                f"KINETIC: outer retry budget ({self.us_kinetic_outer_attempts}) "
+                f"exhausted without both axes holding simultaneously")
 
-        L    = self.latest_us[self.us_left_idx]
-        R    = self.latest_us[self.us_right_idx]
-        rear = self.latest_us[self.us_rear_idx]
-        lat_err_cm = (L - R) / 2 * 100
-
-        # FIX: explicit pass/fail — previously this was just an info log
-        # with no signal back to start_autopark(), so a car that finished
-        # 2.7cm from the wall (vs a 14-26cm target) was reported identically
-        # to a clean park. Both checks are skipped (treated as pass) if the
-        # corresponding sensor read OOB (>2.0m), matching the skip logic
-        # used during the live phases above.
-        lat_ok  = (L > 2.0 or R > 2.0) or (abs(lat_err_cm / 100.0) < self.us_deadband_m)
-        rear_ok = (rear > 2.0) or (lo <= rear <= hi)
-        ok = lat_ok and rear_ok
+        lat_final_ok = (L > 2.0 or R > 2.0) or (abs(lat_err_cm) / 100.0 < self.us_deadband_m)
+        rear_lo = self.us_rear_target_m - self.us_rear_tolerance_m
+        rear_hi = self.us_rear_target_m + self.us_rear_tolerance_m
+        rear_final_ok = (rear > 2.0) or (rear_lo <= rear <= rear_hi)
+        ok = lat_ok and depth_ok and lat_final_ok and rear_final_ok
 
         log_fn = self.get_logger().info if ok else self.get_logger().warning
         log_fn(

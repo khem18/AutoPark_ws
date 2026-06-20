@@ -140,8 +140,8 @@ def generate_launch_description():
             executable='encoder_bridge',
             name='encoder_bridge',
             parameters=[{
-                'enc_port':            '/dev/ttyUSB1',
-                'drive_port':          '/dev/ttyUSB2',
+                'enc_port':            '/dev/ttyUSB2',
+                'drive_port':          '/dev/ttyUSB0',
                 'speed_scale':         0.01,
                 # Calibrated driving speeds for 98 kg passenger load:
                 # Move 1 forward  calibrated at 0.08 m/s -> enc_fwd_speed_mps = 0.08

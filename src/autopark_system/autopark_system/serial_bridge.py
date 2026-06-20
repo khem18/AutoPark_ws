@@ -67,6 +67,19 @@ class SerialBridge(Node):
         self.last_btn_state = 'idle'
         self.us_all_line_buf = self.us_front_line_buf = self.us_rear_line_buf = ''
 
+        # FIX: diagnostics for the "/autopark/ultrasonic never updates"
+        # failure mode. autopark_master was found running with self.latest_us
+        # stuck at its [9.9]*8 placeholder default the entire round (KINETIC-A
+        # logged L=9.900 R=9.900 while the raw sensor showed real values the
+        # whole time) — meaning this node's us_pub was never successfully
+        # publishing a full 8-value frame. These counters/timer surface
+        # exactly where that's failing instead of requiring guesswork next
+        # time: port-not-open vs read-failing vs parse-failing.
+        self.us_last_publish_time = 0.0
+        self.us_publish_count     = 0
+        self.us_fail_streak       = 0
+        self.create_timer(5.0, self._us_health_check)
+
         self.create_subscription(String, gp('command_topic'), self.on_cmd, 10)
         self.create_subscription(Bool, '/enc_busy', self.on_enc_busy, 10)
 
@@ -81,9 +94,39 @@ class SerialBridge(Node):
             f'serial_bridge v_next8 started  '
             f'enc_handles_straight={self.enc_handles_straight}  '
             f'thresh={self.enc_straight_thresh}°')
+        # FIX: make the us_all port state impossible to miss at startup —
+        # this is the single most diagnostic line for the stuck-at-9.9 bug.
+        if self.us_all is None:
+            self.get_logger().error(
+                f'us_all_port ({self.us_all_port}) FAILED TO OPEN — '
+                f'/autopark/ultrasonic will NEVER publish, autopark_master '
+                f'will be stuck reading its [9.9]*8 placeholder forever.')
+        else:
+            self.get_logger().info(
+                f'us_all_port ({self.us_all_port}) opened OK — '
+                f'waiting for first valid 8-value frame...')
 
     def on_enc_busy(self, msg: Bool):
         self.enc_busy = bool(msg.data)
+
+    def _us_health_check(self):
+        # FIX: periodic visibility into ultrasonic publish health.
+        age = time.monotonic() - self.us_last_publish_time if self.us_last_publish_time > 0 else -1
+        if self.us_all is None:
+            self.get_logger().error(
+                'US HEALTH: us_all port is None (never opened) — '
+                '/autopark/ultrasonic has NEVER published')
+        elif self.us_publish_count == 0:
+            self.get_logger().error(
+                'US HEALTH: port is open but ZERO successful 8-value frames '
+                'parsed since startup — check baud rate / sensor firmware '
+                'output format / port-sharing with another reader')
+        elif age > 2.0:
+            self.get_logger().warning(
+                f'US HEALTH: last successful publish was {age:.1f}s ago '
+                f'(fail_streak={self.us_fail_streak}) — data is stale, '
+                f'check for port contention (e.g. a manual miniterm session '
+                f'open on the same device)')
 
     def _open(self, port, baud):
         if not self._serial or not port: return None
@@ -132,8 +175,13 @@ class SerialBridge(Node):
             m = Float32MultiArray()
             m.data = [float(v) for v in vals]
             self.us_pub.publish(m)
+            self.us_last_publish_time = time.monotonic()
+            self.us_publish_count    += 1
+            self.us_fail_streak       = 0
             if self.debug_serial:
                 self.get_logger().info(f'US: {[f"{v*1000:.0f}mm" for v in vals]}')
+        else:
+            self.us_fail_streak += 1
 
     def _read_json(self, ser, buf_attr):
         if ser is None:
@@ -141,14 +189,23 @@ class SerialBridge(Node):
         try:
             waiting = ser.in_waiting
         except Exception as e:
-            self.get_logger().warning(f'{buf_attr} in_waiting: {e}')
+            # FIX: throttled. At 20Hz, an unthrottled warning here during
+            # sustained port contention (e.g. a manual miniterm session
+            # also open on the same device) was firing up to 20x/sec,
+            # spamming the terminal hard enough to contribute to general
+            # desktop sluggishness — including unrelated cv2 GUI windows
+            # (LotDetector) getting flagged "not responding" by the window
+            # manager, since X11 event servicing was starved alongside it.
+            self.get_logger().warning(
+                f'{buf_attr} in_waiting: {e}', throttle_duration_sec=2.0)
             return []
         if waiting <= 0:
             return []
         try:
             chunk = ser.read(waiting).decode('utf-8', errors='ignore')
         except Exception as e:
-            self.get_logger().warning(f'{buf_attr} read: {e}')
+            self.get_logger().warning(
+                f'{buf_attr} read: {e}', throttle_duration_sec=2.0)
             return []
 
         buf = getattr(self, buf_attr) + chunk
@@ -224,14 +281,16 @@ class SerialBridge(Node):
         try:
             waiting = ser.in_waiting
         except Exception as e:
-            self.get_logger().warning(f'{json_buf_attr} in_waiting: {e}')
+            self.get_logger().warning(
+                f'{json_buf_attr} in_waiting: {e}', throttle_duration_sec=2.0)
             return []
         if waiting <= 0:
             return []
         try:
             chunk = ser.read(waiting).decode('utf-8', errors='ignore')
         except Exception as e:
-            self.get_logger().warning(f'{json_buf_attr} read: {e}')
+            self.get_logger().warning(
+                f'{json_buf_attr} read: {e}', throttle_duration_sec=2.0)
             return []
 
         result = []

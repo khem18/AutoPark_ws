@@ -195,6 +195,9 @@ class LotDetector(Node):
         self.gain_b = self.gain_g = self.gain_r = 1.0
         self.estimator = EgoPoseEstimator()
         self.frame_cnt = 0
+
+        # REVERTED: window auto-close-on-parking removed per request —
+        # window now stays open continuously, same as before that change.
         self.get_logger().info(
             "Lot Detector 1920×1080 → BEV 640×480 | /ego_pose (differential)")
 
