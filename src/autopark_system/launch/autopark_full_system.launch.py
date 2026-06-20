@@ -142,7 +142,7 @@ def generate_launch_description():
             parameters=[{
                 'enc_port':            '/dev/ttyUSB2',
                 'drive_port':          '/dev/ttyUSB0',
-                'speed_scale':         0.01,
+                'speed_scale':         0.03,
                 # Calibrated driving speeds for 98 kg passenger load:
                 # Move 1 forward  calibrated at 0.08 m/s -> enc_fwd_speed_mps = 0.08
                 # Move 3/4        calibrated at 0.06 m/s -> enc_rev_speed_mps = 0.06

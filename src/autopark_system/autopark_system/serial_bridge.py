@@ -1,6 +1,29 @@
 """
-serial_bridge.py  —  v_next8
-Changes vs v_next7:
+serial_bridge.py  —  v_next10
+Changes vs v_next8 (this header was stale — said v_next8 while the code
+had already moved to v_next10, which is exactly what caused confusion
+about whether the latest fixes were actually deployed):
+  4. US HEALTH diagnostics: startup log reports whether us_all_port opened
+     OK, plus a periodic health check reporting port state / zero-frames /
+     stale-data age — makes "ultrasonic never updates" diagnosable from
+     logs alone instead of guessing.
+  5. Throttled (2s) the per-poll-cycle warning logs for in_waiting/read
+     failures — these were firing up to 20x/sec during sustained port
+     contention, which was itself contributing to system-wide sluggishness.
+  6. _parse_us_text rewritten: parses each "xN: value cm" field
+     independently with last-known-good carry-forward, instead of
+     requiring an exact 8-field regex match per line (one corrupted field
+     used to discard the entire reading).
+  7. "No signal" recognized explicitly as a fixed 9.9 OOB sentinel value,
+     not silently skipped — one sensor (x3) reports this on every line,
+     which previously left that field permanently unset and blocked
+     publishing forever.
+  8. Publish readiness now gates ONLY on the 3 sensors autopark_master
+     actually reads (x4/x5/x7 — us_trusted_idx), not all 8. An explicit
+     "US GATE" startup log line states this plainly so it's unambiguous
+     from the log alone which version is running.
+
+Original v_next8 changes vs v_next7:
   1. publishStatus() in the ESP32 firmware sends a full JSON every 100 ms
      that includes btn_state.  This is received on the drive port (ttyUSB0)
      and forwarded on /autopark/esp32_status so autopark_master can watch
@@ -67,6 +90,21 @@ class SerialBridge(Node):
         self.last_btn_state = 'idle'
         self.us_all_line_buf = self.us_front_line_buf = self.us_rear_line_buf = ''
 
+        # FIX (per request): only x4 (left, idx 3), x5 (right, idx 4), and
+        # x7 (rear, idx 6) are ever actually read by autopark_master —
+        # those are the only ones that should gate readiness. Previously
+        # ALL 8 had to be seen at least once before anything published,
+        # which is exactly what let x3's permanent "No signal" block
+        # publication forever even though the 3 sensors that matter were
+        # reading fine. Now: all 8 still default to the 9.9 OOB sentinel
+        # and get updated opportunistically whenever they parse, but only
+        # the 3 trusted indices are required before a frame is considered
+        # ready to publish.
+        self.us_last_field    = [9.9] * 8
+        self.us_trusted_idx   = {3, 4, 6}   # x4, x5, x7 — must match autopark_master's
+                                             # us_left_idx / us_right_idx / us_rear_idx
+        self.us_trusted_seen  = set()
+
         # FIX: diagnostics for the "/autopark/ultrasonic never updates"
         # failure mode. autopark_master was found running with self.latest_us
         # stuck at its [9.9]*8 placeholder default the entire round (KINETIC-A
@@ -91,9 +129,17 @@ class SerialBridge(Node):
 
         self.timer = self.create_timer(0.05, self.poll_serial)
         self.get_logger().info(
-            f'serial_bridge v_next8 started  '
+            f'serial_bridge v_next10 started  '
             f'enc_handles_straight={self.enc_handles_straight}  '
             f'thresh={self.enc_straight_thresh}°')
+        # FIX: explicit marker so it's unambiguous from the log alone
+        # whether this trusted-only-gate version is actually deployed,
+        # instead of guessing from behavior. If this line is missing,
+        # an older serial_bridge.py is what's actually running.
+        self.get_logger().info(
+            f'serial_bridge US GATE: trusted_idx={sorted(self.us_trusted_idx)} '
+            f'(x4/x5/x7) — publishes once these 3 are seen, '
+            f'independent of the other 5 fields')
         # FIX: make the us_all port state impossible to miss at startup —
         # this is the single most diagnostic line for the stuck-at-9.9 bug.
         if self.us_all is None:
@@ -332,14 +378,38 @@ class SerialBridge(Node):
         return [max(0.01, min(5.0, v)) for v in vals]
 
     def _parse_us_text(self, line: str, n: int) -> List[float]:
-        matches = re.findall(r'x\d+:\s*([\d.]+)\s*cm', line)
-        if len(matches) != n:
+        # FIX (per request): only x4/x5/x7 (us_trusted_idx) gate readiness
+        # now — those are the only sensors autopark_master ever reads.
+        # All 8 fields are still parsed and carried forward opportunistically
+        # (so the array shape stays 8 for downstream compatibility), but a
+        # frame is considered "ready to publish" the moment all 3 trusted
+        # indices have been seen at least once, regardless of what the
+        # other 5 (including the permanently "No signal" x3) are doing.
+        # "No signal" still recognized explicitly (not just numeric values)
+        # and treated as a fixed 9.9 OOB sentinel either way.
+        matches = re.findall(r'x(\d+):\s*(No\s*signal|[\d.]+)\s*cm', line, re.IGNORECASE)
+        if not matches:
             return []
-        try:
-            vals_m = [float(v) / 100.0 for v in matches]
-        except Exception:
+        updated_any = False
+        for idx_str, val_str in matches:
+            try:
+                idx = int(idx_str) - 1   # x1 -> index 0
+                if not (0 <= idx < n):
+                    continue
+                if val_str.strip().lower().replace(' ', '') == 'nosignal':
+                    self.us_last_field[idx] = 9.9   # sentinel: no reading here
+                else:
+                    self.us_last_field[idx] = max(0.01, min(5.0, float(val_str) / 100.0))
+                if idx in self.us_trusted_idx:
+                    self.us_trusted_seen.add(idx)
+                updated_any = True
+            except Exception:
+                continue
+        if not updated_any:
             return []
-        return [max(0.01, min(5.0, v)) for v in vals_m]
+        if not self.us_trusted_idx <= self.us_trusted_seen:
+            return []   # haven't seen all of x4/x5/x7 at least once yet
+        return list(self.us_last_field[:n])
 
     def _extract_json(self, s: str) -> Tuple[List[str], str]:
         objs, start, depth = [], None, 0

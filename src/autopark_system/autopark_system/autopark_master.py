@@ -177,7 +177,14 @@ class AutoparkMaster(Node):
             #     below us_kinetic_clearance_ref_m, so the car only uses
             #     a large turn angle when there's actually room for it —
             #     not just because the raw proportional error is large.
-            ("us_kinetic_steer_gain",        60.0),   # gentler than us_steer_gain
+            # FIX (per request): gain was producing only 4-7° actual steer
+            # across an entire 20-cycle run that never converged (err
+            # oscillated -6 to -11cm the whole time) — confirmed too weak
+            # given the clearance-aware cap was also active in the 15-23cm
+            # range this car operates in most of the time. Raised so a
+            # typical ~7cm error produces a more assertive ~9-10° before
+            # the clearance cap even applies, instead of ~4°.
+            ("us_kinetic_steer_gain",        90.0),   # was 60.0
             ("us_kinetic_max_steer_deg",     10.0),   # lower ceiling for tight slots
             ("us_kinetic_clearance_ref_m",   0.30),   # full steer allowed at/above this clearance
             ("us_correction_dist_m",         0.12),
@@ -248,7 +255,11 @@ class AutoparkMaster(Node):
             # actually started moving (not from when the drive command was
             # sent), so PWM ramp-up / static-friction startup delay doesn't
             # eat into the timed window.
-            ("us_kinetic_recalc_period_s",    1.0),    # drive duration once movement confirmed
+            ("us_kinetic_recalc_period_s",    1.0),    # Phase A drive duration once movement confirmed
+            # FIX (per request): Phase B recalculates twice as often as
+            # Phase A — tighter cycle for the more safety-sensitive
+            # forward/reverse axis. Phase A unaffected, still 1.0s.
+            ("us_kinetic_recalc_period_b_s",  0.5),
             ("us_kinetic_min_enc_move_m",     0.01),   # 1cm — confirms real movement happened
             # FIX (per request): if EITHER side's ultrasonic reading shows
             # zero change for this many forward cycles (despite the encoder
@@ -348,6 +359,7 @@ class AutoparkMaster(Node):
         self.us_kinetic_max_attempts    = int(gp("us_kinetic_max_attempts"))
         self.us_kinetic_outer_attempts  = int(gp("us_kinetic_outer_attempts"))
         self.us_kinetic_recalc_period_s = float(gp("us_kinetic_recalc_period_s"))
+        self.us_kinetic_recalc_period_b_s = float(gp("us_kinetic_recalc_period_b_s"))
         self.us_kinetic_min_enc_move_m  = float(gp("us_kinetic_min_enc_move_m"))
         self.us_kinetic_unchanged_limit = int(gp("us_kinetic_unchanged_limit"))
         self.us_kinetic_unstick_max_retries = int(gp("us_kinetic_unstick_max_retries"))
@@ -363,6 +375,7 @@ class AutoparkMaster(Node):
         # FIX: edge-detect btn_state transitions to prevent auto-relaunch
         # race (see on_esp32_status for full explanation)
         self.last_btn_state_seen = "idle"
+        self.latest_steer_ready  = False
 
         # IMU state
         # latest_yaw_rad: from quaternion (often identity on mpu6050_cpp → unreliable)
@@ -494,6 +507,12 @@ class AutoparkMaster(Node):
         except Exception:
             return
         btn_state = obj.get("btn_state", "")
+
+        # FIX (per request — "is steer ready used before drive?"): track the
+        # firmware's own steer_ready flag (Status.h already publishes it)
+        # so kinetic can poll for REAL confirmation instead of blindly
+        # sleeping a fixed duration and hoping steering caught up by then.
+        self.latest_steer_ready = bool(obj.get("steer_ready", False))
 
         # FIX: auto-relaunch race. self.busy resets to False the instant
         # start_autopark() RETURNS — which happens right after sending the
@@ -1014,6 +1033,31 @@ class AutoparkMaster(Node):
 
         return True
 
+    # FIX (per request): "is steer ready used before drive?" — it was not.
+    # Kinetic's pre-steer wait was a blind time.sleep(us_steer_wait_s),
+    # never checking the firmware's own steer_ready status. Two problems
+    # with that: (1) if steering genuinely takes longer than the fixed
+    # wait — plausible given Steering.h's pulsed, spring-loaded convergence
+    # — the firmware's OWN steerReadyToDrive() gate silently refuses to
+    # drive at all, which is exactly what the repeated "no encoder movement
+    # within 2.0s — wheel may be stuck" warnings in the logs likely were:
+    # not a physically stuck wheel, but steering that hadn't converged yet.
+    # (2) if steering finishes EARLY, the fixed wait wastes time every
+    # cycle. This polls the real status instead, returning the instant
+    # steer_ready=true, capped at us_steer_wait_s as a timeout ceiling.
+    def _wait_steer_ready(self, phase: str) -> bool:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < self.us_steer_wait_s:
+            if self.latest_steer_ready:
+                return True
+            time.sleep(0.03)
+        self.get_logger().warning(
+            f"KINETIC [{phase}]: steer_ready not confirmed within "
+            f"{self.us_steer_wait_s:.1f}s — proceeding anyway, but the "
+            f"firmware's own drive gate may refuse to move if steering "
+            f"hasn't actually converged")
+        return False
+
     # FIX: clearance-aware steer cap. The old code clamped the lateral
     # correction at a single fixed us_max_steer_deg regardless of how much
     # actual side clearance existed — meaning any error >=10cm committed to
@@ -1055,6 +1099,7 @@ class AutoparkMaster(Node):
         total_fwd_est = 0.0
         prev_L, prev_R = None, None   # for explicit diff logging
         unchanged_streak = 0
+        steer = 0.0   # defensive default; real value set each forward attempt below
 
         for attempt in range(self.us_kinetic_max_attempts):
             if not self._kinetic_floor_ok("A", gear=1):
@@ -1120,6 +1165,18 @@ class AutoparkMaster(Node):
                     f"{side_note} — car is out of forward room. Reversing "
                     f"briefly to clear it.")
 
+                # FIX (per request): reverse with the MIRRORED steer angle
+                # (negative of whatever was just used going forward), not
+                # straight (0.0). The car got stuck while turning at
+                # `steer` degrees — backing out along the same arc in
+                # reverse (opposite sign) tends to retrace the path that
+                # got it there, rather than backing out straight from an
+                # angled position.
+                unstick_steer = -steer
+                self.get_logger().info(
+                    f"KINETIC-A unstick: reversing at steer={unstick_steer:+.1f}° "
+                    f"(mirrored from forward steer={steer:+.1f}°)")
+
                 # FIX (per request): keep reversing immediately as long as
                 # the blockage persists, instead of doing one reverse then
                 # routing back through a full forward-attempt cycle before
@@ -1129,14 +1186,16 @@ class AutoparkMaster(Node):
                 pre_unstick_L, pre_unstick_R = L, R
                 for unstick_try in range(self.us_kinetic_unstick_max_retries):
                     self.cmd_pub.publish(String(data=json.dumps({
-                        "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": 0.0})))
-                    time.sleep(self.us_steer_wait_s)
+                        "type": "drive", "gear": 0, "speed_mps": 0.0,
+                        "steer_deg": unstick_steer})))
+                    self._wait_steer_ready("A_unstick")
                     if not self._kinetic_floor_ok("A_unstick_pre", gear=-1):
                         return False
                     rd_before = self.latest_enc_rd
                     self.cmd_pub.publish(String(data=json.dumps({
                         "type": "drive", "gear": -1, "speed_mps": SPEED,
-                        "steer_deg": 0.0,
+                        "steer_deg": unstick_steer,
+                        "steer_active_hold": True,
                         "duration": round(START_TMO + PERIOD + 1.0, 2)})))
                     t_cmd = time.monotonic()
                     move_start = None
@@ -1189,16 +1248,29 @@ class AutoparkMaster(Node):
             # stopped from the previous cycle's end, or this is cycle 1).
             self.cmd_pub.publish(String(data=json.dumps({
                 "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": steer})))
-            time.sleep(self.us_steer_wait_s)
+            self._wait_steer_ready("A")
             if not self._kinetic_floor_ok("A_post_steer", gear=1):
                 return False
 
             # Issue the drive command with a generous watchdog duration —
             # we control the actual stop ourselves below, this is just a
             # safety ceiling in case our own stop call is ever delayed.
+            #
+            # FIX: steer_active_hold=true — kinetic never set this before,
+            # which meant the firmware's isCorrection check could never be
+            # true, arcDriveStarted reset to false on every single cycle,
+            # and steerReadyToDrive() was permanently stuck on the strict
+            # 8° gate instead of relaxing. With this set, the firmware uses
+            # a consistent 10° gate (STEER_STRAIGHT_TOL) AND continuously
+            # re-applies live steer correction while driving — exactly
+            # matching what kinetic actually does (recalculating steer
+            # every cycle while moving), instead of the one-shot
+            # settle-then-lock semantics that was never the right model
+            # for this.
             rd_before = self.latest_enc_rd
             self.cmd_pub.publish(String(data=json.dumps({
                 "type": "drive", "gear": 1, "speed_mps": SPEED, "steer_deg": steer,
+                "steer_active_hold": True,
                 "duration": round(START_TMO + PERIOD + 1.0, 2)})))
 
             self.get_logger().info(
@@ -1266,13 +1338,22 @@ class AutoparkMaster(Node):
         return False
 
     def _kinetic_depth_steps(self) -> bool:
-        """Depth correction: same stop-after-each-confirmed-1s-drive
-        architecture as lateral. Direction (reverse if too far, forward if
-        too close) can flip between cycles; since the car is already fully
-        stopped at the start of every cycle here, a direction change just
-        needs a fresh pre-steer, no extra stop logic required."""
+        """Depth correction: same stop-after-each-confirmed-drive
+        architecture as lateral, but with three differences per request:
+        (1) steer is always 0 — no straight-line bias compensation. Phase A
+            already centred laterally before this runs; applying a steer
+            bias here was the actual cause of the lateral drift the outer
+            retry loop has to fix afterward, not a cure for it.
+        (2) recalculates every 0.5s instead of 1s (Phase A is unaffected,
+            still 1s) — tighter cycle for the more safety-sensitive
+            forward/reverse axis.
+        (3) encoder-confirmed stuck detection, mirroring Phase A's: if the
+            encoder confirms the wheels turned but rear shows zero change
+            for us_kinetic_unchanged_limit cycles running, that direction
+            is blocked — force a try in the opposite direction next cycle
+            instead of continuing to push the same way uselessly."""
         SPEED      = self.us_correction_speed_mps
-        PERIOD     = self.us_kinetic_recalc_period_s
+        PERIOD     = self.us_kinetic_recalc_period_b_s
         MIN_ENC    = self.us_kinetic_min_enc_move_m
         START_TMO  = self.us_kinetic_move_start_timeout_s
         SETTLE     = self.us_kinetic_settle_s
@@ -1285,7 +1366,8 @@ class AutoparkMaster(Node):
 
         total_rev_est = 0.0
         total_fwd_est = 0.0
-        prev_rear      = None
+        prev_rear        = None
+        unchanged_streak = 0
 
         for attempt in range(self.us_kinetic_max_attempts):
             if not self._kinetic_floor_ok("B"):
@@ -1295,8 +1377,10 @@ class AutoparkMaster(Node):
 
             if prev_rear is not None:
                 d_rear = (rear - prev_rear) * 100
-                unchanged = " [UNCHANGED FROM LAST CYCLE — sensor data not updating]" \
-                    if abs(d_rear) < 0.01 else ""
+                is_unchanged = abs(d_rear) < 0.01
+                unchanged_streak = unchanged_streak + 1 if is_unchanged else 0
+                unchanged = " [UNCHANGED — that direction may be blocked]" \
+                    if is_unchanged else ""
                 self.get_logger().info(
                     f"KINETIC-B [{attempt+1}]: Δrear={d_rear:+.2f}cm "
                     f"vs previous cycle{unchanged}")
@@ -1318,6 +1402,18 @@ class AutoparkMaster(Node):
             error = rear - target   # +ve = too far (reverse), -ve = too close (forward)
             gear  = -1 if error > 0 else 1
 
+            # FIX (per request): encoder confirmed movement happened, but
+            # rear hasn't changed for us_kinetic_unchanged_limit cycles —
+            # that direction is physically blocked. Force the opposite
+            # direction for one cycle instead of repeating the same move.
+            if unchanged_streak >= self.us_kinetic_unchanged_limit:
+                gear = -gear
+                self.get_logger().warning(
+                    f"KINETIC-B [{attempt+1}]: {unchanged_streak} cycle(s) "
+                    f"with zero rear change despite confirmed movement — "
+                    f"forcing {'REV' if gear == -1 else 'FWD'} instead")
+                unchanged_streak = 0
+
             if gear == -1 and total_rev_est >= MAX_REV:
                 self.get_logger().warning(
                     f"KINETIC-B: reverse budget exhausted "
@@ -1329,20 +1425,14 @@ class AutoparkMaster(Node):
                     f"({total_fwd_est*100:.1f}cm used) — error={error*100:+.1f}cm remains")
                 return False
 
-            # [FIX] Apply steer_straight_bias_deg during depth moves.
-            # Without bias, left motor slower → car drifts right even
-            # during Phase-B reverse/forward → lateral error accumulates
-            # while depth is being corrected.
-            depth_steer = (
-                +self.steer_straight_bias_deg if gear > 0
-                else -self.steer_straight_bias_deg
-            )
+            # FIX (per request): steer=0 always, no straight-line bias.
+            depth_steer = 0.0
 
             # Car is already fully stopped from the previous cycle (or this
             # is cycle 1) — pre-steer to straight before driving.
             self.cmd_pub.publish(String(data=json.dumps({
                 "type": "drive", "gear": 0, "speed_mps": 0.0, "steer_deg": 0.0})))
-            time.sleep(self.us_steer_wait_s)
+            self._wait_steer_ready("B")
             if not self._kinetic_floor_ok("B_post_steer", gear=gear):
                 return False
 
@@ -1350,6 +1440,7 @@ class AutoparkMaster(Node):
             self.cmd_pub.publish(String(data=json.dumps({
                 "type": "drive", "gear": gear, "speed_mps": SPEED,
                 "steer_deg": depth_steer,
+                "steer_active_hold": True,
                 "duration": round(START_TMO + PERIOD + 1.0, 2)})))
 
             direction = "REV" if gear == -1 else "FWD"
@@ -1377,24 +1468,29 @@ class AutoparkMaster(Node):
                 prev_rear = rear
                 continue
 
-            # Drive for UP TO PERIOD seconds counted from confirmed start —
-            # but cut short immediately if the live reading shows we've
-            # reached (or are about to blow past) the target window. FIX:
-            # a full blind PERIOD-second commitment was observed covering
-            # 35-46cm of actual travel against an expected ~6cm
-            # (speed*PERIOD) — by the time the NEXT cycle's check ran, the
-            # car had already reversed straight through the entire 15-25cm
-            # window down to a near-collision 4.8cm before the floor check
-            # caught it. Polling the live rear reading during the drive
-            # itself (not just at cycle boundaries) stops the car the
-            # instant it enters tolerance — or the instant it overshoots
-            # past the window in the direction it's currently moving —
-            # regardless of why a single cycle covers far more distance
-            # than expected.
+            # FIX (per request): also stop early the moment the ENCODER
+            # shows we've travelled approximately the estimated distance
+            # needed to close the gap (abs(error)), rather than waiting on
+            # the live ultrasonic check alone. Encoder distance is immediate
+            # and reliable; the ultrasonic reading can lag behind the car's
+            # true position, especially right as it crosses into tolerance.
+            # After stopping this way the loop still settles and re-reads a
+            # FRESH ultrasonic x7 at the top of the next cycle as normal —
+            # if that fresh reading shows still out of tolerance, the loop
+            # just continues with a new correction, same as any other cycle.
+            target_travel_m = abs(error)
             t_drive_end = move_start + PERIOD
             while time.monotonic() < t_drive_end:
                 if not self._kinetic_floor_ok("B_driving", gear=gear):
                     return False
+                traveled = abs(self.latest_enc_rd - rd_before)
+                if traveled >= target_travel_m:
+                    self.get_logger().info(
+                        f"KINETIC-B [{attempt+1}]: encoder confirms "
+                        f"{traveled*100:.1f}cm traveled (estimated "
+                        f"{target_travel_m*100:.1f}cm needed) — stopping "
+                        f"early to recheck fresh ultrasonic")
+                    break
                 live_rear = self.latest_us[self.us_rear_idx]
                 if live_rear <= 2.0:
                     if lo <= live_rear <= hi:

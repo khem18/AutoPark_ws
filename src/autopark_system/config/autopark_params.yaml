@@ -210,7 +210,12 @@ autopark_master:
     # movement (not just elapsed time), a fresh ultrasonic reading is taken
     # and the steer/gear correction is recomputed, refreshing the drive
     # command. Repeats until within tolerance.
-    us_kinetic_recalc_period_s:  1.0     # drive duration once movement confirmed
+    us_kinetic_recalc_period_s:  1.0     # drive duration once movement confirmed (Phase A)
+    # Phase B (depth) recalculates faster — tighter cycle for the more
+    # safety-sensitive forward/reverse axis. Confirmed correct as a Python
+    # default but adding explicitly here too after the forward-guard
+    # index mismatch taught us not to leave things implicit between files.
+    us_kinetic_recalc_period_b_s: 0.5
     us_kinetic_min_enc_move_m:   0.01    # 1cm — confirms real movement happened
     # FIX (per request): if the ultrasonic reading shows zero change for
     # this many consecutive forward cycles (despite the encoder confirming
@@ -274,7 +279,11 @@ autopark_master:
     # steer angle down as the tighter side's clearance shrinks below
     # us_kinetic_clearance_ref_m — large turns only happen when there's
     # actually room for them.
-    us_kinetic_steer_gain:       60.0
+    # FIX (per request): was producing only 4-7° actual steer across an
+    # entire 20-cycle run that never converged. Raised so typical errors
+    # in the 15-23cm clearance range this car usually operates in produce
+    # a more assertive correction before the clearance cap applies.
+    us_kinetic_steer_gain:       90.0   # was 60.0
     us_kinetic_max_steer_deg:    10.0
     us_kinetic_clearance_ref_m:  0.30
     us_correction_speed_mps:     0.06    # speed during kinetic + legacy moves
@@ -296,6 +305,10 @@ autopark_master:
 
 serial_bridge:
   ros__parameters:
+    # FIX: synced to the currently-confirmed port mapping — this had drifted
+    # to stale values (ttyUSB2/ttyUSB0) that didn't match what's actually
+    # verified working (drive=ttyUSB0, ultrasonic=ttyUSB1, per your own
+    # startup logs). Matches encoder_bridge's launch-file ports too.
     drive_port:              "/dev/ttyUSB0"
     enc_handles_straight:    true    # ← was missing from zip config
     enc_straight_thresh_deg: 5.0
